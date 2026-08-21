@@ -3,6 +3,13 @@ import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
 
 const source = readFileSync(fileURLToPath(new URL("./main.mjs", import.meta.url)), "utf8");
+const packageJson = JSON.parse(
+  readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
+);
+const devBuilderConfig = readFileSync(
+  fileURLToPath(new URL("../electron-builder.dev.yml", import.meta.url)),
+  "utf8",
+);
 
 it("applies Electron path overrides before credentials and logs are resolved", () => {
   const userDataOverride = source.indexOf('appPathOverride("OMB_USER_DATA_DIR")');
@@ -48,4 +55,16 @@ it("keeps package smoke away from shared credentials, CUA, and updater state by 
   expect(source).toContain("if (app.isPackaged && !SMOKE_TEST)");
   expect(source).toContain("(!SMOKE_TEST || SMOKE_CUA)");
   expect(source).toContain("if (!SMOKE_TEST) startUpdater(win)");
+});
+
+it("packages acceptance builds under a non-production macOS identity", () => {
+  expect(packageJson.scripts["package:mac:dev"]).toContain(
+    "--config electron-builder.dev.yml --mac dir --arm64",
+  );
+  expect(devBuilderConfig).toContain("extends: ./electron-builder.yml");
+  expect(devBuilderConfig).toContain("appId: com.openmausbot.app.full-task-dev");
+  expect(devBuilderConfig).toContain("productName: OpenMausBot Full Task Dev");
+  expect(devBuilderConfig).toContain("output: release-dev");
+  expect(devBuilderConfig).not.toMatch(/^appId: com\.openmausbot\.app$/m);
+  expect(devBuilderConfig).not.toMatch(/^productName: OpenMausBot$/m);
 });
