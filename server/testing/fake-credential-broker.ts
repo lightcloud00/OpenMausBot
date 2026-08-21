@@ -34,8 +34,16 @@ const child = spawn(command, args, {
 process.stdin.pipe(child.stdin);
 child.stdout.pipe(process.stdout);
 child.stderr.pipe(process.stderr);
-child.once("error", () => process.exit(1));
-child.once("close", (code) => process.exit(code ?? 1));
+let settled = false;
+const finish = (code: number): void => {
+  if (settled) return;
+  settled = true;
+  process.stdin.unpipe(child.stdin);
+  process.stdin.pause();
+  process.exitCode = code;
+};
+child.once("error", () => finish(1));
+child.once("close", (code) => finish(code ?? 1));
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => child.kill(signal));
 }

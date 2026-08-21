@@ -71,7 +71,11 @@ function stop(exitCode: number): void {
   if (settled) return;
   settled = true;
   if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-  process.exit(exitCode);
+  if (child) process.stdin.unpipe(child.stdin);
+  process.stdin.pause();
+  // stdout/stderr are pipes and may still have redacted frames queued. Let
+  // Node drain them naturally instead of truncating them with process.exit().
+  process.exitCode = exitCode;
 }
 
 async function start(bootstrap: Bootstrap): Promise<void> {

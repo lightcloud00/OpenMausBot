@@ -16,6 +16,7 @@ import {
 const dirs: string[] = [];
 afterEach(() => {
   delete process.env.TEST_API_KEY;
+  delete process.env.POST_BOOT_TELEMETRY_TOKEN;
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -104,7 +105,9 @@ describe("TelemetryManager", () => {
       },
     });
     expect(spec.args).toContain("SENTRY_DSN=sentry-logical-alias");
-    expect(spec.args).toContain("C:\\OpenMaus\\server\\telemetry-node-launcher.cmd");
+    expect(spec.args.at(-1)).toBe(
+      '""C:\\OpenMaus\\server\\telemetry-node-launcher.cmd" "C:\\OpenMaus\\OpenMausBot Helper.exe" "C:\\OpenMaus\\server\\telemetry-sink.cjs" "C:\\private\\sink-sentry.json""',
+    );
     expect(spec.args.join(" ")).not.toContain("user:secret");
   });
 
@@ -173,6 +176,36 @@ describe("TelemetryManager", () => {
     expect(journal).not.toContain(canary);
     expect(journal).toContain("redacted");
     expect(manager.health().langfuse.degraded).toBe(false);
+    manager.shutdown();
+  });
+
+  it("redacts protected values added after the telemetry manager is constructed", () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-telemetry-rotated-secret-"));
+    dirs.push(dir);
+    const sinks = { sentry: fakeSink(), langfuse: fakeSink() };
+    const manager = new TelemetryManager({
+      dataDir: dir,
+      sinkPath: "/unused",
+      sourceSha: "b".repeat(40),
+      release: "dev",
+      spawnSink: (kind) => sinks[kind].child,
+    });
+    const canary = "post-boot-telemetry-secret-572983";
+    process.env.POST_BOOT_TELEMETRY_TOKEN = canary;
+    manager.registerTurn({
+      botId: "finch",
+      botName: "Finch",
+      threadId: "thread-1",
+      engine: "codex",
+      model: "gpt-5",
+      prompt: canary,
+    });
+    manager.handleRuntimeEvent(event("turn.started"));
+    manager.handleRuntimeEvent(event("item.completed", { itemType: "assistant_text", text: canary }));
+    manager.handleRuntimeEvent(event("turn.completed", { ok: true }));
+    expect(sinks.langfuse.lines).toHaveLength(1);
+    expect(sinks.langfuse.lines[0]).not.toContain(canary);
+    expect(readFileSync(join(dir, "telemetry", "turns.ndjson"), "utf8")).not.toContain(canary);
     manager.shutdown();
   });
 

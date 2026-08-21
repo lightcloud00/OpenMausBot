@@ -4,6 +4,7 @@ import {
   createCapabilityProfileManifest,
   isAccessProfile,
   normalizeAccessProfile,
+  renderFullTaskScopedSystemPrompt,
   supportsFullTaskScopedBotDriver,
 } from "./access-profile.ts";
 
@@ -35,5 +36,16 @@ describe("access profiles", () => {
     expect(first.hardDenies).toEqual(["catastrophic-destruction", "credential-value-disclosure"]);
     expect(first.sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(JSON.stringify(first)).not.toMatch(/token|password|secretKey/i);
+  });
+
+  it("preserves protected-input and webhook boundaries in the scoped prompt", () => {
+    const prompt = renderFullTaskScopedSystemPrompt(createCapabilityProfileManifest(), {
+      retrievalContext: "\n<untrusted-retrieval />",
+      protectComputerInput: true,
+      untrustedWebhook: true,
+    });
+    expect(prompt).toContain("protected-input step");
+    expect(prompt).toContain("UNTRUSTED WEBHOOK EVENT DATA");
+    expect(prompt).toContain("<untrusted-retrieval />");
   });
 });

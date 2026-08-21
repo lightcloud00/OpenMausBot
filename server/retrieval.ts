@@ -135,7 +135,7 @@ function sourceCandidates(input: unknown): RetrievalChunk[] {
 export class OpenMausRetriever {
   private readonly options: RetrieverOptions;
   private readonly journalPath: string;
-  private readonly protectedValues = protectedEnvironmentValues();
+  private protectedValues = protectedEnvironmentValues();
 
   constructor(options: RetrieverOptions) {
     this.options = options;
@@ -201,6 +201,7 @@ export class OpenMausRetriever {
   }
 
   async retrieve(query: string, cwd?: string, turnToken?: string): Promise<RetrievalResult> {
+    this.protectedValues = protectedEnvironmentValues();
     const cleanQuery = this.sanitize(query).slice(0, 8_000);
     const source = await this.source(cleanQuery, cwd, turnToken);
     const candidates = [...source.chunks, ...this.priorTurns(cleanQuery)];
@@ -236,9 +237,10 @@ export class OpenMausRetriever {
 
   format(result: RetrievalResult): string {
     if (!result.chunks.length) return "";
+    const fenced = (text: string) => text.replace(/<\/?untrusted-retrieval/gi, "<\u200buntrusted-retrieval");
     const body = result.chunks.map((chunk, index) => {
       const identity = [chunk.repositoryId, chunk.path, chunk.sourceSha, chunk.traceId].filter(Boolean).join(" | ");
-      return `[${index + 1}] ${chunk.kind}${identity ? ` (${identity})` : ""}\n${chunk.text}`;
+      return `[${index + 1}] ${chunk.kind}${identity ? ` (${identity})` : ""}\n${fenced(chunk.text)}`;
     }).join("\n\n");
     return `\n\n<untrusted-retrieval schema="${result.schema}" source-sha="${result.sourceSha}">\n${body}\n</untrusted-retrieval>`;
   }

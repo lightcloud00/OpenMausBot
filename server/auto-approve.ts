@@ -106,6 +106,7 @@ const CREDENTIAL_STORE_PATH = [
 const MAX_SAFETY_TEXT = 100_000;
 const MAX_SAFETY_VARIANTS = 128;
 const MAX_SAFETY_ROUNDS = 4;
+const MAX_STRUCTURED_SAFETY_VALUES = 32;
 
 function printableText(text: string): string | null {
   if (!text.length || text.length > MAX_SAFETY_TEXT || text.includes("\u0000")) return null;
@@ -132,12 +133,19 @@ function printableDecoded(value: Buffer): string[] {
   return [...decoded];
 }
 
+function codePointText(hex: string): string {
+  const value = Number.parseInt(hex, 16);
+  return Number.isInteger(value) && value >= 0 && value <= 0x10ffff
+    ? String.fromCodePoint(value)
+    : "";
+}
+
 function decodeEscapes(text: string): string {
   return text
     .replace(/%u([0-9a-f]{4})/gi, (_match, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
-    .replace(/&#x([0-9a-f]{2,6});?/gi, (_match, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#x([0-9a-f]{2,6});?/gi, (_match, hex: string) => codePointText(hex))
     .replace(/\\x([0-9a-f]{2})/gi, (_match, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
-    .replace(/\\u\{([0-9a-f]{1,6})\}/gi, (_match, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/\\u\{([0-9a-f]{1,6})\}/gi, (_match, hex: string) => codePointText(hex))
     .replace(/\\u([0-9a-f]{4})/gi, (_match, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
     .replace(/\\([0-7]{2,3})/g, (_match, octal: string) => String.fromCharCode(Number.parseInt(octal, 8)));
 }
@@ -323,9 +331,15 @@ function commandTokens(text: string): string[] {
 
 function resolveCandidatePath(candidate: string, cwd?: string): string | null {
   const clean = candidate.replace(/[),]+$/, "").trim();
-  if (!clean || /[*?{}[\]]/.test(clean)) return null;
+  if (!clean) return null;
+  // A glob expands children of its non-glob parent. Classify that parent so
+  // broad targets such as /* and /Users/* cannot disappear from the guard,
+  // while scoped targets such as build/* continue to resolve inside the cwd.
+  const glob = clean.search(/[*?{}[\]]/);
+  const target = glob === -1 ? clean : clean.slice(0, glob).replace(/[^/\\]*$/, "");
+  if (!target) return null;
   const base = cwd || process.cwd();
-  const expanded = clean
+  const expanded = target
     .replace(/^~(?=\/|$)/, homedir())
     .replace(/^\$(?:HOME|\{HOME\})(?=\/|$)/, homedir())
     .replace(/^\$(?:PWD|\{PWD\})(?=\/|$)/, base);
@@ -365,9 +379,14 @@ function isBroadFilesystemRoot(path: string): boolean {
  * recognize broad roots, but only resolution against the active cwd can tell
  * that `rm -rf .`, a worktree path, or a wrapped filesystem-tool argument is
  * the deletion of an entire repository rather than a scoped directory. */
-export function targetsCatastrophicFilesystem(tool: string, text: string, cwd?: string): boolean {
+export function targetsCatastrophicFilesystem(
+  tool: string,
+  text: string,
+  cwd?: string,
+  variants: readonly string[] = safetyTextVariants(text),
+): boolean {
   const deletionTool = /(?:delete|remove|unlink|rmtree|rm)(?:_|-)?(?:directory|folder|tree|path|repo(?:sitory)?)?/i.test(tool);
-  for (const variant of safetyTextVariants(text)) {
+  for (const variant of variants) {
     const candidates: string[] = [];
     for (const match of variant.matchAll(/\brm\s+([^\n;&|]+)/gi)) {
       const tokens = commandTokens(match[1]);
@@ -396,7 +415,9 @@ export function looksSensitive(text: string): boolean {
 
 export function looksCatastrophic(text: string, cwd?: string): boolean {
   const analysis = analyzeSafetyText(text);
-  return analysis.opaqueExecution || analysis.variants.some((variant) => matchFirst(CATASTROPHIC, variant) !== null) || targetsCatastrophicFilesystem("shell", text, cwd);
+  return analysis.opaqueExecution ||
+    analysis.variants.some((variant) => matchFirst(CATASTROPHIC, variant) !== null) ||
+    targetsCatastrophicFilesystem("shell", text, cwd, analysis.variants);
 }
 
 export function looksLikeCredentialValueDisclosure(text: string): boolean {
@@ -413,10 +434,10 @@ function structuredStringValues(summary: string): string[] {
     const values: string[] = [];
     let visited = 0;
     const append = (items: unknown[]): void => {
-      const remaining = MAX_SAFETY_VARIANTS - visited - pending.length;
+      const remaining = MAX_STRUCTURED_SAFETY_VALUES - visited - pending.length;
       if (remaining > 0) pending.push(...items.slice(0, remaining));
     };
-    while (pending.length && visited < MAX_SAFETY_VARIANTS) {
+    while (pending.length && visited < MAX_STRUCTURED_SAFETY_VALUES) {
       const value = pending.shift();
       visited += 1;
       if (typeof value === "string") {
@@ -433,13 +454,17 @@ function structuredStringValues(summary: string): string[] {
   }
 }
 
-function targetsCredentialStoreRead(tool: string, summary: string): boolean {
+function targetsCredentialStoreRead(
+  tool: string,
+  summary: string,
+  variants: readonly string[] = safetyTextVariants(`${tool}\n${summary}`),
+): boolean {
   const readTool = /(?:^|[:_.-])(?:read|cat|show|get|resolve|reveal|export|dump|decrypt|download|copy|open|view|query|search|list|load|fetch)(?:$|[:_.-])/i.test(tool);
   const nestedReadTool = /["'](?:tool|name)["']\s*:\s*["'][^"']*(?:read|cat|show|get|resolve|reveal|export|dump|decrypt|download|copy|open|view|query|search|list|load|fetch)[^"']*["']/i.test(summary);
   const readCommand = /\b(?:cat|head|tail|less|more|sed|awk|perl|python\w*|node|cp|rsync|scp|tar|zip|base64|xxd|strings|security|sqlite3)\b/i.test(summary);
   if (!readTool && !nestedReadTool && !readCommand) return false;
-  return [summary, ...structuredStringValues(summary)]
-    .some((candidate) => matchSafety(CREDENTIAL_STORE_PATH, candidate) !== null);
+  return [...variants, ...structuredStringValues(summary)]
+    .some((candidate) => matchFirst(CREDENTIAL_STORE_PATH, candidate) !== null);
 }
 
 export type FullTaskScopedHardDeny = "catastrophic-destruction" | "credential-value-disclosure";
@@ -450,10 +475,18 @@ export function fullTaskScopedHardDeny(
   context?: { cwd?: string },
 ): FullTaskScopedHardDeny | null {
   const combined = `${tool}\n${summary}`;
-  if (looksCatastrophic(combined, context?.cwd) || targetsCatastrophicFilesystem(tool, summary, context?.cwd)) {
+  const analysis = analyzeSafetyText(combined);
+  if (
+    analysis.opaqueExecution ||
+    analysis.variants.some((variant) => matchFirst(CATASTROPHIC, variant) !== null) ||
+    targetsCatastrophicFilesystem(tool, summary, context?.cwd, analysis.variants)
+  ) {
     return "catastrophic-destruction";
   }
-  if (looksLikeCredentialValueDisclosure(combined) || targetsCredentialStoreRead(tool, summary)) {
+  if (
+    analysis.variants.some((variant) => matchFirst(CREDENTIAL_VALUE_DISCLOSURE, variant) !== null) ||
+    targetsCredentialStoreRead(tool, summary, analysis.variants)
+  ) {
     return "credential-value-disclosure";
   }
   return null;
@@ -576,11 +609,10 @@ export function autoVerdict(
     if (sensitive) return { approve: null, source: sensitiveSource, rule: sensitive };
     return { approve: null, source: "no-grant" };
   }
-  if (context?.scope === "local-computer" && !fullTaskScoped) {
-    // The user's active desktop is never delegated to bot auto mode or a
-    // remembered cloud/tool grant in the Linux beta. Same attribution rule
-    // as the unattended block: a guard that would have carded anyway keeps
-    // its own name, the block is the story only when it changed the outcome.
+  if (context?.scope === "local-computer" && !fullTaskScoped && !bot.autoApprove) {
+    // Host control is not covered by a remembered always-allow grant.
+    // After the Auto-on-this-computer warning, unclassified GUI actions
+    // (click/type) may auto-approve; destructive/sensitive still card.
     if (grant) return { approve: null, source: "local-computer-block", rule: grant.rule };
     if (destructive) return { approve: null, source: destructiveSource, rule: destructive };
     if (sensitive) return { approve: null, source: sensitiveSource, rule: sensitive };

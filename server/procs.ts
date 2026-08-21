@@ -10,7 +10,6 @@
 import {
   spawn,
   execFile,
-  execFileSync,
   type ChildProcess,
   type ChildProcessByStdio,
   type ExecFileOptions,
@@ -19,6 +18,7 @@ import {
 import type { Readable, Writable } from "node:stream";
 import { basename, join } from "node:path";
 import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFile as readFileAsync, readlink } from "node:fs/promises";
 import { resolveCliSpawn, type ResolvedSpawn } from "./env-path.ts";
 
 interface OwnedProcess {
@@ -30,7 +30,26 @@ interface OwnedProcess {
 let processRegistryDir: string | null = null;
 const ownedProcesses = new Map<number, OwnedProcess>();
 
-function processIdentity(pid: number): { executable: string; startIdentity: string } | null {
+type ProcessIdentityProbe =
+  | { status: "found"; executable: string; startIdentity: string }
+  | { status: "not-found" | "unavailable" };
+
+function execText(file: string, args: string[], options: ExecFileOptions): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { ...options, encoding: "utf8" }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(String(stdout));
+    });
+  });
+}
+
+function missingProcessError(error: unknown): boolean {
+  const value = error as NodeJS.ErrnoException & { stderr?: string };
+  return value.code === "ESRCH" || /cannot find a process|no process found|process.*not found/i.test(String(value.stderr ?? value.message));
+}
+
+export async function processIdentity(pid: number): Promise<ProcessIdentityProbe> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { status: "unavailable" };
   if (process.platform === "win32") {
     try {
       const script = [
@@ -39,31 +58,49 @@ function processIdentity(pid: number): { executable: string; startIdentity: stri
         "try { $path = $p.Path } catch {}",
         "[pscustomobject]@{ CreationDate = $p.StartTime.ToUniversalTime().ToString('o'); ExecutablePath = $path; Name = $p.ProcessName } | ConvertTo-Json -Compress",
       ].join("; ");
-      const value = JSON.parse(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-        encoding: "utf8",
+      const value = JSON.parse((await execText("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
         timeout: 2_000,
         windowsHide: true,
-      }).trim()) as { CreationDate?: string; ExecutablePath?: string; Name?: string };
-      if (!value.CreationDate) return null;
+      })).trim()) as { CreationDate?: string; ExecutablePath?: string; Name?: string };
+      if (!value.CreationDate) return { status: "unavailable" };
       return {
+        status: "found",
         startIdentity: value.CreationDate,
         executable: basename(value.ExecutablePath || value.Name || ""),
       };
-    } catch {
-      return null;
+    } catch (error) {
+      return { status: missingProcessError(error) ? "not-found" : "unavailable" };
     }
   }
+
+  if (process.platform === "linux") {
+    try {
+      const stat = await readFileAsync(`/proc/${pid}/stat`, "utf8");
+      const closingParen = stat.lastIndexOf(")");
+      if (closingParen < 2) return { status: "unavailable" };
+      const executableName = stat.slice(stat.indexOf("(") + 1, closingParen);
+      const fields = stat.slice(closingParen + 2).trim().split(/\s+/);
+      const startIdentity = fields[19];
+      if (!startIdentity) return { status: "unavailable" };
+      let executable = executableName;
+      try { executable = basename(await readlink(`/proc/${pid}/exe`)); } catch {}
+      return { status: "found", startIdentity, executable };
+    } catch (error) {
+      return { status: (error as NodeJS.ErrnoException).code === "ENOENT" ? "not-found" : "unavailable" };
+    }
+  }
+
   try {
-    const value = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart=", "-o", "comm="], {
-      encoding: "utf8",
+    const value = (await execText("/bin/ps", ["-p", String(pid), "-o", "lstart=", "-o", "comm="], {
       timeout: 1_000,
       windowsHide: true,
-    }).trim();
+    })).trim();
     const match = value.match(/^(.{24})\s+(.+)$/);
-    if (!match) return null;
-    return { startIdentity: match[1]!.trim(), executable: basename(match[2]!.trim()) };
-  } catch {
-    return null;
+    if (!match) return { status: "unavailable" };
+    return { status: "found", startIdentity: match[1]!.trim(), executable: basename(match[2]!.trim()) };
+  } catch (error) {
+    const code = (error as { code?: string | number }).code;
+    return { status: code === 1 || missingProcessError(error) ? "not-found" : "unavailable" };
   }
 }
 
@@ -100,7 +137,7 @@ function unregisterOwnedProcess(pid: number): void {
 
 /** Reap only process groups whose former owner is dead and whose PID still
  * matches the recorded OS start identity and executable. */
-export function configureProcessRegistry(directory: string): void {
+export async function configureProcessRegistry(directory: string): Promise<void> {
   processRegistryDir = directory;
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   for (const name of readdirSync(directory).filter((item) => /^\d+\.json$/.test(item))) {
@@ -110,16 +147,17 @@ export function configureProcessRegistry(directory: string): void {
       if (value.schema !== "openmaus.owned-process-groups.v1" || value.ownerPid === process.pid) continue;
       if (ownerAlive(Number(value.ownerPid))) continue;
       for (const child of Array.isArray(value.children) ? value.children : []) {
-        const observed = processIdentity(Number(child.pid));
-        if (!observed || observed.startIdentity !== child.startIdentity || observed.executable !== child.executable) continue;
+        const observed = await processIdentity(Number(child.pid));
+        if (observed.status !== "found" || observed.startIdentity !== child.startIdentity || observed.executable !== child.executable) continue;
         if (process.platform === "win32") {
           execFile("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true }, () => {});
         } else {
           try { process.kill(-child.pid, "SIGTERM"); } catch {}
           setTimeout(() => {
-            const remaining = processIdentity(Number(child.pid));
-            if (remaining?.startIdentity !== child.startIdentity || remaining.executable !== child.executable) return;
-            try { process.kill(-child.pid, "SIGKILL"); } catch {}
+            void processIdentity(Number(child.pid)).then((remaining) => {
+              if (remaining.status !== "found" || remaining.startIdentity !== child.startIdentity || remaining.executable !== child.executable) return;
+              try { process.kill(-child.pid, "SIGKILL"); } catch {}
+            });
           }, 5_000).unref();
         }
       }
@@ -159,19 +197,22 @@ export function spawnCli(
     const pid = child.pid;
     let registered = false;
     const registrationDeadline = Date.now() + 10_000;
-    const register = () => {
+    const register = async () => {
       if (registered || child.exitCode !== null || child.signalCode !== null) return;
-      const observed = processIdentity(pid);
-      if (!observed) {
-        if (Date.now() < registrationDeadline) setTimeout(register, 100).unref();
+      const observed = await processIdentity(pid);
+      if (observed.status !== "found") {
+        if (observed.status === "not-found" && Date.now() < registrationDeadline) {
+          setTimeout(() => void register(), 100).unref();
+        }
         return;
       }
+      if (child.exitCode !== null || child.signalCode !== null) return;
       registered = true;
-      ownedProcesses.set(pid, { pid, ...observed });
+      ownedProcesses.set(pid, { pid, executable: observed.executable, startIdentity: observed.startIdentity });
       writeProcessRegistry();
       child.once("close", () => unregisterOwnedProcess(pid));
     };
-    register();
+    void register();
   }
 
   // A write to a dying child's stdin fails differently per platform, and one

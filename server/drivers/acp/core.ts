@@ -92,6 +92,12 @@ export interface AcpSupport {
   /** Mutate the child env in place: strip a key, inject a policy. Receives the
    *  instance config so a support can vary with fullAuto. */
   transformEnv?(env: Record<string, string | undefined>, config: AcpConfig): void;
+  /** Mutate the child env after the turn model is known. Catalog refresh and
+   *  snapshot share `transformEnv` and must not see a per-turn overlay. */
+  applyTurnEnv?(
+    env: Record<string, string | undefined>,
+    ctx: { model?: string; requestedModel?: string },
+  ): void;
   /** Pick the ACP authenticate methodId from initialize's advertised
    * authMethods; return null to skip the authenticate step. */
   pickAuthMethod(authMethods: Array<{ id?: string }>): string | null;
@@ -265,6 +271,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const cwd = turn.cwd ?? config.workspace ?? homedir();
         const env = childEnv();
         const resolvedModel = support.resolveTurnModel?.(turn.model, env);
+        support.applyTurnEnv?.(env, { model: resolvedModel, requestedModel: turn.model });
         const cliTurn =
           resolvedModel !== undefined && resolvedModel !== turn.model
             ? { ...turn, model: resolvedModel }
@@ -324,7 +331,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           if (state.text.trim()) {
             emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: state.text });
           }
-          emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost: null });
+          emit({ ...base(threadId, turnId), turnToken: turn.turnToken, type: "turn.completed", ok, stopReason, cost: null });
           stop(); // the agent process does not exit on its own
         };
 

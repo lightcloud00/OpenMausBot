@@ -27,6 +27,18 @@ function injectedCredential(): string {
   return value;
 }
 
+export function claudeApiKeyHelperChildEnv(
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    PATH: source.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+    ELECTRON_RUN_AS_NODE: "1",
+    ...(source.HOME ? { HOME: source.HOME } : {}),
+    ...(source.USERPROFILE ? { USERPROFILE: source.USERPROFILE } : {}),
+    ...(source.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: source.XDG_CONFIG_HOME } : {}),
+  };
+}
+
 export function readClaudeApiKey(aliasValue: string | undefined): string {
   const alias = validAlias(aliasValue);
   const self = fileURLToPath(import.meta.url);
@@ -37,12 +49,7 @@ export function readClaudeApiKey(aliasValue: string | undefined): string {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       maxBuffer: 1024 * 1024,
-      env: {
-        PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
-        ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
-        ...(process.env.USERPROFILE ? { USERPROFILE: process.env.USERPROFILE } : {}),
-        ...(process.env.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } : {}),
-      },
+      env: claudeApiKeyHelperChildEnv(),
     },
   );
   if (result.status !== 0 || result.error) throw new Error("CredVault Claude API credential injection failed");

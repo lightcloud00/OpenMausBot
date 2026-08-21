@@ -76,8 +76,8 @@ declare global {
       permStatus(): Promise<{ mic: string }>;
       /** Triggers the macOS microphone prompt; resolves true when granted. */
       permRequestMic(): Promise<boolean>;
-      /** Opens System Settings on a privacy pane: mic|screen|speech. */
-      permOpenSettings(pane: "mic" | "screen" | "speech"): Promise<void>;
+      /** Opens System Settings on a privacy pane: mic|screen|speech|accessibility. */
+      permOpenSettings(pane: "mic" | "screen" | "speech" | "accessibility"): Promise<void>;
       /** Copies an engine install command and opens a blank terminal. False
        * when no terminal could be launched; the clipboard still has it. */
       openInstallTerminal?(command: string): Promise<boolean>;
@@ -92,7 +92,7 @@ declare global {
       pickFolder?(current?: string): Promise<string | null>;
       /** Save a provider credential through Electron's OS-backed store. */
       setCredential?(
-        name: "composioApiKey" | "xaiApiKey" | "boxToken" | "opencodeGoApiKey" | "ttsKey",
+        name: "composioApiKey" | "xaiApiKey" | "boxToken" | "opencodeGoApiKey" | "ttsKey" | "openaiImageApiKey",
         value: string,
       ): Promise<ConfigStatus>;
       /** In-app auto-update (packaged app only; dormant in dev). onState

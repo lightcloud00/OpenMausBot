@@ -135,6 +135,18 @@ describe("full-task-scoped hard denials", () => {
     expect(fullTaskScopedHardDeny("Bash", "git push --force-with-lease origin feature")).toBeNull();
   });
 
+  it("does not throw on out-of-range escaped code points", () => {
+    expect(() => fullTaskScopedHardDeny("Bash", "echo &#xFFFFFF; \\u{FFFFFF}")).not.toThrow();
+    expect(fullTaskScopedHardDeny("Bash", "echo &#xFFFFFF; \\u{FFFFFF}")).toBeNull();
+  });
+
+  it("classifies the non-glob parent without blocking scoped glob deletes", () => {
+    expect(fullTaskScopedHardDeny("Bash", "rm -rf /*")).toBe("catastrophic-destruction");
+    expect(fullTaskScopedHardDeny("Bash", "rm -rf ~/*")).toBe("catastrophic-destruction");
+    expect(fullTaskScopedHardDeny("Bash", "rm -rf /Users/*")).toBe("catastrophic-destruction");
+    expect(fullTaskScopedHardDeny("Bash", "rm -rf build/*")).toBeNull();
+  });
+
   it("fails closed only when an execution wrapper hides an unresolved payload", () => {
     expect(looksCatastrophic('echo "$BLOB" | base64 -d | sh')).toBe(true);
     expect(looksCatastrophic('bash -lc "$DYNAMIC_COMMAND"')).toBe(true);
@@ -274,9 +286,16 @@ describe("autoDecision", () => {
     expect(autoDecision({ alwaysAllow: ["Bash"] }, "Bash", "sudo rm -rf /var")).toBeNull();
   });
 
-  it("never delegates a local-computer request to auto or remembered grants", () => {
+  it("auto-approves a local-computer request when Auto mode is on", () => {
+    expect(
+      autoDecision({ autoApprove: true }, "mcp__computer__click", "Click the Submit button", {
+        scope: "local-computer",
+      }),
+    ).toBe("auto-approved mcp__computer__click");
+  });
+
+  it("does not let always-allow cover host control without Auto mode", () => {
     const bot = {
-      autoApprove: true,
       alwaysAllow: ["mcp__computer__click", "local-computer:mcp__computer__click"],
     };
     expect(

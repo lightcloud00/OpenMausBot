@@ -61,6 +61,8 @@ describe("CodexDriver turns (fake app-server)", () => {
     delete process.env.AOS_STARTUP_DIRECTIVE;
     delete process.env.FAKE_CODEX_APPROVAL_COMMAND;
     delete process.env.FAKE_CODEX_APPROVAL_KIND;
+    delete process.env.FAKE_CODEX_APPROVAL_SERVER_NAME;
+    delete process.env.FAKE_CODEX_APPROVAL_FALLBACK_SERVER;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -89,7 +91,9 @@ describe("CodexDriver turns (fake app-server)", () => {
       "turn.started",
       "session.started",
       "item.started", // commandExecution ls -la
+      "item.started", // webSearch OpenMausBot
       "item.completed", // commandExecution done
+      "item.completed", // webSearch done
       "content.delta",
       "item.completed", // assistant_text
       "thread.token-usage.updated",
@@ -104,6 +108,10 @@ describe("CodexDriver turns (fake app-server)", () => {
       input: 7,
       output: 3,
     });
+    expect(recorder.events.filter((event) => event.itemId === "w1")).toMatchObject([
+      { type: "item.started", itemType: "tool", title: "web_search" },
+      { type: "item.completed", itemType: "tool", ok: true },
+    ]);
     // codex reports the THREAD total; the driver turns it into this turn's
     // figure so the harness never sums a running total
     expect(recorder.events.at(-1)).toMatchObject({ type: "turn.completed", ok: true, usage: { input: 7, output: 3 } });
@@ -119,6 +127,33 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(turnStart.params.input[0].text).toBe("You are Testy.\n\nlist files");
     const threadStart = seen.calls.find((c: { method: string }) => c.method === "thread/start");
     expect(threadStart.params).toMatchObject({ model: "gpt-5.6-sol", modelProvider: "openai" });
+  });
+
+  it("keeps local computer capability profile-aware while exposing the scoped profile", async () => {
+    await create({ fullAuto: true });
+    expect(instance.adapter.capabilities.localComputerMcp).toBe(false);
+    expect(instance.adapter.capabilities.fullTaskScoped).toBe(true);
+  });
+
+  it("keeps the full command when a Windows interpreter prefix is long", async () => {
+    await create({ mode: "windows-command" });
+    await instance.adapter.sendTurn({ threadId: "t-windows-command", text: "read notes" });
+
+    const command = [
+      "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\"",
+      "-Command",
+      `\"Get-Content -Raw -LiteralPath 'C:\\Users\\Ada\\workspaces\\${"very-long-folder\\".repeat(8)}NOTES.md'\"`,
+    ].join(" ");
+    expect(command.length).toBeGreaterThan(200);
+    const opened = await recorder.until((event) => event.type === "request.opened");
+    expect(recorder.events.find((event) => event.type === "item.started")).toMatchObject({
+      type: "item.started",
+      title: command,
+    });
+    expect(opened).toMatchObject({ requestType: "permission", summary: command });
+
+    await instance.adapter.respondToRequest("t-windows-command", opened.requestId!, { behavior: "allow" });
+    await recorder.until((event) => event.type === "turn.completed");
   });
 
   it("uses the instance environment for the Codex process", async () => {
@@ -376,6 +411,37 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "approved" });
   });
 
+  it("stamps approvalScope on cards only when the turn controls this Mac", async () => {
+    await create({ mode: "approval" });
+
+    // host-mounted: every card carries the scope that keeps the harness's
+    // local-computer-block backstop in force for remembered always-allows
+    await instance.adapter.sendTurn({
+      threadId: "t-host-scope",
+      text: "clean up",
+      integrations: {
+        localComputer: { command: "/cua-driver", args: ["mcp"], env: {}, platform: "darwin", scope: "local-computer" },
+      },
+    });
+    const host = await recorder.until((e) => e.type === "request.opened");
+    expect(host).toMatchObject({ approvalScope: "local-computer" });
+    await instance.adapter.respondToRequest("t-host-scope", host.requestId!, { behavior: "allow" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    // a Local VM mount is not the host: no scope stamped
+    await instance.adapter.sendTurn({
+      threadId: "t-vm-scope",
+      text: "clean up",
+      integrations: {
+        localComputer: { command: process.execPath, args: ["/tmp/container-mcp.js"], env: {} },
+      },
+    });
+    const vm = await recorder.until((e) => e.type === "request.opened" && e.threadId === "t-vm-scope");
+    expect((vm as { approvalScope?: string }).approvalScope).toBeUndefined();
+    await instance.adapter.respondToRequest("t-vm-scope", vm.requestId!, { behavior: "allow" });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-vm-scope");
+  });
+
   it("auto-approves commands in fullAuto without opening a request", async () => {
     await create({ mode: "approval", fullAuto: true });
     const dump = join(scratch, "dump.json");
@@ -403,11 +469,11 @@ describe("CodexDriver turns (fake app-server)", () => {
     });
     await recorder.until((event) => event.type === "turn.completed");
     expect(recorder.events.some((event) => event.type === "request.opened")).toBe(false);
-    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "accept" });
+    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ action: "accept" });
   });
 
   it("keeps auto-approval independent from the full-task-scoped capability profile", async () => {
-    await create({ mode: "approval" });
+    await create({ mode: "approval", fullAuto: true });
     const dump = join(scratch, "full-manual.json");
     process.env.FAKE_CODEX_DUMP = dump;
     process.env.FAKE_CODEX_APPROVAL_KIND = "gateway";
@@ -423,7 +489,27 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(opened).toMatchObject({ requestType: "permission", tool: "call_capability" });
     await instance.adapter.respondToRequest("t-full-manual", opened.requestId!, { behavior: "deny" });
     await recorder.until((event) => event.type === "turn.completed");
-    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "decline" });
+    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ action: "decline" });
+  });
+
+  it("fails closed when MCP elicitation omits the exact gateway serverName", async () => {
+    await create({ mode: "approval" });
+    const dump = join(scratch, "full-invalid-server.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    process.env.FAKE_CODEX_APPROVAL_KIND = "gateway";
+    process.env.FAKE_CODEX_APPROVAL_SERVER_NAME = "not-openmaus";
+    process.env.FAKE_CODEX_APPROVAL_FALLBACK_SERVER = "openmaus_capabilities";
+
+    await instance.adapter.sendTurn({
+      threadId: "t-full-invalid-server",
+      turnToken: "turn-token-123456789012345678901234",
+      text: "clean up",
+      accessProfile: "full-task-scoped",
+      autoApprove: true,
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(recorder.events.some((event) => event.type === "request.opened")).toBe(false);
+    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ action: "decline" });
   });
 
   it("rejects provider-native effects and directs the model through the gateway", async () => {

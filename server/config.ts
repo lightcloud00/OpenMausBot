@@ -16,6 +16,10 @@ const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
 export const MIN_ROOM_TURN_TIMEOUT_MINUTES = 1;
 export const MAX_ROOM_TURN_TIMEOUT_MINUTES = 1_440;
+export const DEFAULT_LOCAL_VM_MODE = "shared" as const;
+export const DEFAULT_LOCAL_VM_MAX_INSTANCES = 2;
+export const MIN_LOCAL_VM_MAX_INSTANCES = 1;
+export const MAX_LOCAL_VM_MAX_INSTANCES = 4;
 
 export function isValidSshAlias(value: unknown): value is string {
   return typeof value === "string" && SSH_ALIAS.test(value);
@@ -47,6 +51,15 @@ const roomConfigSchema = z.object({
     .min(MIN_ROOM_TURN_TIMEOUT_MINUTES)
     .max(MAX_ROOM_TURN_TIMEOUT_MINUTES),
 });
+const localVmConfigSchema = z.object({
+  mode: z.enum(["shared", "per-bot"]).optional(),
+  maxInstances: z
+    .number()
+    .int()
+    .min(MIN_LOCAL_VM_MAX_INSTANCES)
+    .max(MAX_LOCAL_VM_MAX_INSTANCES)
+    .optional(),
+});
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
   displayName: optionalText,
@@ -67,9 +80,12 @@ const appConfigSchema = z.object({
   opencodeGo: z.object({ apiKey: optionalText }).optional(),
   /** Voice credentials and the selected voice id. */
   tts: z.object({ key: optionalText, voice: optionalText }).optional(),
+  /** OpenAI key used only by the in-process avatar image generator. */
+  imageGen: z.object({ key: optionalText }).optional(),
   /** Non-secret profile details shown in the sidebar. */
   profile: z.object({ name: optionalText, email: optionalText }).optional(),
   rooms: roomConfigSchema.optional(),
+  localVm: localVmConfigSchema.optional(),
   instances: instanceConfigMapSchema.optional(),
 });
 const appConfigPatchSchema = appConfigSchema.omit({ instances: true });
@@ -83,8 +99,12 @@ export interface AppConfig {
   vps?: { sshAlias?: string };
   opencodeGo?: { apiKey?: string };
   tts?: { key?: string; voice?: string };
+  imageGen?: { key?: string };
   profile?: { name?: string; email?: string };
   rooms?: { turnTimeoutMinutes: number };
+  /** Shared preserves the historical singleton. Per-bot gives every bot a
+   * separate container, durable workspace, viewer and lease. */
+  localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
   instances?: InstanceConfigMap;
 }
 export type ConfigPatch = z.output<typeof appConfigPatchSchema>;
@@ -109,6 +129,14 @@ export function vpsSshAlias(cfg: AppConfig): string | null {
 
 export function roomTurnTimeoutMinutes(cfg: AppConfig): number {
   return cfg.rooms?.turnTimeoutMinutes ?? DEFAULT_ROOM_TURN_TIMEOUT_MINUTES;
+}
+
+export function localVmMode(cfg: AppConfig): "shared" | "per-bot" {
+  return cfg.localVm?.mode ?? DEFAULT_LOCAL_VM_MODE;
+}
+
+export function localVmMaxInstances(cfg: AppConfig): number {
+  return cfg.localVm?.maxInstances ?? DEFAULT_LOCAL_VM_MAX_INSTANCES;
 }
 
 // OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.
@@ -154,6 +182,8 @@ export function loadConfig(): AppConfig {
   if (process.env.OPENCODE_API_KEY !== undefined) cfg.opencodeGo.apiKey = process.env.OPENCODE_API_KEY;
   cfg.tts = { ...cfg.tts };
   if (process.env.OMB_TTS_KEY !== undefined) cfg.tts.key = process.env.OMB_TTS_KEY;
+  cfg.imageGen = { ...cfg.imageGen };
+  if (process.env.OMB_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.OMB_OPENAI_IMAGE_KEY;
   return cfg;
 }
 
@@ -171,6 +201,7 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
     [patch.box?.token, "BOX_TOKEN"],
     [patch.opencodeGo?.apiKey, "OPENCODE_API_KEY"],
     [patch.tts?.key, "OMB_TTS_KEY"],
+    [patch.imageGen?.key, "OMB_OPENAI_IMAGE_KEY"],
   ];
   for (const [value, name] of secrets) {
     if (value === undefined) continue;
@@ -189,6 +220,7 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   "BOX_TOKEN",
   "OPENCODE_API_KEY",
   "OMB_TTS_KEY",
+  "OMB_OPENAI_IMAGE_KEY",
   "COMPOSIO_API_KEY",
   "OMB_COMPOSIO_BROKER_TOKEN",
 ] as const;
@@ -228,7 +260,7 @@ export function saveConfig(patch: Partial<AppConfig>): void {
     /* first write */
   }
   const checkedPatch = appConfigSchema.partial().parse(patch);
-  for (const key of ["xai", "composio", "box", "opencodeGo", "tts", "profile", "rooms"] as const) {
+  for (const key of ["xai", "composio", "box", "opencodeGo", "tts", "imageGen", "profile", "rooms", "localVm"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);

@@ -64,6 +64,27 @@ describe("CapabilityGateway", () => {
     expect(gateway.stats().activeBackends).toEqual(["test"]);
   });
 
+  it("turns an early backend exit into a rejected request instead of an unhandled stdin error", async () => {
+    const gateway = new CapabilityGateway({
+      servers: {
+        exiting: {
+          type: "stdio",
+          command: process.execPath,
+          args: ["-e", "process.exit(0)"],
+          env: {},
+        },
+      },
+      manifest: createCapabilityProfileManifest({ toolInventory: ["exiting"] }),
+      sources: { claude: "missing", codex: "missing" },
+    });
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, { botId: "bot", threadId: "thread" });
+
+    await expect(gateway.callTool(TOKEN, "exiting", "echo", {})).rejects.toThrow(
+      /capability backend/,
+    );
+  });
+
   it("adds task-owned integrations to the effective manifest and closes them at turn end", async () => {
     chmodSync(FAKE, 0o755);
     const gateway = new CapabilityGateway({
@@ -211,6 +232,23 @@ describe("CapabilityGateway", () => {
     expect(spec.args).not.toContain("exec");
   });
 
+  it("passes one layered cmd command string for spaced Windows paths", () => {
+    const spec = credentialBackendSpawnSpec(
+      { alias: "logical-alias", envVar: "PROVIDER_ACCESS_TOKEN" },
+      {
+        command: "C:\\Safe Tools\\cv.exe",
+        platform: "win32",
+        executable: "C:\\Program Files\\OpenMausBot\\OpenMausBot Helper.exe",
+        proxyPath: "C:\\Program Files\\OpenMausBot\\server\\credential-redacting-proxy.js",
+      },
+    );
+    const commandIndex = spec.args.lastIndexOf("/c");
+    expect(commandIndex).toBeGreaterThan(0);
+    expect(spec.args.slice(commandIndex + 1)).toEqual([
+      '""C:\\Program Files\\OpenMausBot\\server\\credential-redacting-node-launcher.cmd" "C:\\Program Files\\OpenMausBot\\OpenMausBot Helper.exe" "C:\\Program Files\\OpenMausBot\\server\\credential-redacting-proxy.js""',
+    ]);
+  });
+
   it("scopes selections to a turn, isolates concurrent aliases, and redacts split credential output", async () => {
     chmodSync(FAKE, 0o755);
     chmodSync(FAKE_CREDENTIAL_BROKER, 0o755);
@@ -289,6 +327,34 @@ describe("CapabilityGateway", () => {
       gateway.selectCredentialAlias(TOKEN, "remote", "alias-one", "REMOTE_ACCESS_TOKEN"),
     ).rejects.toThrow(/requires a stdio capability server/);
     expect(listed).toBe(false);
+  });
+
+  it("protects only secret-shaped HTTP header values", () => {
+    const gateway = new CapabilityGateway({
+      servers: {
+        remote: {
+          type: "http",
+          url: "https://example.invalid/mcp",
+          headers: {
+            "content-type": "application/json",
+            accept: "*/*",
+            Authorization: "Bearer header-token-canary",
+            "x-api-key": "header-key-canary",
+            "x-empty-token": "  ",
+          },
+        },
+      },
+      manifest: createCapabilityProfileManifest({ toolInventory: ["remote"] }),
+      sources: { claude: "missing", codex: "missing" },
+    });
+    open.push(gateway);
+
+    const values = (gateway as any).protectedValues as Set<string>;
+    expect(values.has("header-token-canary")).toBe(true);
+    expect(values.has("header-key-canary")).toBe(true);
+    expect(values.has("application/json")).toBe(false);
+    expect(values.has("*/*")).toBe(false);
+    expect(values.has("")).toBe(false);
   });
 
   it("provides the same task-scoped host baseline to non-provider clients", async () => {

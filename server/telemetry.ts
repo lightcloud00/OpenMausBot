@@ -10,6 +10,7 @@ import { augmentedPath } from "./env-path.ts";
 import { killCliTree, spawnCli } from "./procs.ts";
 import { protectedEnvironmentValues, redactKnownValues, redactSecrets } from "./redact.ts";
 import type { TelemetryEnvelope, TelemetryErrorEnvelope, TelemetryToolSpan, TelemetryTraceEnvelope } from "./telemetry-protocol.ts";
+import { windowsCmdCommand } from "./windows-cmd.ts";
 
 const SUMMARY_CHARS = 4_000;
 
@@ -153,10 +154,12 @@ export function telemetrySinkSpawnSpec(
       "/v:off",
       "/s",
       "/c",
-      winPath.join(winPath.dirname(sinkPath), "telemetry-node-launcher.cmd"),
-      executable,
-      sinkPath,
-      runtimeConfigPath,
+      windowsCmdCommand([
+        winPath.join(winPath.dirname(sinkPath), "telemetry-node-launcher.cmd"),
+        executable,
+        sinkPath,
+        runtimeConfigPath,
+      ]),
     ];
   } else {
     command = "/usr/bin/env";
@@ -185,7 +188,7 @@ export class TelemetryManager {
   private readonly turnByIdentity = new Map<string, string>();
   private readonly turnsByThread = new Map<string, string[]>();
   private readonly sinks = new Map<SinkKind, SinkChild>();
-  private readonly protectedValues = protectedEnvironmentValues();
+  private protectedValues = protectedEnvironmentValues();
   private readonly healthState: Record<SinkKind, TelemetryHealth> = {
     sentry: { configured: true, running: false, degraded: false },
     langfuse: { configured: true, running: false, degraded: false },
@@ -265,6 +268,7 @@ export class TelemetryManager {
   }
 
   private sanitize<T>(input: T): T {
+    this.protectedValues = protectedEnvironmentValues();
     return redactKnownValues(redactSecrets(input), this.protectedValues) as T;
   }
 

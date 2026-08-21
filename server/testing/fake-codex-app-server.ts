@@ -4,7 +4,7 @@
 // initialize/thread/turn handshake, then plays a scripted turn. Like the
 // real app-server, it never exits on its own — the driver kills it.
 //
-//   FAKE_CODEX_MODE   happy (default) | approval | resume | stream |
+//   FAKE_CODEX_MODE   happy (default) | approval | resume | stream | windows-command |
 //                     logged-in-stdout | logged-out | unauthorized
 //   FAKE_CODEX_DUMP   path to write {argv, env, calls, decision} as JSON
 //
@@ -45,6 +45,7 @@ const dump = () => {
 
 const finishTurn = () => {
   notify("item/completed", { item: { id: "i1", type: "commandExecution", status: "completed" } });
+  notify("item/completed", { item: { id: "w1", type: "webSearch", status: "completed" } });
   if (mode === "stream") {
     // token deltas, then the whole message — the driver must not double-emit
     notify("item/agentMessage/delta", { itemId: "m1", delta: "done from " });
@@ -120,7 +121,7 @@ process.stdin.on("data", (chunk) => {
       case "thread/start":
         out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: "codex-thread-1" }, model: "fake-codex-model" } });
         break;
-      case "turn/start":
+      case "turn/start": {
         if (mode === "unauthorized") {
           out({
             jsonrpc: "2.0",
@@ -133,30 +134,44 @@ process.stdin.on("data", (chunk) => {
           break;
         }
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
-        notify("item/started", { item: { id: "i1", type: "commandExecution", command: "ls -la" } });
-        if (mode === "approval") {
-          const gatewayApproval = process.env.FAKE_CODEX_APPROVAL_KIND === "gateway";
+        const command = mode === "windows-command"
+          ? [
+              "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\"",
+              "-Command",
+              `\"Get-Content -Raw -LiteralPath 'C:\\Users\\Ada\\workspaces\\${"very-long-folder\\".repeat(8)}NOTES.md'\"`,
+            ].join(" ")
+          : "ls -la";
+        notify("item/started", { item: { id: "i1", type: "commandExecution", command } });
+        notify("item/started", { item: { id: "w1", type: "webSearch", query: "OpenMausBot" } });
+        if (mode === "approval" || mode === "windows-command") {
+          const gatewayApproval =
+            mode === "approval" && process.env.FAKE_CODEX_APPROVAL_KIND === "gateway";
+          const approvalCommand =
+            mode === "windows-command"
+              ? command
+              : process.env.FAKE_CODEX_APPROVAL_COMMAND ?? "rm -rf scratch";
           out({
             jsonrpc: "2.0",
             id: 100,
-            method: gatewayApproval ? "item/mcpToolCall/requestApproval" : "execCommandApproval",
+            method: gatewayApproval ? "mcpServer/elicitation/request" : "execCommandApproval",
             params: gatewayApproval
               ? {
-                  server: "openmaus_capabilities",
+                  serverName: process.env.FAKE_CODEX_APPROVAL_SERVER_NAME ?? "openmaus_capabilities",
                   tool: "call_capability",
                   arguments: {
-                    server: "openmaus-host",
+                    server: process.env.FAKE_CODEX_APPROVAL_FALLBACK_SERVER ?? "openmaus-host",
                     tool: "filesystem_delete",
                     arguments: { path: process.env.FAKE_CODEX_APPROVAL_COMMAND ?? "scratch" },
                   },
                 }
-              : { command: process.env.FAKE_CODEX_APPROVAL_COMMAND ?? "rm -rf scratch" },
+              : { command: approvalCommand },
           });
           // turn continues from the approval response handler above
         } else {
           finishTurn();
         }
         break;
+      }
       default:
         if (msg.id !== undefined) out({ jsonrpc: "2.0", id: msg.id, result: {} });
     }

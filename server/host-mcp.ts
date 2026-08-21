@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createCapabilityProfileManifest, type CapabilityProfileManifest } from "./access-profile.ts";
 import { augmentedPath } from "./env-path.ts";
 import { writeFileAtomic } from "./atomic.ts";
+import { BUILTIN_CAPABILITY_TOOLS } from "./builtin-capability-tools.ts";
 
 export type HostMcpServer =
   | { type: "builtin" }
@@ -188,13 +189,7 @@ export function loadHostMcpCatalog(options: {
   };
   const inventory = Object.entries(servers).flatMap(([name, server]) =>
     server.type === "builtin"
-      ? [
-          `${name}:shell_execute`,
-          `${name}:filesystem_read`,
-          `${name}:filesystem_write`,
-          `${name}:filesystem_delete`,
-          `${name}:filesystem_stat`,
-        ]
+      ? BUILTIN_CAPABILITY_TOOLS.map((tool) => `${name}:${tool.name}`)
       : [name],
   );
   return {

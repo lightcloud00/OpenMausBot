@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { clearProcessRegistry, configureProcessRegistry, killCliTree, spawnCli } from "./procs.ts";
+import { clearProcessRegistry, configureProcessRegistry, killCliTree, processIdentity, spawnCli } from "./procs.ts";
 
 const IDLE = "setInterval(() => {}, 1000)";
 
@@ -25,7 +25,7 @@ describe("owned process registry", () => {
   it("records an owned process group and removes it when the turn tree closes", async () => {
     const directory = join(process.env.HOME!, ".openmausbot", "process-registry-test");
     mkdirSync(directory, { recursive: true });
-    configureProcessRegistry(directory);
+    await configureProcessRegistry(directory);
 
     const registry = join(directory, `${process.pid}.json`);
     const child = spawnCli(process.execPath, ["-e", IDLE], { stdio: ["pipe", "pipe", "pipe"] });
@@ -46,6 +46,20 @@ describe("owned process registry", () => {
     await eventually(() => {
       const value = JSON.parse(readFileSync(registry, "utf8")) as { children: unknown[] };
       expect(value.children).toEqual([]);
+    });
+  });
+
+  it("rejects invalid process ids without probing the operating system", async () => {
+    await expect(processIdentity(0)).resolves.toEqual({ status: "unavailable" });
+    await expect(processIdentity(-1)).resolves.toEqual({ status: "unavailable" });
+    await expect(processIdentity(Number.MAX_SAFE_INTEGER + 1)).resolves.toEqual({ status: "unavailable" });
+  });
+
+  it("reads a live process identity asynchronously", async () => {
+    await expect(processIdentity(process.pid)).resolves.toMatchObject({
+      status: "found",
+      executable: expect.any(String),
+      startIdentity: expect.any(String),
     });
   });
 });

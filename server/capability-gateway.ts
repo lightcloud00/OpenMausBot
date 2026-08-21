@@ -7,10 +7,12 @@ import { z } from "zod";
 
 import { createCapabilityProfileManifest } from "./access-profile.ts";
 import { fullTaskScopedHardDeny } from "./auto-approve.ts";
+import { BUILTIN_CAPABILITY_TOOLS } from "./builtin-capability-tools.ts";
 import { augmentedPath } from "./env-path.ts";
 import type { HostMcpCatalog, HostMcpServer } from "./host-mcp.ts";
 import { killCliTree, spawnCli } from "./procs.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
+import { windowsCmdCommand } from "./windows-cmd.ts";
 import {
   isSecretName,
   protectedEnvironmentValues,
@@ -25,41 +27,6 @@ const REQUEST_TIMEOUT_MS = 60_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60_000;
 const MAX_TOOL_RESULT_BYTES = 256 * 1024;
 const MAX_INTERACTIVE_RESULT_BYTES = 8 * 1024 * 1024;
-const BUILTIN_TOOLS = [
-  {
-    name: "shell_execute",
-    description: "Execute a task-scoped host shell command. Catastrophic destruction and credential-value disclosure are centrally denied.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        command: { type: "string" },
-        cwd: { type: "string" },
-        timeoutMs: { type: "number", minimum: 100, maximum: 300000 },
-      },
-      required: ["command"],
-    },
-  },
-  {
-    name: "filesystem_read",
-    description: "Read a UTF-8 host file, excluding credential stores and credential-file content.",
-    inputSchema: { type: "object", properties: { path: { type: "string" }, maxBytes: { type: "number" } }, required: ["path"] },
-  },
-  {
-    name: "filesystem_write",
-    description: "Write or append UTF-8 content to a task-scoped host file.",
-    inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" }, append: { type: "boolean" } }, required: ["path", "content"] },
-  },
-  {
-    name: "filesystem_delete",
-    description: "Delete a scoped host path. Broad roots and whole repositories are denied.",
-    inputSchema: { type: "object", properties: { path: { type: "string" }, recursive: { type: "boolean" } }, required: ["path"] },
-  },
-  {
-    name: "filesystem_stat",
-    description: "Inspect host path metadata without reading file content.",
-    inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
-  },
-] as const;
 const SAFE_ENV_NAMES = [
   "HOME",
   "USERPROFILE",
@@ -195,9 +162,11 @@ export function credentialBackendSpawnSpec(
         "/v:off",
         "/s",
         "/c",
-        winPath.join(winPath.dirname(proxyPath), "credential-redacting-node-launcher.cmd"),
-        executable,
-        proxyPath,
+        windowsCmdCommand([
+          winPath.join(winPath.dirname(proxyPath), "credential-redacting-node-launcher.cmd"),
+          executable,
+          proxyPath,
+        ]),
       ]
     : ["/usr/bin/env", "ELECTRON_RUN_AS_NODE=1", executable, proxyPath];
   return {
@@ -262,6 +231,12 @@ class StdioBackend implements BackendClient {
       });
       this.child.stdout.setEncoding("utf8");
       this.child.stdout.on("data", (chunk) => this.onData(String(chunk)));
+      // A backend can exit between the liveness check and a write. Own the
+      // stream error so EPIPE rejects pending work through the normal backend
+      // failure path instead of becoming an uncaught process-level exception.
+      this.child.stdin.on("error", () =>
+        this.fail(new Error(`${this.name}: capability backend stdin failed`)),
+      );
       // stderr can contain wrapper diagnostics with logical aliases. It can
       // also contain provider output, so it is deliberately neither logged
       // nor copied into errors returned to the agent.
@@ -557,7 +532,7 @@ export class CapabilityGateway {
 
   private manifestFor(token: string): HostMcpCatalog["manifest"] {
     const inventory = Object.entries(this.serversFor(token)).flatMap(([name, server]) =>
-      server.type === "builtin" ? BUILTIN_TOOLS.map((tool) => `${name}:${tool.name}`) : [name],
+      server.type === "builtin" ? BUILTIN_CAPABILITY_TOOLS.map((tool) => `${name}:${tool.name}`) : [name],
     );
     return createCapabilityProfileManifest({ toolInventory: inventory });
   }
@@ -687,7 +662,7 @@ export class CapabilityGateway {
 
   async listTools(token: string, serverName: string): Promise<any> {
     this.requireTurn(token);
-    if (this.serverFor(token, serverName)?.type === "builtin") return { tools: BUILTIN_TOOLS };
+    if (this.serverFor(token, serverName)?.type === "builtin") return { tools: BUILTIN_CAPABILITY_TOOLS };
     const backend = this.backend(token, serverName);
     try {
       return this.sanitize(await backend.client.request("tools/list", {}));
@@ -830,8 +805,10 @@ export class CapabilityGateway {
           if (isSecretName(name)) this.protectedValues.add(value);
         }
       } else if (server.type === "http") {
-        for (const value of Object.values(server.headers)) {
-          this.protectedValues.add(value.replace(/^Bearer\s+/i, ""));
+        for (const [name, value] of Object.entries(server.headers)) {
+          if (!isSecretName(name)) continue;
+          const protectedValue = value.replace(/^Bearer\s+/i, "").trim();
+          if (protectedValue) this.protectedValues.add(protectedValue);
         }
       }
     }

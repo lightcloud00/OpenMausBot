@@ -331,12 +331,21 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       };
 
       // server→client approval request → canonical request.opened
+      // Host-scope tagging mirrors claude.ts: when this turn mounts the real
+      // Mac (not a VM), every card carries approvalScope so the harness's
+      // local-computer-block backstop applies to remembered always-allows.
+      const controlsHost = turn.integrations?.localComputer?.scope === "local-computer";
       const handleServerRequest = (msg: any) => {
         const method = msg.method as string;
         const params = msg.params ?? {};
         const legacy = method === "execCommandApproval" || method === "applyPatchApproval";
         const isQuestion = method === "item/tool/requestUserInput";
+        const isMcpElicitation = method === "mcpServer/elicitation/request";
         const isMcp = /mcp/i.test(method);
+        const approvalResult = (behavior: "allow" | "deny") =>
+          isMcpElicitation
+            ? { action: behavior === "allow" ? "accept" : "decline" }
+            : { decision: behavior === "allow" ? (legacy ? "approved" : "accept") : legacy ? "denied" : "decline" };
         const tool =
           method === "item/fileChange/requestApproval" || method === "applyPatchApproval"
             ? "edit"
@@ -364,9 +373,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               type: "runtime.error",
               message: `OpenMausBot denied ${tool}: ${denial}`,
             });
-            return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "denied" : "decline" } });
+            return send({ jsonrpc: "2.0", id: msg.id, result: approvalResult("deny") });
           }
-          const gatewayMcp = isMcp && /openmaus[_-]capabilities/i.test(JSON.stringify(params));
+          const gatewayMcp =
+            isMcpElicitation &&
+            typeof params.serverName === "string" &&
+            params.serverName === "openmaus_capabilities";
           if (!gatewayMcp) {
             emit({
               ...base(threadId, turnId),
@@ -374,14 +386,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               type: "runtime.error",
               message: `OpenMausBot rejected provider-native ${tool}; retry through openmaus_capabilities`,
             });
-            return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "denied" : "decline" } });
+            return send({ jsonrpc: "2.0", id: msg.id, result: approvalResult("deny") });
           }
           if (turn.autoApprove) {
-            return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "approved" : "accept" } });
+            return send({ jsonrpc: "2.0", id: msg.id, result: approvalResult("allow") });
           }
         }
-        if (config.fullAuto && !isQuestion) {
-          return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "approved" : "accept" } });
+        if (config.fullAuto && !isQuestion && !fullTaskScoped) {
+          return send({ jsonrpc: "2.0", id: msg.id, result: approvalResult("allow") });
         }
         const requestId = newId();
         const choices = isQuestion
@@ -400,7 +412,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             send({
               jsonrpc: "2.0",
               id: msg.id,
-              result: { decision: behavior === "allow" ? (legacy ? "approved" : "accept") : legacy ? "denied" : "decline" },
+              result: approvalResult(behavior === "allow" ? "allow" : "deny"),
             });
           }
           emit({ ...base(threadId, turnId), turnToken: turn.turnToken, type: "request.resolved", requestId, behavior, source });
@@ -420,6 +432,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           summary,
           choices,
           turnToken: turn.turnToken,
+          approvalScope: controlsHost ? "local-computer" : undefined,
         });
       };
 
@@ -446,7 +459,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             const item = p.item ?? {};
             const title =
               item.type === "commandExecution"
-                ? String(item.command ?? "shell").slice(0, 80)
+                ? String(item.command ?? "shell")
                 : item.type === "fileChange"
                   ? "edit"
                   : item.type === "mcpToolCall"
@@ -468,7 +481,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 state.sawStreamDelta = false;
                 emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: item.text });
               }
-            } else if (["commandExecution", "fileChange", "mcpToolCall"].includes(item.type)) {
+            } else if (["commandExecution", "fileChange", "mcpToolCall", "webSearch"].includes(item.type)) {
               emit({
                 ...base(threadId, turnId),
                 type: "item.completed",
@@ -668,7 +681,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           composioMcp: true,
           agentsMcp: true,
           phoneMcp: true,
-          localComputerMcp: true,
+          localComputerMcp: !config.fullAuto,
+          fullTaskScoped: true,
           images: true,
           effortLevels: ["low", "medium", "high", "xhigh", "max"],
         },
