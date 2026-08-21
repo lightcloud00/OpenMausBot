@@ -45,6 +45,7 @@ const ENTRY_POINTS = [
   "permission-proxy.ts",
   "connector-proxy.ts",
   "capability-proxy.ts",
+  "credential-redacting-proxy.ts",
   "claude-api-key-helper.ts",
   "drivers/agents-proxy.ts",
   "drivers/dweb-proxy.ts",
@@ -86,4 +87,8 @@ await rm(join(root, "dist-server", "telemetry-sink.js"), { force: true });
 await copyFile(
   join(server, "telemetry-node-launcher.cmd"),
   join(root, "dist-server", "telemetry-node-launcher.cmd"),
+);
+await copyFile(
+  join(server, "credential-redacting-node-launcher.cmd"),
+  join(root, "dist-server", "credential-redacting-node-launcher.cmd"),
 );

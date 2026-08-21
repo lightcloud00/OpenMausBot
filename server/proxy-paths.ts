@@ -42,6 +42,7 @@ export const SPAWNED_PROXIES = {
   dweb: resolveProxy("drivers/dweb-proxy"),
   connectors: resolveProxy("connector-proxy"),
   capabilities: resolveProxy("capability-proxy"),
+  credentialRedactor: resolveProxy("credential-redacting-proxy"),
   claudeApiKeyHelper: resolveProxy("claude-api-key-helper"),
   // OpenTelemetry contains legitimate dynamic CommonJS requires. A CJS sink
   // bundle preserves them; the main server remains ESM.

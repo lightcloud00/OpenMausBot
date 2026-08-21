@@ -5,11 +5,14 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createCapabilityProfileManifest } from "./access-profile.ts";
-import { CapabilityGateway } from "./capability-gateway.ts";
+import { CapabilityGateway, credentialBackendSpawnSpec } from "./capability-gateway.ts";
 import type { HostMcpCatalog } from "./host-mcp.ts";
 
 const FAKE = join(dirname(fileURLToPath(import.meta.url)), "testing", "fake-capability-mcp.ts");
+const FAKE_CREDENTIAL_BROKER = join(dirname(fileURLToPath(import.meta.url)), "testing", "fake-credential-broker.ts");
+const CREDENTIAL_REDACTOR = join(dirname(fileURLToPath(import.meta.url)), "credential-redacting-proxy.ts");
 const TOKEN = "turn-token-123456789012345678901234";
+const TOKEN_TWO = "turn-token-abcdefghijklmnopqrstuvwxyz12";
 
 function catalog(): HostMcpCatalog {
   return {
@@ -179,6 +182,113 @@ describe("CapabilityGateway", () => {
     await expect(
       gateway.selectCredentialAlias(TOKEN, "test", "not-present", "TOKEN"),
     ).rejects.toThrow(/unknown credential alias/);
+  });
+
+  it("uses cv stdio-exec without putting values in argv", () => {
+    const spec = credentialBackendSpawnSpec(
+      { alias: "logical-alias", envVar: "PROVIDER_ACCESS_TOKEN" },
+      {
+        command: "/safe/cv",
+        platform: "darwin",
+        executable: "/app/OpenMausBot Helper",
+        proxyPath: "/app/server/credential-redacting-proxy.js",
+      },
+    );
+    expect(spec.command).toBe("/safe/cv");
+    expect(spec.args.slice(0, 6)).toEqual([
+      "--source",
+      "main",
+      "stdio-exec",
+      "--env",
+      "PROVIDER_ACCESS_TOKEN=logical-alias",
+      "--",
+    ]);
+    expect(spec.args).toContain("ELECTRON_RUN_AS_NODE=1");
+    expect(spec.args.slice(-2)).toEqual([
+      "/app/OpenMausBot Helper",
+      "/app/server/credential-redacting-proxy.js",
+    ]);
+    expect(spec.args).not.toContain("exec");
+  });
+
+  it("scopes selections to a turn, isolates concurrent aliases, and redacts split credential output", async () => {
+    chmodSync(FAKE, 0o755);
+    chmodSync(FAKE_CREDENTIAL_BROKER, 0o755);
+    const directory = mkdtempSync(join(tmpdir(), "omb-credential-gateway-"));
+    temporary.push(directory);
+    const argvReceipt = join(directory, "broker-argv.ndjson");
+    const gateway = new CapabilityGateway(catalog(), {
+      idleTimeoutMs: 60_000,
+      listAliases: async () => ["alias-one", "alias-two", "alias-three"],
+      credentialBroker: {
+        command: process.execPath,
+        prefixArgs: [FAKE_CREDENTIAL_BROKER, argvReceipt],
+        executable: process.execPath,
+        proxyPath: CREDENTIAL_REDACTOR,
+      },
+    });
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, { botId: "one", threadId: "thread-one" });
+    gateway.beginTurn(TOKEN_TWO, { botId: "two", threadId: "thread-two" });
+    await gateway.selectCredentialAlias(TOKEN, "test", "alias-one", "TEST_SELECTED_SECRET");
+    await gateway.selectCredentialAlias(TOKEN_TWO, "test", "alias-two", "TEST_SELECTED_SECRET");
+
+    const [one, two] = await Promise.all([
+      gateway.callTool(TOKEN, "test", "credential-split", {}),
+      gateway.callTool(TOKEN_TWO, "test", "credential-echo", {}),
+    ]);
+    expect(one.structuredContent).toMatchObject({ tag: "alias-one" });
+    expect(two.structuredContent).toMatchObject({ tag: "alias-two" });
+    expect(JSON.stringify([one, two])).not.toMatch(/credential-(?:one|two)-canary/);
+    expect(JSON.stringify([one, two])).toContain("[REDACTED]");
+    expect(gateway.stats().activeBackends).toEqual(["test", "test"]);
+
+    const markerOne = one.structuredContent.marker;
+    await gateway.selectCredentialAlias(TOKEN_TWO, "test", "alias-three", "TEST_SELECTED_SECRET");
+    const [oneAgain, three] = await Promise.all([
+      gateway.callTool(TOKEN, "test", "credential-echo", {}),
+      gateway.callTool(TOKEN_TWO, "test", "credential-echo", {}),
+    ]);
+    expect(oneAgain.structuredContent).toMatchObject({ tag: "alias-one", marker: markerOne });
+    expect(three.structuredContent.tag).toBe("alias-three");
+
+    gateway.endTurn(TOKEN);
+    gateway.beginTurn(TOKEN, { botId: "one", threadId: "thread-one-next" });
+    const cleared = await gateway.callTool(TOKEN, "test", "credential-echo", {});
+    expect(cleared.structuredContent.tag).toBe("none");
+
+    const brokerArgv = readFileSync(argvReceipt, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(brokerArgv).toHaveLength(3);
+    for (const argv of brokerArgv) {
+      expect(argv.slice(0, 3)).toEqual(["--source", "main", "stdio-exec"]);
+      expect(argv).not.toContain("exec");
+      expect(argv.join(" ")).not.toMatch(/credential-(?:one|two|three)-canary/);
+    }
+    expect(brokerArgv.map((argv) => argv[4]).sort()).toEqual([
+      "TEST_SELECTED_SECRET=alias-one",
+      "TEST_SELECTED_SECRET=alias-three",
+      "TEST_SELECTED_SECRET=alias-two",
+    ]);
+  });
+
+  it("rejects credential selection for HTTP capabilities before alias lookup", async () => {
+    let listed = false;
+    const gateway = new CapabilityGateway({
+      servers: { remote: { type: "http", url: "https://example.invalid/mcp", headers: {} } },
+      manifest: createCapabilityProfileManifest({ toolInventory: ["remote"] }),
+      sources: { claude: "missing", codex: "missing" },
+    }, {
+      listAliases: async () => {
+        listed = true;
+        return ["alias-one"];
+      },
+    });
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, { botId: "bot", threadId: "thread" });
+    await expect(
+      gateway.selectCredentialAlias(TOKEN, "remote", "alias-one", "REMOTE_ACCESS_TOKEN"),
+    ).rejects.toThrow(/requires a stdio capability server/);
+    expect(listed).toBe(false);
   });
 
   it("provides the same task-scoped host baseline to non-provider clients", async () => {

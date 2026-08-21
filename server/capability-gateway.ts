@@ -2,13 +2,15 @@ import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { appendFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve, win32 as winPath } from "node:path";
+import { z } from "zod";
 
 import { createCapabilityProfileManifest } from "./access-profile.ts";
 import { fullTaskScopedHardDeny } from "./auto-approve.ts";
 import { augmentedPath } from "./env-path.ts";
 import type { HostMcpCatalog, HostMcpServer } from "./host-mcp.ts";
 import { killCliTree, spawnCli } from "./procs.ts";
+import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import {
   isSecretName,
   protectedEnvironmentValues,
@@ -141,10 +143,76 @@ interface BackendClient {
   close(): void;
 }
 
+interface CredentialSelection {
+  alias: string;
+  envVar: string;
+}
+
+export interface CredentialBrokerOptions {
+  command?: string;
+  prefixArgs?: string[];
+  platform?: NodeJS.Platform;
+  executable?: string;
+  proxyPath?: string;
+}
+
+export interface CredentialBackendSpawnSpec {
+  command: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+}
+
+const CredentialListPayload = z.object({
+  result: z.object({
+    credentials: z.array(z.object({
+      name: z.string().optional(),
+      aliases: z.array(z.string()).optional(),
+    })).optional(),
+  }).optional(),
+});
+
+export function credentialBackendSpawnSpec(
+  selection: CredentialSelection,
+  options: CredentialBrokerOptions = {},
+): CredentialBackendSpawnSpec {
+  const platform = options.platform ?? process.platform;
+  const executable = options.executable ?? process.execPath;
+  const proxyPath = options.proxyPath ?? SPAWNED_PROXIES.credentialRedactor;
+  const prefix = options.prefixArgs ?? [];
+  if (hasSecretArgument(prefix)) throw new Error("credential broker argv is not allowed to contain credential-shaped values");
+  const launcher = platform === "win32"
+    ? [
+        process.env.ComSpec || process.env.COMSPEC || "cmd.exe",
+        "/d",
+        "/v:off",
+        "/s",
+        "/c",
+        winPath.join(winPath.dirname(proxyPath), "credential-redacting-node-launcher.cmd"),
+        executable,
+        proxyPath,
+      ]
+    : ["/usr/bin/env", "ELECTRON_RUN_AS_NODE=1", executable, proxyPath];
+  return {
+    command: options.command ?? "cv",
+    args: [
+      ...prefix,
+      "--source",
+      "main",
+      "stdio-exec",
+      "--env",
+      `${selection.envVar}=${selection.alias}`,
+      "--",
+      ...launcher,
+    ],
+    env: minimalEnvironment(),
+  };
+}
+
 class StdioBackend implements BackendClient {
   private readonly name: string;
   private readonly server: Extract<HostMcpServer, { type: "stdio" }>;
-  private readonly credential?: { alias: string; envVar: string };
+  private readonly credential?: CredentialSelection;
+  private readonly credentialBroker: CredentialBrokerOptions;
   private child: ReturnType<typeof spawnCli> | null = null;
   private buffer = "";
   private nextId = 1;
@@ -155,11 +223,13 @@ class StdioBackend implements BackendClient {
   constructor(
     name: string,
     server: Extract<HostMcpServer, { type: "stdio" }>,
-    credential?: { alias: string; envVar: string },
+    credential: CredentialSelection | undefined,
+    credentialBroker: CredentialBrokerOptions,
   ) {
     this.name = name;
     this.server = server;
     this.credential = credential;
+    this.credentialBroker = credentialBroker;
   }
 
   get alive(): boolean {
@@ -172,13 +242,14 @@ class StdioBackend implements BackendClient {
       if (hasSecretArgument(this.server.args)) {
         throw new Error(`${this.name}: credential-shaped argv is not allowed`);
       }
-      const command = this.credential ? "credvault" : this.server.command;
-      const args = this.credential
-        ? ["exec", this.credential.alias, this.credential.envVar, "--", this.server.command, ...this.server.args]
-        : this.server.args;
+      const credentialSpec = this.credential
+        ? credentialBackendSpawnSpec(this.credential, this.credentialBroker)
+        : null;
+      const command = credentialSpec?.command ?? this.server.command;
+      const args = credentialSpec?.args ?? this.server.args;
       this.child = spawnCli(command, args, {
         cwd: this.server.cwd ?? homedir(),
-        env: minimalEnvironment(this.server.env),
+        env: credentialSpec?.env ?? minimalEnvironment(this.server.env),
         stdio: ["pipe", "pipe", "pipe"],
       });
       this.child.stdout.setEncoding("utf8");
@@ -189,6 +260,16 @@ class StdioBackend implements BackendClient {
       this.child.stderr.resume();
       this.child.on("error", () => this.fail(new Error(`${this.name}: capability backend could not start`)));
       this.child.on("close", () => this.fail(new Error(`${this.name}: capability backend closed`)));
+      if (this.credential) {
+        this.child.stdin.write(`${JSON.stringify({
+          schema: "openmaus.credential-backend-bootstrap.v1",
+          command: this.server.command,
+          args: this.server.args,
+          cwd: this.server.cwd ?? homedir(),
+          env: this.server.env,
+          protectedEnvironmentNames: [this.credential.envVar, ...Object.keys(this.server.env)],
+        })}\n`);
+      }
       await this.rawRequest("initialize", {
         protocolVersion: MCP_PROTOCOL,
         capabilities: {},
@@ -357,6 +438,7 @@ export interface CapabilityGatewayOptions {
   idleTimeoutMs?: number;
   now?: () => number;
   listAliases?: () => Promise<string[]>;
+  credentialBroker?: CredentialBrokerOptions;
 }
 
 /** App-owned MCP union. The provider sees one small proxy; backend processes
@@ -366,10 +448,11 @@ export class CapabilityGateway {
   readonly catalog: HostMcpCatalog;
   private readonly activeTurns = new Map<string, ActiveTurn>();
   private readonly backends = new Map<string, BackendSlot>();
-  private readonly selections = new Map<string, { alias: string; envVar: string }>();
+  private readonly selections = new Map<string, Map<string, CredentialSelection>>();
   private readonly idleTimeoutMs: number;
   private readonly now: () => number;
   private readonly protectedValues: Set<string>;
+  private readonly credentialBroker: CredentialBrokerOptions;
 
   constructor(
     catalog: HostMcpCatalog,
@@ -379,6 +462,7 @@ export class CapabilityGateway {
     this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.now = options.now ?? Date.now;
     this.listAliasesImpl = options.listAliases ?? listCredentialAliases;
+    this.credentialBroker = options.credentialBroker ?? {};
     this.protectedValues = protectedEnvironmentValues();
     this.protectServerValues(catalog.servers);
   }
@@ -393,12 +477,13 @@ export class CapabilityGateway {
     servers?: Record<string, HostMcpServer>;
   }): void {
     if (!token || token.length < 24) throw new Error("invalid capability turn token");
+    if (this.activeTurns.has(token)) this.endTurn(token);
     this.activeTurns.set(token, {
       botId: turn.botId,
       threadId: turn.threadId,
       cwd: turn.cwd,
       expiresAt: this.now() + (turn.ttlMs ?? 24 * 60 * 60_000),
-      servers: { ...(turn.servers ?? {}) },
+      servers: { ...turn.servers },
       interactiveInput: "",
     });
     this.protectServerValues(turn.servers ?? {});
@@ -406,14 +491,23 @@ export class CapabilityGateway {
 
   endTurn(token: string): void {
     const ended = this.activeTurns.get(token);
+    const selections = this.selections.get(token);
     this.activeTurns.delete(token);
+    this.selections.delete(token);
     if (!ended) return;
     for (const [name, server] of Object.entries(ended.servers)) {
-      const key = this.backendFingerprint(server, this.selections.get(name));
+      const key = this.backendFingerprint(server, selections?.get(name));
       const stillReferenced = [...this.activeTurns.values()].some((turn) =>
         JSON.stringify(turn.servers[name]) === JSON.stringify(server),
       );
       if (!stillReferenced) this.closeBackend(key);
+    }
+    for (const [name, selection] of selections ?? []) {
+      const server = ended.servers[name] ?? this.catalog.servers[name];
+      if (!server || server.type !== "stdio") continue;
+      if (!this.selectionReferenced(name, server, selection)) {
+        this.closeBackend(this.backendFingerprint(server, selection));
+      }
     }
   }
 
@@ -480,15 +574,42 @@ export class CapabilityGateway {
     envVar: string,
   ): Promise<void> {
     this.requireTurn(token);
-    if (!this.serverFor(token, serverName)) throw new Error("unknown capability server");
+    const server = this.serverFor(token, serverName);
+    if (!server) throw new Error("unknown capability server");
+    if (server.type !== "stdio") {
+      throw new Error("credential alias injection requires a stdio capability server");
+    }
     if (!/^[A-Z_][A-Z0-9_]{1,80}$/.test(envVar)) throw new Error("invalid credential environment name");
     const aliases = await this.aliases(token);
     if (!aliases.includes(alias)) throw new Error("unknown credential alias");
-    this.selections.set(serverName, { alias, envVar });
-    for (const [key, slot] of this.backends) if (slot.name === serverName) this.closeBackend(key);
+    const turnSelections = this.selections.get(token) ?? new Map<string, CredentialSelection>();
+    const previous = turnSelections.get(serverName);
+    const next = { alias, envVar };
+    turnSelections.set(serverName, next);
+    this.selections.set(token, turnSelections);
+    if (previous && this.backendFingerprint(server, previous) !== this.backendFingerprint(server, next)) {
+      if (!this.selectionReferenced(serverName, server, previous)) {
+        this.closeBackend(this.backendFingerprint(server, previous));
+      }
+    }
   }
 
-  private backendFingerprint(server: HostMcpServer, selection?: { alias: string; envVar: string }): string {
+  private selectionFor(token: string, name: string): CredentialSelection | undefined {
+    return this.selections.get(token)?.get(name);
+  }
+
+  private selectionReferenced(name: string, server: HostMcpServer, selection: CredentialSelection): boolean {
+    const serverIdentity = JSON.stringify(server);
+    const selectionIdentity = JSON.stringify(selection);
+    return [...this.activeTurns.keys()].some((token) => {
+      const candidateServer = this.serverFor(token, name);
+      const candidateSelection = this.selectionFor(token, name);
+      return JSON.stringify(candidateServer) === serverIdentity
+        && JSON.stringify(candidateSelection) === selectionIdentity;
+    });
+  }
+
+  private backendFingerprint(server: HostMcpServer, selection?: CredentialSelection): string {
     return createHash("sha256").update(JSON.stringify({ server, selection: selection ?? null })).digest("hex");
   }
 
@@ -496,7 +617,7 @@ export class CapabilityGateway {
     const server = this.serverFor(token, name);
     if (!server) throw new Error("unknown capability server");
     if (server.type === "builtin") throw new Error("built-in capabilities do not start a backend");
-    const selection = this.selections.get(name);
+    const selection = this.selectionFor(token, name);
     const key = this.backendFingerprint(server, selection);
     const existing = this.backends.get(key);
     if (existing?.client.alive) {
@@ -507,7 +628,7 @@ export class CapabilityGateway {
     }
     if (existing) this.backends.delete(key);
     const client: BackendClient = server.type === "stdio"
-      ? new StdioBackend(name, server, selection)
+      ? new StdioBackend(name, server, selection, this.credentialBroker)
       : new HttpBackend(name, server);
     this.backends.set(key, { name, fingerprint: key, client, idle: null, active: 1 });
     return { key, client };
@@ -690,7 +811,8 @@ export class CapabilityGateway {
 
   shutdown(): void {
     this.activeTurns.clear();
-    for (const key of [...this.backends.keys()]) this.closeBackend(key);
+    this.selections.clear();
+    for (const key of this.backends.keys()) this.closeBackend(key);
   }
 
   private protectServerValues(servers: Record<string, HostMcpServer>): void {
@@ -710,9 +832,8 @@ export class CapabilityGateway {
 
 export function listCredentialAliases(): Promise<string[]> {
   const candidates: Array<[string, string[]]> = [
-    ["credvault", ["list", "--output", "names"]],
-    ["cv", ["--source", "main", "list", "--output", "names"]],
-    [join(homedir(), ".local", "bin", "cv"), ["--source", "main", "list", "--output", "names"]],
+    ["cv", ["--source", "main", "--json", "list", "--limit", "5000"]],
+    [join(homedir(), ".local", "bin", "cv"), ["--source", "main", "--json", "list", "--limit", "5000"]],
   ];
   return new Promise((resolve) => {
     const attempt = (index: number) => {
@@ -721,10 +842,19 @@ export function listCredentialAliases(): Promise<string[]> {
       execFile(
         candidate[0],
         candidate[1],
-        { timeout: 10_000, encoding: "utf8", env: minimalEnvironment(), windowsHide: true },
+        { timeout: 10_000, encoding: "utf8", env: minimalEnvironment(), windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
         (error, stdout) => {
           if (error) return attempt(index + 1);
-          const aliases = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+          let aliases: string[] = [];
+          try {
+            const payload = CredentialListPayload.parse(JSON.parse(stdout));
+            aliases = (payload.result?.credentials ?? []).flatMap((credential) => [
+              ...(credential.name ? [credential.name] : []),
+              ...(credential.aliases ?? []),
+            ]);
+          } catch {
+            return attempt(index + 1);
+          }
           return aliases.length ? resolve(aliases) : attempt(index + 1);
         },
       );
