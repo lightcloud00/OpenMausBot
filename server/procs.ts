@@ -34,9 +34,10 @@ function processIdentity(pid: number): { executable: string; startIdentity: stri
   if (process.platform === "win32") {
     try {
       const script = [
-        `$p = Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\"`,
-        "if (-not $p) { exit 1 }",
-        "$p | Select-Object CreationDate,ExecutablePath,Name | ConvertTo-Json -Compress",
+        `$p = Get-Process -Id ${pid} -ErrorAction Stop`,
+        "$path = $null",
+        "try { $path = $p.Path } catch {}",
+        "[pscustomobject]@{ CreationDate = $p.StartTime.ToUniversalTime().ToString('o'); ExecutablePath = $path; Name = $p.ProcessName } | ConvertTo-Json -Compress",
       ].join("; ");
       const value = JSON.parse(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
         encoding: "utf8",
@@ -157,17 +158,20 @@ export function spawnCli(
   if (child.pid && processRegistryDir) {
     const pid = child.pid;
     let registered = false;
+    const registrationDeadline = Date.now() + 10_000;
     const register = () => {
       if (registered || child.exitCode !== null || child.signalCode !== null) return;
       const observed = processIdentity(pid);
-      if (!observed) return;
+      if (!observed) {
+        if (Date.now() < registrationDeadline) setTimeout(register, 100).unref();
+        return;
+      }
       registered = true;
       ownedProcesses.set(pid, { pid, ...observed });
       writeProcessRegistry();
       child.once("close", () => unregisterOwnedProcess(pid));
     };
     register();
-    if (!registered) setTimeout(register, 25).unref();
   }
 
   // A write to a dying child's stdin fails differently per platform, and one

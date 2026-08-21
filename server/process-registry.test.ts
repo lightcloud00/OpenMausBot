@@ -6,7 +6,7 @@ import { clearProcessRegistry, configureProcessRegistry, killCliTree, spawnCli }
 
 const IDLE = "setInterval(() => {}, 1000)";
 
-async function eventually(assertion: () => void, timeoutMs = 5_000): Promise<void> {
+async function eventually(assertion: () => void, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
