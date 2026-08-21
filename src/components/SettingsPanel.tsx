@@ -350,6 +350,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const activeState = stateForBot(bot);
   const mascotMotion = state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
   const engine = state.instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId);
+  const fullTaskScopedAvailable = engine?.driverKind === "claudeAgent" || engine?.driverKind === "codex";
+  const fullTaskScoped = bot.accessProfile === "full-task-scoped" && fullTaskScopedAvailable;
   const canCoordinate = engine?.capabilities?.agentsMcp === true;
   const canUseConnectedApps = engine?.capabilities?.composioMcp === true;
   const canUseVps = engine?.capabilities?.computerMcp === true && engine.driverKind !== "boxAgent";
@@ -666,7 +668,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                   title={mode === "local" && !localSelectable ? localDisabledReason ?? undefined : undefined}
                   onClick={() =>
                     patch(
-                      mode === "local" && bot.accessProfile !== "full-task-scoped"
+                      mode === "local" && !fullTaskScoped
                         ? { computer: mode, autoApprove: false }
                         : { computer: mode },
                     )
@@ -702,7 +704,9 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           <div className="rounded-xl bg-card p-4">
             <div className="text-[15px] font-medium text-ink">Access profile</div>
             <div className="mt-0.5 text-[13px] text-ink-secondary">
-              Full task-scoped access keeps every host and connected capability available while refusing only catastrophic destruction and credential-value disclosure.
+              {fullTaskScopedAvailable
+                ? "Full task-scoped access keeps every host and connected capability available while refusing only catastrophic destruction and credential-value disclosure."
+                : "Choose a Claude or Codex engine before enabling full task-scoped access; other engines do not mount the protected gateway."}
             </div>
             <select
               value={bot.accessProfile ?? "standard"}
@@ -711,7 +715,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               className="mt-3 w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
             >
               <option value="standard">Standard</option>
-              <option value="full-task-scoped">Full task-scoped</option>
+              <option value="full-task-scoped" disabled={!fullTaskScopedAvailable}>Full task-scoped</option>
             </select>
           </div>
 
@@ -719,11 +723,11 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             <div>
               <div className="text-[15px] font-medium text-ink">Auto mode</div>
               <div className="mt-0.5 text-[13px] text-ink-secondary">
-                {bot.computer === "local" && bot.accessProfile !== "full-task-scoped"
+                {bot.computer === "local" && !fullTaskScoped
                   ? "Local computer actions always require your approval in this beta."
-                  : bot.accessProfile === "full-task-scoped" && bot.autoApprove
+                  : fullTaskScoped && bot.autoApprove
                   ? "Keeps going across host and connected tools; only catastrophic destruction and credential-value disclosure stop automatically."
-                  : bot.accessProfile === "full-task-scoped"
+                  : fullTaskScoped
                   ? "Approve each non-denied action yourself. The same capabilities remain available, and the two hard denials still apply."
                   : bot.autoApprove
                   ? "Keeps going on its own — you'll still be asked about anything destructive, and about questions it asks you."
@@ -734,11 +738,11 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               role="switch"
               aria-checked={Boolean(bot.autoApprove)}
               aria-label="Auto mode"
-              disabled={bot.computer === "local" && bot.accessProfile !== "full-task-scoped"}
+              disabled={bot.computer === "local" && !fullTaskScoped}
               onClick={() => patch({ autoApprove: !bot.autoApprove })}
               className={cn(
                 "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors",
-                bot.computer === "local" && bot.accessProfile !== "full-task-scoped" && "cursor-not-allowed opacity-40",
+                bot.computer === "local" && !fullTaskScoped && "cursor-not-allowed opacity-40",
                 bot.autoApprove ? "bg-accent" : "bg-raised",
               )}
             >

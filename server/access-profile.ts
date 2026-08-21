@@ -11,6 +11,16 @@ export const FULL_TASK_SCOPED_HARD_DENIES = [
 export type FullTaskScopedHardDeny = (typeof FULL_TASK_SCOPED_HARD_DENIES)[number];
 export type TelemetryCaptureMode = "off" | "metadata" | "sanitized-content";
 
+// BotRecord profiles are currently mounted by these two provider adapters.
+// Manus and Hermes use the external gateway lease API instead of a BotRecord,
+// so they are intentionally not part of this driver-kind list.
+export const FULL_TASK_SCOPED_BOT_DRIVER_KINDS = ["claudeAgent", "codex"] as const;
+
+export function supportsFullTaskScopedBotDriver(driverKind: unknown): boolean {
+  return typeof driverKind === "string" &&
+    (FULL_TASK_SCOPED_BOT_DRIVER_KINDS as readonly string[]).includes(driverKind);
+}
+
 export interface CapabilityProfileManifest {
   schema: "openmaus.capability-profile.v1";
   profile: "full-task-scoped";

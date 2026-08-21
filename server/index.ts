@@ -16,6 +16,7 @@ import {
   FULL_TASK_SCOPED_SYSTEM_PROMPT,
   isAccessProfile,
   isFullTaskScoped,
+  supportsFullTaskScopedBotDriver,
 } from "./access-profile.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
@@ -1446,6 +1447,18 @@ async function startTurn(
       { status: 409 },
     );
   }
+  const fullTaskScoped = isFullTaskScoped(bot.accessProfile);
+  if (
+    fullTaskScoped &&
+    (opts?.runOn === "cloud" || !supportsFullTaskScopedBotDriver(instance.driverKind))
+  ) {
+    throw Object.assign(
+      new Error(
+        "full-task-scoped bot turns require the Claude or Codex engine so every capability crosses the protected gateway",
+      ),
+      { status: 409 },
+    );
+  }
   const instanceId = instance.instanceId;
   const model = opts?.runOn === "cloud" ? instance.models.default : bot.modelSelection.model;
   // a cloud routine borrows the instance default model, so it borrows no
@@ -1528,7 +1541,6 @@ async function startTurn(
     let capabilityManifest = hostMcpCatalog.manifest;
     try {
       const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
-      const fullTaskScoped = isFullTaskScoped(bot.accessProfile);
       const selectedSkills = fullTaskScoped
         ? []
         : selectBundledSkills(
@@ -1963,6 +1975,19 @@ async function runGroupMemberTurn(
     });
     return true;
   }
+  const fullTaskScoped = isFullTaskScoped(bot.accessProfile);
+  if (fullTaskScoped && !supportsFullTaskScopedBotDriver(instance.driverKind)) {
+    store.appendMessage(group.threadId, {
+      role: "bot",
+      kind: "activity",
+      from: { botId: bot.id, name: bot.name, color: bot.color },
+      tool: {
+        name: `error: ${bot.name}'s full-task-scoped profile requires the Claude or Codex engine`,
+        ok: false,
+      },
+    });
+    return true;
+  }
   // One turn per bot at a time, across BOTH engines. Without this a bot
   // could run its 1:1 turn and a room turn concurrently — two provider
   // processes, interleaved token spend, and an interrupt that only ever
@@ -1977,7 +2002,6 @@ async function runGroupMemberTurn(
     return true;
   }
   const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
-  const fullTaskScoped = isFullTaskScoped(bot.accessProfile);
   let capabilityToken: string | undefined;
   let retrievalContext = "";
   let capabilityManifest = hostMcpCatalog.manifest;
@@ -3569,6 +3593,18 @@ const server = createServer(async (req, res) => {
           return json(res, 400, { error: "accessProfile must be standard or full-task-scoped" });
         }
         patch.accessProfile = body.accessProfile;
+      }
+      {
+        const effectiveAccessProfile = body.accessProfile ?? existingBot?.accessProfile ?? "standard";
+        const effectiveInstanceId = body.modelSelection?.instanceId ?? existingBot?.modelSelection.instanceId;
+        if (effectiveAccessProfile === "full-task-scoped") {
+          const target = effectiveInstanceId ? registry.get(effectiveInstanceId) : null;
+          if (!target || !supportsFullTaskScopedBotDriver(target.driverKind)) {
+            return json(res, 400, {
+              error: "full-task-scoped is available only for Claude and Codex bot engines",
+            });
+          }
+        }
       }
       if (
         body.computer !== undefined &&

@@ -1,5 +1,5 @@
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -120,6 +120,21 @@ describe("CapabilityGateway", () => {
     expect(result).toMatchObject({ isError: true });
     expect(JSON.stringify(result)).toContain("catastrophic-destruction");
     expect(gateway.stats().activeBackends).toEqual([]);
+  });
+
+  it("blocks a structured Pi credential-store read before touching the host file", async () => {
+    const gateway = new CapabilityGateway({
+      servers: { "openmaus-host": { type: "builtin" } },
+      manifest: createCapabilityProfileManifest({ toolInventory: ["openmaus-host:filesystem_read"] }),
+      sources: { claude: "missing", codex: "missing" },
+    });
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, { botId: "bot", threadId: "thread" });
+    const result = await gateway.callTool(TOKEN, "openmaus-host", "filesystem_read", {
+      path: join(homedir(), ".pi", "agent", "auth.json"),
+    });
+    expect(result).toMatchObject({ isError: true });
+    expect(JSON.stringify(result)).toContain("credential-value-disclosure");
   });
 
   it("removes binary payloads and closes idle backends", async () => {

@@ -4,6 +4,7 @@ import {
   createCapabilityProfileManifest,
   isAccessProfile,
   normalizeAccessProfile,
+  supportsFullTaskScopedBotDriver,
 } from "./access-profile.ts";
 
 describe("access profiles", () => {
@@ -11,6 +12,13 @@ describe("access profiles", () => {
     expect(normalizeAccessProfile(undefined)).toBe("standard");
     expect(normalizeAccessProfile("anything-goes")).toBe("standard");
     expect(isAccessProfile("full-task-scoped")).toBe(true);
+  });
+
+  it("offers BotRecord full access only through adapters that mount the gateway", () => {
+    expect(supportsFullTaskScopedBotDriver("claudeAgent")).toBe(true);
+    expect(supportsFullTaskScopedBotDriver("codex")).toBe(true);
+    expect(supportsFullTaskScopedBotDriver("piAgent")).toBe(false);
+    expect(supportsFullTaskScopedBotDriver("boxAgent")).toBe(false);
   });
 
   it("creates a deterministic, value-free capability manifest", () => {

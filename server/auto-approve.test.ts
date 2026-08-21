@@ -125,6 +125,14 @@ describe("full-task-scoped hard denials", () => {
   it("blocks structured credential-store reads without blocking non-secret writes", () => {
     for (const path of [
       "~/.codex/auth.json",
+      "~/.pi/agent/auth.json",
+      join(homedir(), ".pi", "agent", "auth.json"),
+      "~/.grok/auth.json",
+      "~/.gemini/oauth_creds.json",
+      "~/.factory/auth.v2.loginkeychain",
+      "~/.factory/settings.json",
+      "~/.local/share/opencode/auth.json",
+      join(homedir(), "Library", "Application Support", "opencode", "auth.json"),
       "~/.openmausbot/config.json",
       "~/Library/Application Support/openmausbot/credentials.bin",
       "~/.aws/credentials",

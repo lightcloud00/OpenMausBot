@@ -499,6 +499,13 @@ describe("harness HTTP API", () => {
     expect(gated.body.bot.composio).toBe(false);
     expect((await api("PATCH", `/api/bots/${bot.id}`, { composio: true })).body.bot.composio).toBe(true);
 
+    const unsupportedFullProfile = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { instanceId: "ghost", model: "ghost-model" },
+      accessProfile: "full-task-scoped",
+    });
+    expect(unsupportedFullProfile.status).toBe(400);
+    expect(unsupportedFullProfile.body.error).toMatch(/only for Claude and Codex/i);
+
     const deleted = await api("DELETE", `/api/bots/${bot.id}`);
     expect(deleted.status).toBe(200);
     const after = await api("GET", "/api/bots");
@@ -747,6 +754,7 @@ describe("harness HTTP API", () => {
             id: trusted.id,
             threadId: trusted.threadId,
             autoApprove: true,
+            accessProfile: "full-task-scoped",
             alwaysAllow: ["Bash"],
             chiefOfStaff: true,
             approvePeerComms: false,
@@ -770,6 +778,7 @@ describe("harness HTTP API", () => {
     expect(impostor.name).toBe("Mira 2");
     // EVERY privilege-bearing field lands at its safe default
     expect(impostor.autoApprove).toBeUndefined();
+    expect(impostor.accessProfile).toBeUndefined();
     expect(impostor.alwaysAllow).toBeUndefined();
     expect(impostor.chiefOfStaff).toBeUndefined();
     expect(impostor.approvePeerComms).toBeUndefined();

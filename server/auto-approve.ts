@@ -83,6 +83,8 @@ const CREDENTIAL_VALUE_DISCLOSURE = [
 const CREDENTIAL_STORE_PATH = [
   /(?:^|[\s/'"\\])\.codex[\\/]auth\.json(?:[\s'"\\]|$)/i,
   /(?:^|[\s/'"\\])\.claude(?:\.json|[\\/](?:settings\.json|credentials?(?:\.json)?))(?:[\s'"\\]|$)/i,
+  /(?:^|[\s/'"\\])\.(?:pi[\\/]agent[\\/]auth\.json|grok[\\/]auth\.json|gemini[\\/]oauth_creds\.json|factory[\\/](?:auth\.v2\.(?:file|loginkeychain|keyring)|settings\.json))(?:[\s'"\\]|$)/i,
+  /(?:^|[\s/'"\\])opencode[\\/]auth\.json(?:[\s'"\\]|$)/i,
   /(?:^|[\s/'"\\])\.(?:aws[\\/]credentials|ssh[\\/](?:id_[^\s/'"\\]+|authorized_keys)|docker[\\/]config\.json|kube[\\/]config|netrc|npmrc|pypirc)(?:[\s'"\\]|$)/i,
   /(?:^|[\s/'"\\])\.config[\\/](?:credvault|gcloud|gh[\\/]hosts\.yml|glab-cli[\\/]config\.yml)(?:[\\/\s'"\\]|$)/i,
   /(?:^|[\s/'"\\])\.credvault(?:[\\/\s'"\\]|$)/i,
