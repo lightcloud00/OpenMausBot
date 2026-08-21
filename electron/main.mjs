@@ -30,6 +30,8 @@ const APP_ICON = path.join(__dirname, "resources/app-icon.png");
 let desktopViewerWindow = null;
 let desktopViewerOwner = null;
 let desktopViewerContextId = null;
+const SMOKE_TEST = process.env.OMB_SMOKE_TEST === "1";
+const SMOKE_CUA = SMOKE_TEST && process.env.OMB_SMOKE_CUA === "1";
 
 // GNOME groups the window with its installed desktop entry only when both
 // identities match. This must run before Electron becomes ready.
@@ -488,14 +490,14 @@ function createWindow() {
   // Packaged CI smoke hook. It validates the real renderer/preload bridge and
   // same-origin embedded server, then follows the normal window-close path.
   // No debugging port or sandbox override is needed.
-  if (process.env.OMB_SMOKE_TEST === "1") {
+  if (SMOKE_TEST) {
     win.webContents.once("did-finish-load", async () => {
       try {
         const result = await win.webContents.executeJavaScript(`
           (async () => {
             if (!window.ogb?.getCapabilities) throw new Error("desktop preload bridge is unavailable");
             let crashPromise = null;
-            if (${JSON.stringify(process.env.OMB_SMOKE_CUA === "1")}) {
+            if (${JSON.stringify(SMOKE_CUA)}) {
               crashPromise = new Promise((resolve, reject) => {
                 const timeout = setTimeout(() => {
                   unsubscribe?.();
@@ -821,7 +823,11 @@ setCuaStateListener((connection) => {
 
 app.whenReady().then(async () => {
   if (process.platform === "darwin") app.dock.setIcon(APP_ICON);
-  if (app.isPackaged) {
+  // Package acceptance must not ask Chromium's shared Safe Storage keychain,
+  // register a connected-app identity, or migrate credentials. A development
+  // signature does not share the installed app's trust identity even when the
+  // user-data directory is isolated.
+  if (app.isPackaged && !SMOKE_TEST) {
     secureCredentials = await loadSecureCredentials();
     await secureComposioConfig();
     await secureWorkspaceConfig();
@@ -885,12 +891,17 @@ app.whenReady().then(async () => {
   // connection descriptor on first render. Never blocks window creation on
   // failure — computer use degrades to "unavailable", the rest still works.
   cuaReady =
-    process.platform === "darwin" || process.platform === "linux"
+    (process.platform === "darwin" || process.platform === "linux") && (!SMOKE_TEST || SMOKE_CUA)
       ? startCua().catch((e) => {
           console.error("[cua] start failed:", e);
           return { mode: "unavailable", reason: String(e) };
         })
-      : Promise.resolve({ mode: "unavailable", reason: "unsupported-platform" });
+      : Promise.resolve({
+          mode: "unavailable",
+          reason: SMOKE_TEST
+            ? "package smoke disables CUA unless OMB_SMOKE_CUA=1"
+            : "unsupported-platform",
+        });
   if (app.isPackaged) serverReady = await startServerPackaged();
   // The companion the user left on comes back without anyone finding the
   // toggle again — one attempt, after the harness port is settled, with the
@@ -903,7 +914,7 @@ app.whenReady().then(async () => {
   const win = createWindow();
   // in-app auto-update (packaged only) — checks GitHub releases, downloads on
   // the user's click, installs on "Restart to update"
-  startUpdater(win);
+  if (!SMOKE_TEST) startUpdater(win);
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

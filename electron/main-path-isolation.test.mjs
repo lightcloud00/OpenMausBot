@@ -41,3 +41,11 @@ it("requires isolated absolute non-root path overrides", () => {
   expect(source).toMatch(/fs\.mkdirSync\(resolved, \{ recursive: true, mode: 0o700 \}\)/);
   expect(source).toMatch(/fs\.statSync\(resolved\)\.isDirectory\(\)/);
 });
+
+it("keeps package smoke away from shared credentials, CUA, and updater state by default", () => {
+  expect(source).toContain('const SMOKE_TEST = process.env.OMB_SMOKE_TEST === "1";');
+  expect(source).toContain('const SMOKE_CUA = SMOKE_TEST && process.env.OMB_SMOKE_CUA === "1";');
+  expect(source).toContain("if (app.isPackaged && !SMOKE_TEST)");
+  expect(source).toContain("(!SMOKE_TEST || SMOKE_CUA)");
+  expect(source).toContain("if (!SMOKE_TEST) startUpdater(win)");
+});
