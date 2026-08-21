@@ -96,6 +96,7 @@ function sentryError(envelope: TelemetryErrorEnvelope): void {
     });
     scope.setContext("openmausbot", {
       diagnostic_summary: clean.message.slice(0, 1_000),
+      ...(clean.diagnostics ? { diagnostics: clean.diagnostics } : {}),
       at: clean.at,
     });
     Sentry.captureException(error);

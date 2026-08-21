@@ -46,6 +46,7 @@ export interface TelemetryErrorEnvelope {
   name: string;
   message: string;
   stack?: string;
+  diagnostics?: Record<string, string | number | boolean>;
   at: string;
 }
 

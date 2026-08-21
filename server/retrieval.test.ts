@@ -65,4 +65,50 @@ describe("OpenMausRetriever", () => {
     expect(result.sourceCount).toBe(0);
     expect(result.priorTurnCount).toBe(1);
   });
+
+  it("rejects stale or unidentified source chunks instead of advertising them as the exact snapshot", async () => {
+    const dataDir = tmpDir("retrieval-source-identity-");
+    const retriever = new OpenMausRetriever({
+      dataDir,
+      sourceSha: "exact-source-sha",
+      sourceRetrieve: async () => ({ results: [
+        {
+          text: "exact committed source",
+          repository_id: "openmausbot",
+          repository_relative_path: "server/exact.ts",
+          source_sha: "exact-source-sha",
+        },
+        {
+          text: "stale source must not be injected",
+          repository_id: "openmausbot",
+          repository_relative_path: "server/stale.ts",
+          source_sha: "stale-source-sha",
+        },
+        {
+          text: "unidentified source must not be injected",
+          repository_id: "openmausbot",
+          repository_relative_path: "server/unknown.ts",
+        },
+      ] }),
+    });
+
+    const result = await retriever.retrieve("exact committed source");
+    const formatted = retriever.format(result);
+    expect(result).toMatchObject({
+      sourceSha: "exact-source-sha",
+      sourceCount: 1,
+      degraded: true,
+    });
+    expect(result.warnings).toEqual([
+      "discarded 1 project-source chunk(s) from a different source snapshot",
+      "discarded 1 project-source chunk(s) without an exact source SHA",
+    ]);
+    expect(result.chunks.filter((chunk) => chunk.kind === "source")).toEqual([
+      expect.objectContaining({ text: "exact committed source", sourceSha: "exact-source-sha" }),
+    ]);
+    expect(formatted).toContain('source-sha="exact-source-sha"');
+    expect(formatted).not.toContain("stale source must not be injected");
+    expect(formatted).not.toContain("stale-source-sha");
+    expect(formatted).not.toContain("unidentified source must not be injected");
+  });
 });

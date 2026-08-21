@@ -173,8 +173,8 @@ export class OpenMausRetriever {
       .map((row) => row.chunk);
   }
 
-  private async source(query: string, cwd?: string, turnToken?: string): Promise<{ chunks: RetrievalChunk[]; warning?: string }> {
-    if (!this.options.sourceRetrieve) return { chunks: [], warning: "project-source retriever is not configured" };
+  private async source(query: string, cwd?: string, turnToken?: string): Promise<{ chunks: RetrievalChunk[]; warnings: string[] }> {
+    if (!this.options.sourceRetrieve) return { chunks: [], warnings: ["project-source retriever is not configured"] };
     const timeoutMs = this.options.sourceTimeoutMs ?? 8_000;
     let timer: NodeJS.Timeout | undefined;
     try {
@@ -185,9 +185,16 @@ export class OpenMausRetriever {
           timer.unref?.();
         }),
       ]);
-      return { chunks: sourceCandidates(result).slice(0, SOURCE_CHUNK_LIMIT) };
+      const candidates = sourceCandidates(result);
+      const exact = candidates.filter((chunk) => chunk.sourceSha === this.options.sourceSha);
+      const mismatched = candidates.filter((chunk) => chunk.sourceSha && chunk.sourceSha !== this.options.sourceSha).length;
+      const unidentified = candidates.filter((chunk) => !chunk.sourceSha).length;
+      const warnings: string[] = [];
+      if (mismatched) warnings.push(`discarded ${mismatched} project-source chunk(s) from a different source snapshot`);
+      if (unidentified) warnings.push(`discarded ${unidentified} project-source chunk(s) without an exact source SHA`);
+      return { chunks: exact.slice(0, SOURCE_CHUNK_LIMIT), warnings };
     } catch (error) {
-      return { chunks: [], warning: error instanceof Error ? error.message : "project-source retrieval failed" };
+      return { chunks: [], warnings: [error instanceof Error ? error.message : "project-source retrieval failed"] };
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -222,8 +229,8 @@ export class OpenMausRetriever {
       sourceCount,
       priorTurnCount,
       charCount: chars,
-      degraded: Boolean(source.warning),
-      warnings: source.warning ? [this.sanitize(source.warning).slice(0, 300)] : [],
+      degraded: source.warnings.length > 0,
+      warnings: source.warnings.map((warning) => this.sanitize(warning).slice(0, 300)),
     };
   }
 

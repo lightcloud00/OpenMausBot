@@ -179,7 +179,11 @@ export function telemetrySinkSpawnSpec(
  * environments, argv, journals, or tool results. */
 export class TelemetryManager {
   private readonly options: TelemetryOptions;
+  /** Correlation IDs are unique even when multiple authenticated external
+   * turns intentionally share a conversation thread. */
   private readonly turns = new Map<string, TurnState>();
+  private readonly turnByIdentity = new Map<string, string>();
+  private readonly turnsByThread = new Map<string, string[]>();
   private readonly sinks = new Map<SinkKind, SinkChild>();
   private readonly protectedValues = protectedEnvironmentValues();
   private readonly healthState: Record<SinkKind, TelemetryHealth> = {
@@ -268,28 +272,82 @@ export class TelemetryManager {
     return structuredClone(this.healthState);
   }
 
-  registerTurn(input: RegisterTurnInput): string {
+  private identityKey(threadId: string, turnId: string): string {
+    return JSON.stringify([threadId, turnId]);
+  }
+
+  private stateForThread(threadId: string): { correlationId: string; state: TurnState } | undefined {
+    const correlations = this.turnsByThread.get(threadId) ?? [];
+    // Preserve the legacy single-thread behavior for providers that do not
+    // report turn IDs: the most recently registered active turn owns events.
+    for (let index = correlations.length - 1; index >= 0; index -= 1) {
+      const correlationId = correlations[index]!;
+      const state = this.turns.get(correlationId);
+      if (state) return { correlationId, state };
+    }
+    return undefined;
+  }
+
+  private stateForEvent(event: RuntimeEvent): { correlationId: string; state: TurnState } | undefined {
+    if (!event.turnId) return this.stateForThread(event.threadId);
+    const identity = this.identityKey(event.threadId, event.turnId);
+    const exactCorrelation = this.turnByIdentity.get(identity);
+    if (exactCorrelation) {
+      const exact = this.turns.get(exactCorrelation);
+      if (exact) return { correlationId: exactCorrelation, state: exact };
+      this.turnByIdentity.delete(identity);
+    }
+
+    // Existing callers register before a provider reports its native turn ID.
+    // Bind the oldest unbound state once, then route every subsequent event by
+    // exact identity. External callers may also provide the ID up front via
+    // the backwards-compatible overload below.
+    for (const correlationId of this.turnsByThread.get(event.threadId) ?? []) {
+      const state = this.turns.get(correlationId);
+      if (!state || state.turnId !== "pending") continue;
+      state.turnId = event.turnId;
+      this.turnByIdentity.set(identity, correlationId);
+      return { correlationId, state };
+    }
+    return undefined;
+  }
+
+  registerTurn(input: RegisterTurnInput): string;
+  registerTurn(input: RegisterTurnInput, turnId: string): string;
+  registerTurn(input: RegisterTurnInput, turnId?: string): string {
+    if (turnId) {
+      const existing = this.turnByIdentity.get(this.identityKey(input.threadId, turnId));
+      if (existing && this.turns.has(existing)) return existing;
+    }
     const correlationId = randomUUID();
-    this.turns.set(input.threadId, {
+    const state: TurnState = {
       ...input,
       correlationId,
       traceId: randomUUID(),
-      turnId: "pending",
+      turnId: turnId || "pending",
       startedAt: this.now().toISOString(),
       promptSummary: summary(String(this.sanitize(input.prompt))),
       responseSummary: "",
       tools: new Map(),
       completedTools: [],
-    });
+    };
+    this.turns.set(correlationId, state);
+    this.turnsByThread.set(input.threadId, [...(this.turnsByThread.get(input.threadId) ?? []), correlationId]);
+    if (turnId) this.turnByIdentity.set(this.identityKey(input.threadId, turnId), correlationId);
     return correlationId;
   }
 
   handleRuntimeEvent(event: RuntimeEvent): void {
-    const state = this.turns.get(event.threadId);
-    if (state && event.turnId) state.turnId = event.turnId;
+    const active = this.stateForEvent(event);
+    const state = active?.state;
     if (event.type === "runtime.error") {
       if (state) state.errorSummary = summary(String(this.sanitize(event.message)), 1_000);
-      this.captureError(event.message, { component: "driver", state, turnId: event.turnId });
+      this.captureError(event.message, {
+        component: "driver",
+        state,
+        threadId: event.threadId,
+        turnId: event.turnId,
+      });
     }
     if (!state) return;
     const at = event.createdAt || this.now().toISOString();
@@ -308,22 +366,40 @@ export class TelemetryManager {
     } else if (event.type === "turn.completed") {
       if (event.usage) state.usage = event.usage;
       const cancelled = /cancel|interrupt|abort/i.test(event.stopReason ?? "");
-      this.finishTurn(event.threadId, event.ok ? "completed" : cancelled ? "cancelled" : "failed", event.stopReason ?? undefined);
+      this.finishTurn(
+        active.correlationId,
+        event.ok ? "completed" : cancelled ? "cancelled" : "failed",
+        event.stopReason ?? undefined,
+      );
     }
   }
 
-  failTurn(threadId: string, error: unknown): void {
-    const state = this.turns.get(threadId);
+  failTurn(threadId: string, error: unknown): void;
+  failTurn(threadId: string, turnId: string, error: unknown): void;
+  failTurn(threadId: string, turnIdOrError: string | unknown, explicitError?: unknown): void {
+    const hasTurnId = arguments.length >= 3;
+    const turnId = hasTurnId ? String(turnIdOrError) : undefined;
+    const error = hasTurnId ? explicitError : turnIdOrError;
+    const correlationId = turnId
+      ? this.turnByIdentity.get(this.identityKey(threadId, turnId))
+      : this.stateForThread(threadId)?.correlationId;
+    const state = correlationId ? this.turns.get(correlationId) : undefined;
     const message = error instanceof Error ? error.message : String(error);
     if (state) state.errorSummary = summary(String(this.sanitize(message)), 1_000);
-    this.captureError(error, { component: "driver", state });
-    this.finishTurn(threadId, "failed", message);
+    this.captureError(error, { component: "driver", state, threadId, turnId });
+    if (correlationId) this.finishTurn(correlationId, "failed", message);
   }
 
-  private finishTurn(threadId: string, outcome: TelemetryTraceEnvelope["outcome"], error?: string): void {
-    const state = this.turns.get(threadId);
+  private finishTurn(correlationId: string, outcome: TelemetryTraceEnvelope["outcome"], error?: string): void {
+    const state = this.turns.get(correlationId);
     if (!state) return;
-    this.turns.delete(threadId);
+    this.turns.delete(correlationId);
+    if (state.turnId !== "pending") {
+      this.turnByIdentity.delete(this.identityKey(state.threadId, state.turnId));
+    }
+    const remaining = (this.turnsByThread.get(state.threadId) ?? []).filter((id) => id !== correlationId);
+    if (remaining.length) this.turnsByThread.set(state.threadId, remaining);
+    else this.turnsByThread.delete(state.threadId);
     const endedAt = this.now().toISOString();
     for (const open of state.tools.values()) {
       state.completedTools.push({ ...open, endedAt, ok: false });
@@ -366,6 +442,7 @@ export class TelemetryManager {
       engine?: string;
       model?: string;
       correlationId?: string;
+      diagnostics?: Record<string, unknown>;
     },
   ): void {
     const original = error instanceof Error ? error : new Error(String(error));
@@ -387,9 +464,23 @@ export class TelemetryManager {
       name: original.name,
       message: summary(original.message, 1_000),
       stack: original.stack ? summary(original.stack, 4_000) : undefined,
+      diagnostics: this.sanitizeDiagnostics(context.diagnostics),
       at: this.now().toISOString(),
     });
     this.send("sentry", envelope);
+  }
+
+  private sanitizeDiagnostics(input: Record<string, unknown> | undefined): Record<string, string | number | boolean> | undefined {
+    if (!input) return undefined;
+    const diagnostics: Record<string, string | number | boolean> = {};
+    for (const [rawKey, rawValue] of Object.entries(input).slice(0, 16)) {
+      const key = summary(rawKey, 80).replace(/[^A-Za-z0-9_.-]/g, "_");
+      if (!key) continue;
+      if (typeof rawValue === "string") diagnostics[key] = summary(String(this.sanitize(rawValue)), 1_000);
+      else if (typeof rawValue === "number" && Number.isFinite(rawValue)) diagnostics[key] = rawValue;
+      else if (typeof rawValue === "boolean") diagnostics[key] = rawValue;
+    }
+    return Object.keys(diagnostics).length ? diagnostics : undefined;
   }
 
   private writeJournal(envelope: TelemetryTraceEnvelope): void {
@@ -414,7 +505,7 @@ export class TelemetryManager {
   }
 
   shutdown(): void {
-    for (const threadId of [...this.turns.keys()]) this.finishTurn(threadId, "cancelled", "application shutdown");
+    for (const correlationId of [...this.turns.keys()]) this.finishTurn(correlationId, "cancelled", "application shutdown");
     for (const child of this.sinks.values()) {
       try { child.stdin.end(); } catch {}
       killCliTree(child);

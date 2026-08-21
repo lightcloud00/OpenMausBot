@@ -176,6 +176,84 @@ describe("TelemetryManager", () => {
     manager.shutdown();
   });
 
+  it("keeps concurrent turns on the same thread isolated by exact turn identity", () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-telemetry-concurrent-"));
+    dirs.push(dir);
+    const sinks = { sentry: fakeSink(), langfuse: fakeSink() };
+    const manager = new TelemetryManager({
+      dataDir: dir,
+      sinkPath: "/unused",
+      sourceSha: "c".repeat(40),
+      release: "dev",
+      spawnSink: (kind) => sinks[kind].child,
+    });
+
+    const correlationA = manager.registerTurn({
+      botId: "manus",
+      botName: "Manus",
+      threadId: "shared-thread",
+      engine: "openmaus-gateway",
+      model: "external-client",
+      prompt: "first external request",
+    });
+    manager.handleRuntimeEvent(event("turn.started", { threadId: "shared-thread", turnId: "external-turn-a" }));
+    const correlationB = manager.registerTurn({
+      botId: "hermes",
+      botName: "Hermes",
+      threadId: "shared-thread",
+      engine: "openmaus-gateway",
+      model: "external-client",
+      prompt: "second external request",
+    });
+
+    manager.handleRuntimeEvent(event("turn.started", { threadId: "shared-thread", turnId: "external-turn-b" }));
+    manager.handleRuntimeEvent(event("item.completed", {
+      threadId: "shared-thread",
+      turnId: "external-turn-b",
+      itemType: "assistant_text",
+      text: "second response",
+    }));
+    manager.handleRuntimeEvent(event("item.completed", {
+      threadId: "shared-thread",
+      turnId: "external-turn-a",
+      itemType: "assistant_text",
+      text: "first response",
+    }));
+    manager.handleRuntimeEvent(event("turn.completed", {
+      threadId: "shared-thread",
+      turnId: "external-turn-b",
+      ok: true,
+    }));
+    manager.handleRuntimeEvent(event("turn.completed", {
+      threadId: "shared-thread",
+      turnId: "external-turn-a",
+      ok: true,
+    }));
+
+    expect(sinks.langfuse.lines).toHaveLength(2);
+    const traces = sinks.langfuse.lines.map((line) => JSON.parse(line));
+    expect(new Set(traces.map((trace) => trace.traceId)).size).toBe(2);
+    expect(new Set(traces.map((trace) => trace.correlationId))).toEqual(new Set([correlationA, correlationB]));
+    expect(Object.fromEntries(traces.map((trace) => [trace.turnId, {
+      botId: trace.botId,
+      promptSummary: trace.promptSummary,
+      responseSummary: trace.responseSummary,
+    }]))).toEqual({
+      "external-turn-a": {
+        botId: "manus",
+        promptSummary: "first external request",
+        responseSummary: "first response",
+      },
+      "external-turn-b": {
+        botId: "hermes",
+        promptSummary: "second external request",
+        responseSummary: "second response",
+      },
+    });
+    manager.shutdown();
+    expect(sinks.langfuse.lines).toHaveLength(2);
+  });
+
   it("sends full sanitized runtime errors to Sentry without conversational prompts", () => {
     const dir = mkdtempSync(join(tmpdir(), "omb-telemetry-"));
     dirs.push(dir);
@@ -206,6 +284,40 @@ describe("TelemetryManager", () => {
       botId: "cogs",
       threadId: "thread-1",
     });
+    manager.shutdown();
+  });
+
+  it("bounds and sanitizes renderer diagnostics before sending them to Sentry", () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-telemetry-renderer-"));
+    dirs.push(dir);
+    const canary = "renderer-secret-canary-83746";
+    process.env.TEST_API_KEY = canary;
+    const sinks = { sentry: fakeSink(), langfuse: fakeSink() };
+    const manager = new TelemetryManager({
+      dataDir: dir,
+      sinkPath: "/unused",
+      sourceSha: "d".repeat(40),
+      release: "dev",
+      spawnSink: (kind) => sinks[kind].child,
+    });
+
+    manager.captureError(new Error("renderer failed"), {
+      component: "renderer",
+      diagnostics: {
+        source: "window.error",
+        page: `http://127.0.0.1/app/${canary}`,
+        line: 42,
+        unsupported: { secret: canary },
+        oversized: "x".repeat(2_000),
+      },
+    });
+
+    expect(sinks.sentry.lines).toHaveLength(1);
+    expect(sinks.sentry.lines[0]).not.toContain(canary);
+    const envelope = JSON.parse(sinks.sentry.lines[0]!);
+    expect(envelope.diagnostics).toMatchObject({ source: "window.error", line: 42 });
+    expect(envelope.diagnostics).not.toHaveProperty("unsupported");
+    expect(envelope.diagnostics.oversized).toHaveLength(1_000);
     manager.shutdown();
   });
 
