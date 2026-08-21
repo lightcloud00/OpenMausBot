@@ -32,6 +32,7 @@ let desktopViewerOwner = null;
 let desktopViewerContextId = null;
 const SMOKE_TEST = process.env.OMB_SMOKE_TEST === "1";
 const SMOKE_CUA = SMOKE_TEST && process.env.OMB_SMOKE_CUA === "1";
+const SMOKE_BUNDLED_CUA = SMOKE_TEST && process.env.OMB_SMOKE_BUNDLED_CUA === "1";
 
 // GNOME groups the window with its installed desktop entry only when both
 // identities match. This must run before Electron becomes ready.
@@ -891,7 +892,8 @@ app.whenReady().then(async () => {
   // connection descriptor on first render. Never blocks window creation on
   // failure — computer use degrades to "unavailable", the rest still works.
   cuaReady =
-    (process.platform === "darwin" || process.platform === "linux") && (!SMOKE_TEST || SMOKE_CUA)
+    (process.platform === "darwin" || process.platform === "linux") &&
+    (!SMOKE_TEST || SMOKE_CUA || SMOKE_BUNDLED_CUA)
       ? startCua().catch((e) => {
           console.error("[cua] start failed:", e);
           return { mode: "unavailable", reason: String(e) };
@@ -899,7 +901,7 @@ app.whenReady().then(async () => {
       : Promise.resolve({
           mode: "unavailable",
           reason: SMOKE_TEST
-            ? "package smoke disables CUA unless OMB_SMOKE_CUA=1"
+            ? "package smoke disables CUA unless its isolated CUA lane is enabled"
             : "unsupported-platform",
         });
   if (app.isPackaged) serverReady = await startServerPackaged();

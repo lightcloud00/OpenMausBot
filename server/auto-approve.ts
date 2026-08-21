@@ -403,12 +403,43 @@ export function looksLikeCredentialValueDisclosure(text: string): boolean {
   return matchSafety(CREDENTIAL_VALUE_DISCLOSURE, text) !== null;
 }
 
+function structuredStringValues(summary: string): string[] {
+  if (
+    summary.length > MAX_SAFETY_TEXT ||
+    (!summary.trim().startsWith("{") && !summary.trim().startsWith("["))
+  ) return [];
+  try {
+    const pending: unknown[] = [JSON.parse(summary)];
+    const values: string[] = [];
+    let visited = 0;
+    const append = (items: unknown[]): void => {
+      const remaining = MAX_SAFETY_VARIANTS - visited - pending.length;
+      if (remaining > 0) pending.push(...items.slice(0, remaining));
+    };
+    while (pending.length && visited < MAX_SAFETY_VARIANTS) {
+      const value = pending.shift();
+      visited += 1;
+      if (typeof value === "string") {
+        if (value.length <= MAX_SAFETY_TEXT) values.push(value);
+      } else if (Array.isArray(value)) {
+        append(value);
+      } else if (value && typeof value === "object") {
+        append(Object.values(value));
+      }
+    }
+    return values;
+  } catch {
+    return [];
+  }
+}
+
 function targetsCredentialStoreRead(tool: string, summary: string): boolean {
   const readTool = /(?:^|[:_.-])(?:read|cat|show|get|resolve|reveal|export|dump|decrypt|download|copy|open|view|query|search|list|load|fetch)(?:$|[:_.-])/i.test(tool);
   const nestedReadTool = /["'](?:tool|name)["']\s*:\s*["'][^"']*(?:read|cat|show|get|resolve|reveal|export|dump|decrypt|download|copy|open|view|query|search|list|load|fetch)[^"']*["']/i.test(summary);
   const readCommand = /\b(?:cat|head|tail|less|more|sed|awk|perl|python\w*|node|cp|rsync|scp|tar|zip|base64|xxd|strings|security|sqlite3)\b/i.test(summary);
   if (!readTool && !nestedReadTool && !readCommand) return false;
-  return matchSafety(CREDENTIAL_STORE_PATH, summary) !== null;
+  return [summary, ...structuredStringValues(summary)]
+    .some((candidate) => matchSafety(CREDENTIAL_STORE_PATH, candidate) !== null);
 }
 
 export type FullTaskScopedHardDeny = "catastrophic-destruction" | "credential-value-disclosure";

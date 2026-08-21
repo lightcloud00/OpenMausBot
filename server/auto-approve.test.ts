@@ -180,6 +180,7 @@ describe("full-task-scoped hard denials", () => {
       "~/.codex/auth.json",
       "~/.pi/agent/auth.json",
       join(homedir(), ".pi", "agent", "auth.json"),
+      "C:\\Users\\runner\\.pi\\agent\\auth.json",
       "~/.grok/auth.json",
       "~/.gemini/oauth_creds.json",
       "~/.factory/auth.v2.loginkeychain",

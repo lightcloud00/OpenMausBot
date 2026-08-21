@@ -88,10 +88,18 @@ function boundedPath(raw: unknown, cwd?: string): string {
 }
 
 function shellCommand(command: string, cwd: string, timeoutMs: number): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const shell = process.platform === "win32"
+    ? process.env.ComSpec || process.env.COMSPEC || "cmd.exe"
+    : process.platform === "darwin"
+      ? "/bin/zsh"
+      : "/bin/sh";
+  const shellArgs = process.platform === "win32"
+    ? ["/d", "/v:off", "/s", "/c", command]
+    : ["-lc", command];
   return new Promise((resolveResult, reject) => {
     execFile(
-      "/bin/zsh",
-      ["-lc", command],
+      shell,
+      shellArgs,
       {
         cwd,
         env: minimalEnvironment(),
