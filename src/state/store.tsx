@@ -13,7 +13,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
+import type { AccessProfile, CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { MausColor, MausMotion } from "@/lib/mascot";
 import type { Routine, RoutineInput, RoutineRun } from "@/lib/routines";
 import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib/webhooks";
@@ -162,6 +162,8 @@ export interface Bot {
   cwd?: string;
   /** auto mode: the bot approves its own tool permissions */
   autoApprove?: boolean;
+  /** Runtime capability posture; missing is the standard profile. */
+  accessProfile?: AccessProfile;
   /** tools this bot may always use without asking */
   alwaysAllow?: string[];
   /** speak this bot's replies aloud as they settle */
@@ -439,6 +441,7 @@ export type Action =
           | "color"
           | "mascotExpression"
           | "autoApprove"
+          | "accessProfile"
           | "speakReplies"
           | "voice"
           | "pinned"
@@ -832,7 +835,9 @@ export function reducer(state: AppState, action: Action): AppState {
         : animated;
       return updateBot(next, action.botId, (b) => {
         const merged = { ...b, ...action.patch };
-        return merged.computer === "local" ? { ...merged, autoApprove: false } : merged;
+        return merged.computer === "local" && merged.accessProfile !== "full-task-scoped"
+          ? { ...merged, autoApprove: false }
+          : merged;
       });
     }
     case "threadActive": {

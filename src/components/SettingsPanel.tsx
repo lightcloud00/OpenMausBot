@@ -337,6 +337,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "color"
         | "mascotExpression"
         | "autoApprove"
+        | "accessProfile"
         | "speakReplies"
         | "voice"
         | "chiefOfStaff"
@@ -664,7 +665,11 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                   disabled={mode === "local" && !localSelectable}
                   title={mode === "local" && !localSelectable ? localDisabledReason ?? undefined : undefined}
                   onClick={() =>
-                    patch(mode === "local" ? { computer: mode, autoApprove: false } : { computer: mode })
+                    patch(
+                      mode === "local" && bot.accessProfile !== "full-task-scoped"
+                        ? { computer: mode, autoApprove: false }
+                        : { computer: mode },
+                    )
                   }
                   className={cn(
                     "flex-1 py-1.5 text-[13px] capitalize",
@@ -694,12 +699,32 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           {/* keyed so switching bots never shows one bot's notes under another's name */}
           <MemoryCard key={bot.id} bot={bot} />
 
+          <div className="rounded-xl bg-card p-4">
+            <div className="text-[15px] font-medium text-ink">Access profile</div>
+            <div className="mt-0.5 text-[13px] text-ink-secondary">
+              Full task-scoped access keeps every host and connected capability available while refusing only catastrophic destruction and credential-value disclosure.
+            </div>
+            <select
+              value={bot.accessProfile ?? "standard"}
+              onChange={(event) => patch({ accessProfile: event.target.value as "standard" | "full-task-scoped" })}
+              aria-label="Access profile"
+              className="mt-3 w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
+            >
+              <option value="standard">Standard</option>
+              <option value="full-task-scoped">Full task-scoped</option>
+            </select>
+          </div>
+
           <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
             <div>
               <div className="text-[15px] font-medium text-ink">Auto mode</div>
               <div className="mt-0.5 text-[13px] text-ink-secondary">
-                {bot.computer === "local"
+                {bot.computer === "local" && bot.accessProfile !== "full-task-scoped"
                   ? "Local computer actions always require your approval in this beta."
+                  : bot.accessProfile === "full-task-scoped" && bot.autoApprove
+                  ? "Keeps going across host and connected tools; only catastrophic destruction and credential-value disclosure stop automatically."
+                  : bot.accessProfile === "full-task-scoped"
+                  ? "Approve each non-denied action yourself. The same capabilities remain available, and the two hard denials still apply."
                   : bot.autoApprove
                   ? "Keeps going on its own — you'll still be asked about anything destructive, and about questions it asks you."
                   : "Approve each action yourself. Turn on to let this bot keep working without stopping to ask."}
@@ -709,11 +734,11 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               role="switch"
               aria-checked={Boolean(bot.autoApprove)}
               aria-label="Auto mode"
-              disabled={bot.computer === "local"}
+              disabled={bot.computer === "local" && bot.accessProfile !== "full-task-scoped"}
               onClick={() => patch({ autoApprove: !bot.autoApprove })}
               className={cn(
                 "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors",
-                bot.computer === "local" && "cursor-not-allowed opacity-40",
+                bot.computer === "local" && bot.accessProfile !== "full-task-scoped" && "cursor-not-allowed opacity-40",
                 bot.autoApprove ? "bg-accent" : "bg-raised",
               )}
             >

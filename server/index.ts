@@ -10,6 +10,13 @@ import { extname, join } from "node:path";
 import { z } from "zod";
 
 import { approvalKey, autoVerdict } from "./auto-approve.ts";
+import { CapabilityGateway } from "./capability-gateway.ts";
+import { appCapabilityServers, retainOnlyCapabilityGateway } from "./capability-integrations.ts";
+import {
+  FULL_TASK_SCOPED_SYSTEM_PROMPT,
+  isAccessProfile,
+  isFullTaskScoped,
+} from "./access-profile.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
 import { extensionForMime, IMAGE_MAX_BYTES, readAttachment, saveImage, type SavedAttachment } from "./attachments.ts";
@@ -43,9 +50,9 @@ import {
 } from "./config.ts";
 import { ComputerControl } from "./computer-control.ts";
 import { augmentedPath, findCliCandidates, resetPathCache } from "./env-path.ts";
-import { describeSpawnFailure, execCli } from "./procs.ts";
+import { clearProcessRegistry, configureProcessRegistry, describeSpawnFailure, execCli } from "./procs.ts";
 import { buildNotification, type Notification } from "./notify.ts";
-import { isEffortLevel, type RequestOutcome, type RuntimeEvent } from "./contracts.ts";
+import { isEffortLevel, type RequestOutcome, type RuntimeEvent, type SendTurnInput } from "./contracts.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
@@ -92,6 +99,11 @@ import { WebhookManager } from "./webhooks.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
+import { loadHostMcpCatalog, writeHostMcpManifest } from "./host-mcp.ts";
+import { publishGatewayEndpoint, removeGatewayEndpoint } from "./gateway-endpoint.ts";
+import { runtimeRelease, runtimeSourceSha } from "./release.ts";
+import { TelemetryManager } from "./telemetry.ts";
+import { OpenMausRetriever, SOURCE_CHUNK_LIMIT } from "./retrieval.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
 const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
@@ -108,7 +120,11 @@ const MIME: Record<string, string> = {
 };
 
 ensureDirs();
+configureProcessRegistry(join(DATA_DIR, "runtime", "owned-process-groups"));
 const cfg = loadConfig();
+const hostMcpCatalog = loadHostMcpCatalog();
+writeHostMcpManifest(DATA_DIR, hostMcpCatalog);
+const capabilityGateway = new CapabilityGateway(hostMcpCatalog);
 const registry = new ProviderRegistry(BUILT_IN_DRIVERS);
 await registry.load(instanceConfigs(cfg));
 const bundledSkills = loadBundledSkills();
@@ -120,6 +136,12 @@ bus.attach(registry.instances());
 // A shared secret guards the localhost-only /api/internal endpoints the
 // agents-proxy calls; regenerated each boot (the proxy gets it via env).
 const COMMS_TOKEN = randomBytes(24).toString("hex");
+publishGatewayEndpoint(DATA_DIR, {
+  url: `http://127.0.0.1:${PORT}/api/internal/capabilities`,
+  authorization: COMMS_TOKEN,
+  manifestSha256: hostMcpCatalog.manifest.sha256,
+  pid: process.pid,
+});
 
 /** Constant-time bearer check for the internal comms endpoints. The token
  * is high-entropy and loopback-only, so a timing oracle is a long shot —
@@ -138,6 +160,7 @@ const MAX_COMMS_DEPTH = 1;
 // there is exactly one way proxies are located.
 const agentsProxyPath = SPAWNED_PROXIES.agents;
 const phoneProxyPath = SPAWNED_PROXIES.phone;
+const capabilityProxyPath = SPAWNED_PROXIES.capabilities;
 // in the packaged app process.execPath is Electron — run the proxy as node
 const AGENTS_NODE_FLAG = { ELECTRON_RUN_AS_NODE: "1" };
 
@@ -162,6 +185,19 @@ function phoneIntegration() {
   if (process.env.OMB_RESOURCES_PATH) env.OMB_RESOURCES_PATH = process.env.OMB_RESOURCES_PATH;
   if (process.env.PH_ANDROID_SERIAL) env.PH_ANDROID_SERIAL = process.env.PH_ANDROID_SERIAL;
   return { command: process.execPath, args: [phoneProxyPath], env };
+}
+
+function capabilityIntegration(turnToken: string) {
+  return {
+    command: process.execPath,
+    args: [capabilityProxyPath],
+    env: {
+      ...AGENTS_NODE_FLAG,
+      OMB_HARNESS_URL: `http://127.0.0.1:${PORT}`,
+      OMB_COMMS_TOKEN: COMMS_TOKEN,
+      OMB_TURN_TOKEN: turnToken,
+    },
+  };
 }
 
 function connectedAppsIntegration(botId: string, threadId: string) {
@@ -225,8 +261,7 @@ function askBotAndWait(targetBotId: string, message: string, depth: number, from
 }
 
 // default selection for new bots: first available instance, claude preferred
-async function defaultSelection() {
-  const described = await registry.describe();
+function selectionFromDescription(described: Awaited<ReturnType<typeof registry.describe>>) {
   const available = described.filter((d) => d.snapshot.state === "available");
   // Deliberately NO fallback to described[0]. Handing a bot an engine whose
   // CLI isn't installed makes it look ready and then fail on send with a raw
@@ -236,10 +271,42 @@ async function defaultSelection() {
   const pick = available.find((d) => d.driverKind === "claudeAgent") ?? available[0];
   return { instanceId: pick?.instanceId ?? "", model: pick?.models.default ?? "" };
 }
+async function defaultSelection() {
+  return selectionFromDescription(await registry.describe());
+}
 let bootSelection = { instanceId: "", model: "" };
 const store = new Store(() => bootSelection);
 bootSelection = await defaultSelection();
 store.seedIfEmpty();
+const sourceSha = runtimeSourceSha();
+const release = runtimeRelease();
+const telemetry = new TelemetryManager({
+  dataDir: DATA_DIR,
+  sinkPath: SPAWNED_PROXIES.telemetrySink,
+  sourceSha,
+  release,
+  ...(process.env.OMB_TELEMETRY_DISABLED === "1" ? { spawnSink: () => null } : {}),
+});
+const retriever = new OpenMausRetriever({
+  dataDir: DATA_DIR,
+  sourceSha,
+  sourceRetrieve: async (query, cwd, turnToken) => {
+    if (!turnToken) throw new Error("project-source retrieval requires an active turn");
+    const listing = await capabilityGateway.listTools(turnToken, "fleet-windows");
+    const tools = Array.isArray(listing?.tools) ? listing.tools : [];
+    const names = tools.map((tool: { name?: unknown }) => String(tool?.name ?? ""));
+    const selected = names.includes("retrieve") ? "retrieve" : names.includes("query") ? "query" : "";
+    if (!selected) throw new Error("fleet-windows retrieval tool is unavailable");
+    return capabilityGateway.callTool(turnToken, "fleet-windows", selected, {
+      query,
+      cwd: cwd || process.cwd(),
+      intent: "auto",
+      limit: SOURCE_CHUNK_LIMIT,
+      truth: "canonical_upstream",
+    });
+  },
+});
+bus.subscribe((event) => telemetry.handleRuntimeEvent(event));
 
 /** A bot as a client may see it: no provider session bookkeeping.
  *
@@ -542,6 +609,101 @@ const repeats = new RepeatDetector({ thresholds: [5, 10, 20], maxKeysPerThread: 
 // touched, and turns parked on a human approval are exempt.
 const TURN_STALL_MS = Math.max(60_000, Number(process.env.OMB_TURN_STALL_MS) || 20 * 60_000);
 const roomStallCompletions = new RoomTurnStallRegistry();
+const capabilityTurnTokens = new Map<string, string>();
+const externalCapabilityTelemetry = new Map<string, {
+  client: string;
+  threadId: string;
+  turnId: string;
+  correlationId: string;
+}>();
+
+function externalCapabilityEvent(
+  token: string,
+  event: { type: RuntimeEvent["type"]; [key: string]: unknown },
+): void {
+  const turn = externalCapabilityTelemetry.get(token);
+  if (!turn) return;
+  telemetry.handleRuntimeEvent({
+    ...event,
+    eventId: `external-${randomUUID()}`,
+    provider: "openmaus-gateway",
+    threadId: turn.threadId,
+    turnId: turn.turnId,
+    createdAt: new Date().toISOString(),
+  } as RuntimeEvent);
+}
+
+function finishExternalCapabilityTurn(token: string, ok: boolean, reason?: string): void {
+  const turn = externalCapabilityTelemetry.get(token);
+  capabilityGateway.endTurn(token);
+  if (!turn) return;
+  externalCapabilityEvent(token, {
+    type: "turn.completed",
+    ok,
+    stopReason: reason ?? null,
+    cost: null,
+  });
+  externalCapabilityTelemetry.delete(token);
+}
+
+async function externalCapabilityCall<T>(
+  token: string,
+  name: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const itemId = `gateway-${randomUUID()}`;
+  externalCapabilityEvent(token, { type: "item.started", itemType: "tool", itemId, title: name });
+  try {
+    const result = await operation();
+    externalCapabilityEvent(token, {
+      type: "item.completed",
+      itemType: "tool",
+      itemId,
+      ok: !(result && typeof result === "object" && (result as { isError?: unknown }).isError === true),
+    });
+    return result;
+  } catch (error) {
+    externalCapabilityEvent(token, { type: "item.completed", itemType: "tool", itemId, ok: false });
+    const turn = externalCapabilityTelemetry.get(token);
+    telemetry.captureError(error, {
+      component: "gateway",
+      botId: turn?.client,
+      botName: turn?.client,
+      threadId: turn?.threadId,
+      turnId: turn?.turnId,
+      engine: "openmaus-gateway",
+      model: "external-client",
+      correlationId: turn?.correlationId,
+    });
+    throw error;
+  }
+}
+
+function openCapabilityTurn(botId: string, threadId: string, cwd?: string): string {
+  const previous = capabilityTurnTokens.get(threadId);
+  if (previous) capabilityGateway.endTurn(previous);
+  const token = randomBytes(32).toString("hex");
+  capabilityGateway.beginTurn(token, { botId, threadId, cwd });
+  capabilityTurnTokens.set(threadId, token);
+  return token;
+}
+
+function closeCapabilityTurn(threadId: string, expected?: string): void {
+  const token = capabilityTurnTokens.get(threadId);
+  if (!token || (expected && token !== expected)) return;
+  capabilityGateway.endTurn(token);
+  capabilityTurnTokens.delete(threadId);
+}
+
+function finalizeFullCapabilityTurn(
+  token: string,
+  integrations: NonNullable<SendTurnInput["integrations"]>,
+) {
+  capabilityGateway.extendTurn(token, appCapabilityServers(integrations));
+  retainOnlyCapabilityGateway(integrations);
+  return capabilityGateway.inventory(token).manifest;
+}
+
 const watchdog = new TurnWatchdog({
   stallMs: TURN_STALL_MS,
   checkMs: 60_000,
@@ -559,11 +721,13 @@ const watchdog = new TurnWatchdog({
     finalizeDelegationWatch(turn.threadId, false, "", "Delegated turn stalled and was stopped");
     turnUsage.delete(turn.threadId);
     roomStallCompletions.stall(turn.threadId);
+    telemetry.failTurn(turn.threadId, new Error("turn stalled without runtime activity"));
     // ACP interruption settles within five seconds; other adapters settle
     // sooner. Keep ownership during that grace period so another turn cannot
     // overlap the process we are stopping. The normal turn.completed fold
     // clears it first when the adapter responds.
     const release = setTimeout(() => {
+      closeCapabilityTurn(turn.threadId);
       const group = store.groupByThread(turn.threadId);
       const speaker = groupSpeakers.get(turn.threadId);
       if (group && group.busyBotId === turn.botId && speaker?.botId === turn.botId) {
@@ -585,7 +749,10 @@ watchdog.start();
 bus.subscribe((event: RuntimeEvent) => {
   if (event.type === "request.opened") watchdog.setWaitingOnHuman(event.threadId, true);
   else if (event.type === "request.resolved") watchdog.setWaitingOnHuman(event.threadId, false);
-  else if (event.type === "turn.completed") watchdog.settle(event.threadId);
+  else if (event.type === "turn.completed") {
+    watchdog.settle(event.threadId);
+    closeCapabilityTurn(event.threadId, event.turnToken);
+  }
   else watchdog.touch(event.threadId);
 });
 
@@ -741,7 +908,11 @@ bus.subscribe((event: RuntimeEvent) => {
       const asker = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
       const unattended = permission && asker && event.requestId ? isUnattended(asker.id) : false;
       const verdict = permission && asker && event.requestId
-        ? autoVerdict(asker, event.tool, event.summary, { unattended, scope: event.approvalScope })
+        ? autoVerdict(asker, event.tool, event.summary, {
+            unattended,
+            scope: event.approvalScope,
+            cwd: store.taskByThread(asker.id, event.threadId)?.cwd ?? asker.cwd,
+          })
         : null;
       if (verdict?.approve && asker && event.requestId) {
         const settled = verdict.approve;
@@ -1328,7 +1499,7 @@ async function startTurn(
     replaysNatively: instance.driverKind === "grok",
   });
 
-  const persona = [
+      const persona = [
     `You are ${bot.name}, a personal bot in OpenMausBot.`,
     bot.title && `Role: ${bot.title}.`,
     bot.description && `About: ${bot.description}`,
@@ -1342,15 +1513,29 @@ async function startTurn(
   store.setActivity(bot.id, "working");
   store.patchBot(bot.id, { unread: false });
   turnUsage.delete(threadId);
+  telemetry.registerTurn({
+    botId: bot.id,
+    botName: bot.name,
+    threadId,
+    engine: instance.driverKind,
+    model,
+    prompt: text,
+  });
 
   void (async () => {
+    let capabilityToken: string | undefined;
+    let retrievalContext = "";
+    let capabilityManifest = hostMcpCatalog.manifest;
     try {
       const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
-      const selectedSkills = selectBundledSkills(
-        text,
-        instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : [],
-        bundledSkills,
-      );
+      const fullTaskScoped = isFullTaskScoped(bot.accessProfile);
+      const selectedSkills = fullTaskScoped
+        ? []
+        : selectBundledSkills(
+            text,
+            instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : [],
+            bundledSkills,
+          );
       if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
         integrations.phone = phoneIntegration();
       }
@@ -1382,6 +1567,11 @@ async function startTurn(
           ? store.pinTaskCwd(bot.id, threadId, privateWorkspace)
           : null;
       const cwd = pinnedCwd ?? undefined;
+      if (fullTaskScoped) {
+        capabilityToken = openCapabilityTurn(bot.id, threadId, cwd);
+        integrations.capabilityGateway = capabilityIntegration(capabilityToken);
+        retrievalContext = retriever.format(await retriever.retrieve(text, cwd, capabilityToken));
+      }
       // dweb is opt-in: without an explicit daemon URL, do not advertise
       // tools that would fail on every call or spawn an unnecessary proxy.
       const dwebUrl = process.env.DWEB_URL?.trim();
@@ -1551,6 +1741,10 @@ async function startTurn(
         : integrations.agents
           ? "You can work with the user's other bots through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply."
           : "";
+      const connectedAppsAvailable = Boolean(integrations.composio);
+      if (fullTaskScoped && capabilityToken) {
+        capabilityManifest = finalizeFullCapabilityTurn(capabilityToken, integrations);
+      }
 
       // (activeVpsThreads was already claimed above, before the provision or
       // reuse await, so the backend guards saw this turn the whole time.)
@@ -1565,8 +1759,9 @@ async function startTurn(
         // resume the wrong conversation and defeat the context bubble
         resumeCursor: resume ? task.resumeCursors[instanceId] : undefined,
         transcript,
-        system:
-          persona +
+        system: fullTaskScoped
+          ? `${FULL_TASK_SCOPED_SYSTEM_PROMPT} Capability manifest: ${capabilityManifest.schema} sha256=${capabilityManifest.sha256}; intentional servers=${capabilityManifest.toolInventory.join(", ")}.${retrievalContext}`
+          : persona +
           (computerKind === "vm"
             ? " You have a shared, isolated Cua sandbox: a Linux desktop in a container on this machine. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and work carefully."
             : computerKind === "box" && instance.driverKind !== "boxAgent"
@@ -1581,7 +1776,7 @@ async function startTurn(
             : "") +
           // gated on the integration, not the key: the hint only goes to a
           // bot whose driver actually mounted the tools
-          (integrations.composio
+          (connectedAppsAvailable
             ? " The user's connected apps (Gmail, Calendar, Slack, Notion, and the rest) are reachable through the composio tools — find the right one with COMPOSIO_SEARCH_TOOLS, read its arguments with COMPOSIO_GET_TOOL_SCHEMAS, then run it with COMPOSIO_MULTI_EXECUTE_TOOL. Reach for them before telling the user you have no access to a service."
             : "") +
           (coordinationPrompt ? ` ${coordinationPrompt}` : "") +
@@ -1597,6 +1792,9 @@ async function startTurn(
             : ""),
         integrations,
         cwd,
+        accessProfile: bot.accessProfile,
+        autoApprove: bot.autoApprove,
+        turnToken: capabilityToken,
       });
       // dispatched: the rewind is spent, and the old cursors are dead
       if (rewound) store.patchBot(bot.id, { rewound: false, resumeCursors: {} });
@@ -1610,6 +1808,8 @@ async function startTurn(
         startScreenPoller(bot.id, previewCapture, { screenIsTheWork: instance.driverKind === "boxAgent" });
       }
     } catch (e) {
+      telemetry.failTurn(threadId, e);
+      if (capabilityToken) closeCapabilityTurn(threadId, capabilityToken);
       localVmLease.release(threadId);
       if (localVmActiveThread === threadId) localVmActiveThread = null;
       if (activeVpsThreads.get(bot.id) === threadId) activeVpsThreads.delete(bot.id);
@@ -1777,11 +1977,17 @@ async function runGroupMemberTurn(
     return true;
   }
   const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
-  const selectedSkills = selectBundledSkills(
-    serializeRoomContext(group.threadId, userName),
-    instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : [],
-    bundledSkills,
-  );
+  const fullTaskScoped = isFullTaskScoped(bot.accessProfile);
+  let capabilityToken: string | undefined;
+  let retrievalContext = "";
+  let capabilityManifest = hostMcpCatalog.manifest;
+  const selectedSkills = fullTaskScoped
+    ? []
+    : selectBundledSkills(
+        serializeRoomContext(group.threadId, userName),
+        instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : [],
+        bundledSkills,
+      );
   if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
     integrations.phone = phoneIntegration();
   }
@@ -1835,9 +2041,17 @@ async function runGroupMemberTurn(
   // but must not decide the pin: the room's desk is a property of the
   // room, not of whichever member happened to speak first.
   const cwd = groupTurnCwd(workspace, () => store.pinGroupCwd(group.id));
+  if (fullTaskScoped) {
+    capabilityToken = openCapabilityTurn(bot.id, group.threadId, cwd);
+    integrations.capabilityGateway = capabilityIntegration(capabilityToken);
+    retrievalContext = retriever.format(await retriever.retrieve(text, cwd, capabilityToken));
+    capabilityManifest = finalizeFullCapabilityTurn(capabilityToken, integrations);
+  }
   const roomSystem =
-    (workspace ? `${system}\n${memorySystemPrompt(bot.id).trim()}` : system) +
-    renderSkillInstructions(selectedSkills);
+    fullTaskScoped
+      ? `${FULL_TASK_SCOPED_SYSTEM_PROMPT} Capability manifest: ${capabilityManifest.schema} sha256=${capabilityManifest.sha256}; intentional servers=${capabilityManifest.toolInventory.join(", ")}.${retrievalContext}`
+      : (workspace ? `${system}\n${memorySystemPrompt(bot.id).trim()}` : system) +
+        renderSkillInstructions(selectedSkills);
 
   // run the turn and wait for it to settle, folding the reply text so a
   // chained @mention can be routed afterwards
@@ -1873,6 +2087,14 @@ async function runGroupMemberTurn(
     });
     unregisterStall = roomStallCompletions.register(group.threadId, () => finish("stalled"));
     watchdog.watch(group.threadId, bot.id);
+    telemetry.registerTurn({
+      botId: bot.id,
+      botName: bot.name,
+      threadId: group.threadId,
+      engine: instance.driverKind,
+      model: bot.modelSelection.model,
+      prompt: text,
+    });
     instance.adapter
       .sendTurn({
         threadId: group.threadId,
@@ -1880,9 +2102,14 @@ async function runGroupMemberTurn(
         system: roomSystem,
         cwd,
         integrations,
+        accessProfile: bot.accessProfile,
+        autoApprove: bot.autoApprove,
+        turnToken: capabilityToken,
         ...memberTurnSelection(bot.modelSelection),
       })
       .catch((err) => {
+        telemetry.failTurn(group.threadId, err);
+        if (capabilityToken) closeCapabilityTurn(group.threadId, capabilityToken);
         store.appendMessage(group.threadId, {
           role: "bot",
           kind: "activity",
@@ -2153,6 +2380,11 @@ async function reloadProviders() {
   await registry.disposeAll();
   await registry.load(instanceConfigs(cfg));
   bus.attach(registry.instances());
+  // One authenticated description both refreshes the default for future bots
+  // and becomes the settings response. Avoid probing every provider twice on
+  // each write, which is especially costly while the host is under load.
+  const described = await registry.describe();
+  bootSelection = selectionFromDescription(described);
   // A killed turn's terminal events can die with the old fleet (dispose is
   // async under the hood), stranding the bot busy — and its screen poller —
   // forever. Settle anything still marked busy.
@@ -2176,10 +2408,12 @@ async function reloadProviders() {
       tool: { name: "error: turn interrupted — provider settings changed", ok: false },
     });
     store.setActivity(b.id, "idle");
+    telemetry.failTurn(b.threadId, new Error("provider settings changed during turn"));
   }
   // killed turns settle here without a turn.completed event, so anything
   // queued behind them drains now — onto the freshly loaded fleet
   drainQueuedSends();
+  return described;
 }
 
 // Config writes rebuild the whole provider registry. Keep the read-modify-write
@@ -2290,6 +2524,93 @@ const server = createServer(async (req, res) => {
     if (path.startsWith("/api/internal/")) {
       if (!authorizedComms(req.headers.authorization)) {
         return json(res, 401, { error: "unauthorized" });
+      }
+      if (path.startsWith("/api/internal/capabilities")) {
+        if (method === "POST" && path === "/api/internal/capabilities/turns") {
+          const body = await readBody(req);
+          const client = String(body.client ?? "external").slice(0, 80);
+          const threadId = String(body.threadId ?? `${client}-${randomUUID()}`).slice(0, 160);
+          const cwd = typeof body.cwd === "string" && body.cwd.trim() ? body.cwd.trim() : undefined;
+          const turnToken = randomBytes(32).toString("hex");
+          capabilityGateway.beginTurn(turnToken, { botId: client, threadId, cwd, ttlMs: 60 * 60_000 });
+          const turnId = `external-${randomUUID()}`;
+          const correlationId = telemetry.registerTurn({
+            botId: client,
+            botName: client,
+            threadId,
+            engine: "openmaus-gateway",
+            model: typeof body.model === "string" ? body.model.slice(0, 160) : "external-client",
+            prompt: typeof body.promptSummary === "string" ? body.promptSummary.slice(0, 4_000) : "authenticated external full-task-scoped capability session",
+          });
+          externalCapabilityTelemetry.set(turnToken, { client, threadId, turnId, correlationId });
+          externalCapabilityEvent(turnToken, { type: "turn.started" });
+          return json(res, 201, { turnToken, manifest: capabilityGateway.inventory(turnToken).manifest });
+        }
+        const externalTurn = path.match(/^\/api\/internal\/capabilities\/turns\/([a-f0-9]{64})$/);
+        if (method === "DELETE" && externalTurn) {
+          finishExternalCapabilityTurn(externalTurn[1], true);
+          return json(res, 200, { ended: true });
+        }
+        const rawTurnToken = req.headers["x-openmaus-turn-token"];
+        const turnToken = Array.isArray(rawTurnToken) ? "" : (rawTurnToken ?? "");
+        if (!capabilityGateway.ownsTurn(turnToken)) {
+          finishExternalCapabilityTurn(turnToken, false, "capability turn expired or was cancelled");
+          return json(res, 409, { error: "capability request rejected: turn is no longer active" });
+        }
+        if (method === "GET" && path === "/api/internal/capabilities") {
+          return json(res, 200, { result: capabilityGateway.inventory(turnToken) });
+        }
+        if (method === "GET" && path === "/api/internal/capabilities/credential-aliases") {
+          return json(res, 200, { aliases: await capabilityGateway.aliases(turnToken) });
+        }
+        if (method === "POST" && path === "/api/internal/capabilities/credential-alias") {
+          const body = await readBody(req);
+          await capabilityGateway.selectCredentialAlias(
+            turnToken,
+            String(body.server ?? ""),
+            String(body.alias ?? ""),
+            String(body.environmentName ?? ""),
+          );
+          return json(res, 200, { ok: true });
+        }
+        if (method === "POST" && path === "/api/internal/capabilities/call") {
+          const body = await readBody(req);
+          const args = body.arguments && typeof body.arguments === "object" && !Array.isArray(body.arguments)
+            ? body.arguments as Record<string, unknown>
+            : {};
+          return json(res, 200, {
+            result: await externalCapabilityCall(
+              turnToken,
+              `${String(body.server ?? "")}:${String(body.tool ?? "")}`,
+              () => capabilityGateway.callTool(
+                turnToken,
+                String(body.server ?? ""),
+                String(body.tool ?? ""),
+                args,
+              ),
+            ),
+          });
+        }
+        if (method === "POST" && path === "/api/internal/capabilities/retrieval") {
+          const body = await readBody(req);
+          const query = String(body.query ?? "").trim();
+          if (!query || query.length > 8_000) return json(res, 400, { error: "query must contain 1-8000 characters" });
+          const cwd = typeof body.cwd === "string" && body.cwd.trim() ? body.cwd.trim() : undefined;
+          return json(res, 200, {
+            result: await externalCapabilityCall(
+              turnToken,
+              "openmaus-retrieval",
+              () => retriever.retrieve(query, cwd, turnToken),
+            ),
+          });
+        }
+        const toolsMatch = path.match(/^\/api\/internal\/capabilities\/([^/]+)\/tools$/);
+        if (method === "GET" && toolsMatch) {
+          return json(res, 200, {
+            result: await capabilityGateway.listTools(turnToken, decodeURIComponent(toolsMatch[1])),
+          });
+        }
+        return json(res, 404, { error: `no capability route: ${method} ${path}` });
       }
       if (method === "GET" && path === "/api/internal/agents") {
         const self = url.searchParams.get("self");
@@ -2503,6 +2824,40 @@ const server = createServer(async (req, res) => {
         return json(res, 200, { messageIds });
       }
       return json(res, 404, { error: "unknown internal endpoint" });
+    }
+
+    if (method === "GET" && path === "/api/runtime/capability-profile") {
+      return json(res, 200, {
+        ...hostMcpCatalog.manifest,
+        sources: hostMcpCatalog.sources,
+        health: capabilityGateway.stats(),
+      });
+    }
+
+    if (method === "GET" && path === "/api/runtime/telemetry") {
+      return json(res, 200, {
+        mode: "all-turns",
+        sourceSha,
+        release,
+        sinks: telemetry.health(),
+      });
+    }
+    if (method === "POST" && path === "/api/telemetry/error") {
+      const body = await readBody(req);
+      telemetry.captureError(
+        Object.assign(new Error(String(body.message ?? "renderer error")), {
+          name: typeof body.name === "string" ? body.name.slice(0, 120) : "RendererError",
+          stack: typeof body.stack === "string" ? body.stack.slice(0, 8_000) : undefined,
+        }),
+        {
+          component: "renderer",
+          botId: typeof body.botId === "string" ? body.botId : undefined,
+          threadId: typeof body.threadId === "string" ? body.threadId : undefined,
+          turnId: typeof body.turnId === "string" ? body.turnId : undefined,
+          correlationId: typeof body.correlationId === "string" ? body.correlationId : undefined,
+        },
+      );
+      return json(res, 202, { accepted: true });
     }
 
     // ── routines calendar ────────────────────────────────────────────────
@@ -2953,7 +3308,6 @@ const server = createServer(async (req, res) => {
       const takenNames = new Set(store.bots.map((bot) => bot.name.trim().toLowerCase()));
       let group;
       try {
-        const selection = await defaultSelection();
         for (const member of manifest.team.members) {
           // importedMemberProfile is the authority boundary: persona fields
           // only, colliding names numbered. seedMessages: false — an
@@ -2963,7 +3317,7 @@ const server = createServer(async (req, res) => {
           // allowed); the user can switch it on per bot after reading who
           // they got.
           const created = store.createBot(
-            { ...importedMemberProfile(member, takenNames), modelSelection: selection },
+            importedMemberProfile(member, takenNames),
             { seedMessages: false },
           );
           store.patchBot(created.id, { composio: false });
@@ -3098,7 +3452,6 @@ const server = createServer(async (req, res) => {
     }
     if (method === "POST" && path === "/api/bots") {
       const bot = store.createBot();
-      store.patchBot(bot.id, { modelSelection: await defaultSelection() });
       return json(res, 201, {
         bot: {
           ...wireBot(store.bot(bot.id)!),
@@ -3211,6 +3564,12 @@ const server = createServer(async (req, res) => {
         if (typeof body.composio !== "boolean") return json(res, 400, { error: "composio must be true or false" });
         patch.composio = body.composio;
       }
+      if (body.accessProfile !== undefined) {
+        if (!isAccessProfile(body.accessProfile)) {
+          return json(res, 400, { error: "accessProfile must be standard or full-task-scoped" });
+        }
+        patch.accessProfile = body.accessProfile;
+      }
       if (
         body.computer !== undefined &&
         !["cloud", "vm", "local", "off"].includes(String(body.computer))
@@ -3241,7 +3600,8 @@ const server = createServer(async (req, res) => {
       // still answer .includes() — with substring matches, not tool names
       if (body.autoApprove !== undefined) {
         if (typeof body.autoApprove !== "boolean") return json(res, 400, { error: "autoApprove must be true or false" });
-        if (body.autoApprove === true && effectiveComputer === "local") {
+        const effectiveAccessProfile = body.accessProfile ?? existingBot?.accessProfile ?? "standard";
+        if (body.autoApprove === true && effectiveComputer === "local" && effectiveAccessProfile !== "full-task-scoped") {
           return json(res, 400, { error: "Auto mode is unavailable while this bot uses the local computer beta" });
         }
         patch.autoApprove = body.autoApprove;
@@ -3258,7 +3618,13 @@ const server = createServer(async (req, res) => {
         }
         patch.alwaysAllow = [...new Set(body.alwaysAllow as string[])].slice(0, 200);
       }
-      if (effectiveComputer === "local" && body.autoApprove === undefined && existingBot?.autoApprove) {
+      const effectiveAccessProfile = body.accessProfile ?? existingBot?.accessProfile ?? "standard";
+      if (
+        effectiveComputer === "local" &&
+        effectiveAccessProfile !== "full-task-scoped" &&
+        body.autoApprove === undefined &&
+        existingBot?.autoApprove
+      ) {
         patch.autoApprove = false;
       }
       if (existingBot?.computer === "local" && body.computer !== undefined && body.computer !== "local") {
@@ -3710,12 +4076,12 @@ const server = createServer(async (req, res) => {
         // but writing the resolved map keeps disk and runtime in lockstep
         saveConfig({ instances: result.config.instances });
         Object.assign(cfg, loadConfig());
-        await reloadProviders();
+        const instances = await reloadProviders();
         // rescan BEFORE describe(): the response's cliCandidates are computed
         // from the memoized PATH, so resetting after would answer this request
         // with the pre-reset cache
         resetPathCache();
-        return json(res, 200, { instances: await registry.describe() });
+        return json(res, 200, { instances });
       } finally {
         providerConfigBusy = false;
       }
@@ -4021,6 +4387,7 @@ const server = createServer(async (req, res) => {
 
     return json(res, 404, { error: `no route: ${method} ${path}` });
   } catch (e) {
+    telemetry.captureError(e, { component: "server" });
     const status = (e as any)?.status ?? 500;
     return json(res, status, { error: e instanceof Error ? e.message : String(e) });
   }
@@ -4036,6 +4403,13 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     watchdog.stop();
     routines?.stop();
     webhookIngress?.server.close();
+    capabilityGateway.shutdown();
+    removeGatewayEndpoint(DATA_DIR);
+    telemetry.shutdown();
+    clearProcessRegistry();
     void registry.disposeAll().finally(() => process.exit(0));
   });
 }
+
+process.on("uncaughtExceptionMonitor", (error) => telemetry.captureError(error, { component: "server" }));
+process.on("unhandledRejection", (reason) => telemetry.captureError(reason, { component: "server" }));

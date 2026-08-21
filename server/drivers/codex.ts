@@ -10,8 +10,12 @@
 // resumeCursor is the codex thread id; a later turn tries thread/resume
 // and falls back to a fresh thread/start.
 import { homedir } from "node:os";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 
-import { stripWorkspaceCredentialEnv } from "../config.ts";
+import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
+import { writeFileAtomic } from "../atomic.ts";
+import { fullTaskScopedHardDeny } from "../auto-approve.ts";
 import { computerProxyEnv } from "../container-computer.ts";
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
@@ -51,6 +55,7 @@ function decodeConfig(raw: unknown): CodexConfig {
 const QUESTION_TIMEOUT_NOTE = "No answer was given — use your best judgment.";
 const DENY_TIMEOUT_NOTE =
   "OpenMausBot: nobody answered this permission request in time. Skip this action and finish what you can without it.";
+const OPENMAUS_CODEX_PERMISSIONS = "openmaus-gateway-only";
 
 type StdioMcpServer = { command: string; args: string[]; env: Record<string, string> };
 
@@ -59,6 +64,7 @@ function mountMcpServer(
   env: Record<string, string | undefined>,
   name: string,
   server: StdioMcpServer,
+  approvalMode: "auto" | "prompt" = "auto",
 ): void {
   Object.assign(env, server.env);
   const prefix = `mcp_servers.${name}`;
@@ -68,8 +74,74 @@ function mountMcpServer(
     // Values stay in the child environment; argv contains names only so
     // credentials never appear in process listings or diagnostics.
     "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(server.env))}`,
-    "-c", `${prefix}.default_tools_approval_mode="auto"`,
+    "-c", `${prefix}.default_tools_approval_mode=${JSON.stringify(approvalMode)}`,
   );
+}
+
+export function ensureOpenMausCodexHome(dataDir = DATA_DIR): string {
+  const home = join(dataDir, "runtime", "codex");
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  writeFileAtomic(
+    join(home, "config.toml"),
+    [
+      'cli_auth_credentials_store = "keyring"',
+      'mcp_oauth_credentials_store = "keyring"',
+      "project_doc_max_bytes = 0",
+      "project_doc_fallback_filenames = []",
+      "include_apps_instructions = false",
+      "include_collaboration_mode_instructions = false",
+      "include_environment_context = false",
+      "include_permissions_instructions = false",
+      'approval_policy = "on-request"',
+      `default_permissions = "${OPENMAUS_CODEX_PERMISSIONS}"`,
+      "check_for_update_on_startup = false",
+      "",
+      // Codex's provider-native effect tools would be an enforcement bypass.
+      // The named profile below also leaves native filesystem writes and
+      // network unavailable, so a future or unknown built-in fails closed.
+      // The app-owned MCP gateway remains fully capable outside this sandbox.
+      "[features]",
+      "apps = false",
+      "auth_elicitation = false",
+      "browser_use = false",
+      "browser_use_external = false",
+      "browser_use_full_cdp_access = false",
+      "computer_use = false",
+      "goals = false",
+      "hooks = false",
+      "image_generation = false",
+      "in_app_browser = false",
+      "memories = false",
+      "multi_agent = false",
+      "multi_agent_v2 = false",
+      "plugin_sharing = false",
+      "plugins = false",
+      "remote_plugin = false",
+      "shell_tool = false",
+      "skill_mcp_dependency_install = false",
+      "skill_search = false",
+      "tool_call_mcp_elicitation = false",
+      "tool_suggest = false",
+      "unified_exec = false",
+      "view_image = false",
+      "workspace_dependencies = false",
+      "",
+      "[agents]",
+      "enabled = false",
+      "",
+      `[permissions.${OPENMAUS_CODEX_PERMISSIONS}]`,
+      'description = "Provider-native tools are inert; all task capabilities use the OpenMaus gateway."',
+      "",
+      `[permissions.${OPENMAUS_CODEX_PERMISSIONS}.filesystem]`,
+      '":minimal" = "read"',
+      "",
+      `[permissions.${OPENMAUS_CODEX_PERMISSIONS}.network]`,
+      "enabled = false",
+      "",
+    ].join("\n"),
+    { mode: 0o600 },
+  );
+  return home;
 }
 
 export const CodexDriver: ProviderDriver<CodexConfig> = {
@@ -139,17 +211,31 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
+      const fullTaskScoped = turn.accessProfile === "full-task-scoped";
       const turnId = newId();
 
       const env = childEnv();
+      if (fullTaskScoped) {
+        env.CODEX_HOME = ensureOpenMausCodexHome();
+        for (const name of Object.keys(env)) if (name.startsWith("AOS_")) delete env[name];
+      }
       const appServerArgs = ["app-server", ...codexLocalProviderArgs(env, turn.model)];
-      if (turn.integrations?.composio) {
-        mountMcpServer(appServerArgs, env, "openmausbot_connectors", turn.integrations.composio);
+      if (turn.integrations?.capabilityGateway) {
+        mountMcpServer(
+          appServerArgs,
+          env,
+          "openmaus_capabilities",
+          turn.integrations.capabilityGateway,
+          fullTaskScoped && !turn.autoApprove ? "prompt" : "auto",
+        );
       }
-      if (turn.integrations?.agents) {
-        mountMcpServer(appServerArgs, env, "agents", turn.integrations.agents);
+      if (turn.integrations?.composio && !fullTaskScoped) {
+        mountMcpServer(appServerArgs, env, "openmausbot_connectors", turn.integrations.composio, fullTaskScoped ? "prompt" : "auto");
       }
-      if (turn.integrations?.computer) {
+      if (turn.integrations?.agents && !fullTaskScoped) {
+        mountMcpServer(appServerArgs, env, "agents", turn.integrations.agents, fullTaskScoped ? "prompt" : "auto");
+      }
+      if (turn.integrations?.computer && !fullTaskScoped) {
         const proxyEnv = computerProxyEnv(turn.integrations.computer);
         mountMcpServer(appServerArgs, env, "computer", {
           command: process.execPath,
@@ -163,13 +249,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             OMB_CONTROL_URL: proxyEnv.OMB_CONTROL_URL ?? "",
             OMB_CONTROL_TOKEN: proxyEnv.OMB_CONTROL_TOKEN ?? "",
           },
-        });
-      } else if (turn.integrations?.localComputer) {
+        }, fullTaskScoped ? "prompt" : "auto");
+      } else if (turn.integrations?.localComputer && !fullTaskScoped) {
         // The host daemon and isolated Local VM both arrive as a direct Cua
         // Driver stdio MCP server. Codex sees the same computer tool surface.
-        mountMcpServer(appServerArgs, env, "computer", turn.integrations.localComputer);
+        mountMcpServer(appServerArgs, env, "computer", turn.integrations.localComputer, fullTaskScoped ? "prompt" : "auto");
       }
-      if (turn.integrations?.phone) {
+      if (turn.integrations?.phone && !fullTaskScoped) {
         const bridge = turn.integrations.phone;
         Object.assign(env, bridge.env);
         const prefix = "mcp_servers.openmausbot_phone";
@@ -177,7 +263,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           "-c", `${prefix}.command=${JSON.stringify(bridge.command)}`,
           "-c", `${prefix}.args=${JSON.stringify(bridge.args)}`,
           "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(bridge.env))}`,
-          "-c", `${prefix}.default_tools_approval_mode="auto"`,
+          "-c", `${prefix}.default_tools_approval_mode=${JSON.stringify(fullTaskScoped ? "prompt" : "auto")}`,
         );
       }
 
@@ -236,7 +322,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         for (const p of rpcPending.values()) p.reject(new Error("turn settled"));
         rpcPending.clear();
         active.delete(threadId);
-        emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost: null, ...(state.usage ? { usage: state.usage } : {}) });
+        emit({ ...base(threadId, turnId), turnToken: turn.turnToken, type: "turn.completed", ok, stopReason, cost: null, ...(state.usage ? { usage: state.usage } : {}) });
         stop(); // the app-server never exits on its own
       };
 
@@ -246,24 +332,54 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const params = msg.params ?? {};
         const legacy = method === "execCommandApproval" || method === "applyPatchApproval";
         const isQuestion = method === "item/tool/requestUserInput";
+        const isMcp = /mcp/i.test(method);
         const tool =
           method === "item/fileChange/requestApproval" || method === "applyPatchApproval"
             ? "edit"
             : isQuestion
               ? "ask_user"
-              : "shell";
+              : isMcp
+                ? String(params.tool ?? params.toolName ?? params.name ?? "mcp")
+                : "shell";
+        const summary =
+          typeof params.command === "string"
+            ? params.command.slice(0, 20_000)
+            : isMcp
+              ? JSON.stringify(params).slice(0, 20_000)
+              : Array.isArray(params.questions)
+                ? params.questions.map((q: any) => q.question ?? q.header).filter(Boolean).join(" · ")
+                : typeof params.reason === "string"
+                  ? params.reason
+                  : tool;
+        if (fullTaskScoped && !isQuestion) {
+          const denial = fullTaskScopedHardDeny(tool, summary, { cwd: turn.cwd });
+          if (denial) {
+            emit({
+              ...base(threadId, turnId),
+              turnToken: turn.turnToken,
+              type: "runtime.error",
+              message: `OpenMausBot denied ${tool}: ${denial}`,
+            });
+            return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "denied" : "decline" } });
+          }
+          const gatewayMcp = isMcp && /openmaus[_-]capabilities/i.test(JSON.stringify(params));
+          if (!gatewayMcp) {
+            emit({
+              ...base(threadId, turnId),
+              turnToken: turn.turnToken,
+              type: "runtime.error",
+              message: `OpenMausBot rejected provider-native ${tool}; retry through openmaus_capabilities`,
+            });
+            return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "denied" : "decline" } });
+          }
+          if (turn.autoApprove) {
+            return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "approved" : "accept" } });
+          }
+        }
         if (config.fullAuto && !isQuestion) {
           return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "approved" : "accept" } });
         }
         const requestId = newId();
-        const summary =
-          typeof params.command === "string"
-            ? params.command.slice(0, 200)
-            : Array.isArray(params.questions)
-              ? params.questions.map((q: any) => q.question ?? q.header).filter(Boolean).join(" · ")
-              : typeof params.reason === "string"
-                ? params.reason
-                : tool;
         const choices = isQuestion
           ? (params.questions?.[0]?.options ?? []).map((o: any) => o.label).slice(0, 5)
           : undefined;
@@ -283,7 +399,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               result: { decision: behavior === "allow" ? (legacy ? "approved" : "accept") : legacy ? "denied" : "decline" },
             });
           }
-          emit({ ...base(threadId, turnId), type: "request.resolved", requestId, behavior, source });
+          emit({ ...base(threadId, turnId), turnToken: turn.turnToken, type: "request.resolved", requestId, behavior, source });
         };
         const timer = setTimeout(
           () => (isQuestion ? finish("answer", QUESTION_TIMEOUT_NOTE, "timeout") : finish("deny", DENY_TIMEOUT_NOTE, "timeout")),
@@ -299,6 +415,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           tool,
           summary,
           choices,
+          turnToken: turn.turnToken,
         });
       };
 
@@ -470,8 +587,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               cwd: turn.cwd ?? homedir(),
               model: selection.model,
               ...(selection.modelProvider ? { modelProvider: selection.modelProvider } : {}),
-              sandbox: config.fullAuto ? "danger-full-access" : "workspace-write",
-              approvalPolicy: config.fullAuto ? "never" : "on-request",
+              ...(fullTaskScoped
+                ? { permissions: OPENMAUS_CODEX_PERMISSIONS }
+                : { sandbox: config.fullAuto ? "danger-full-access" : "workspace-write" }),
+              approvalPolicy: fullTaskScoped ? "on-request" : config.fullAuto ? "never" : "on-request",
               ephemeral: false,
             });
             codexThreadId = started?.thread?.id ?? null;
@@ -545,6 +664,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           composioMcp: true,
           agentsMcp: true,
           phoneMcp: true,
+          localComputerMcp: true,
           images: true,
           effortLevels: ["low", "medium", "high", "xhigh", "max"],
         },

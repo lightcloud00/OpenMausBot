@@ -94,7 +94,7 @@ describe("ClaudeDriver.decodeConfig", () => {
     expect(permissionSocketPath("t-perm-dup-1")).not.toBe(permissionSocketPath("t-perm-dup-2"));
   });
 
-  it("does not advertise or accept local CUA in bypassPermissions mode", async () => {
+  it("advertises local CUA but rejects the legacy bypass mode for a standard turn", async () => {
     const bypass = await ClaudeDriver.create({
       instanceId: "claude-bypass",
       displayName: "Claude Bypass",
@@ -102,7 +102,7 @@ describe("ClaudeDriver.decodeConfig", () => {
       enabled: true,
       config: { cli: FAKE_CLI, permissionMode: "bypassPermissions" },
     });
-    expect(bypass.adapter.capabilities.localComputerMcp).toBe(false);
+    expect(bypass.adapter.capabilities.localComputerMcp).toBe(true);
     await expect(
       bypass.adapter.sendTurn({
         threadId: "t-bypass-local",
@@ -154,6 +154,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.BOX_TOKEN;
     delete process.env.OPENCODE_API_KEY;
     delete process.env.OMB_TTS_KEY;
+    delete process.env.AOS_STARTUP_DIRECTIVE;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -230,6 +231,92 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(seen.env.XAI_API_KEY).toBeUndefined();
     expect(seen.env.BOX_TOKEN).toBeUndefined();
     expect(seen.env.OMB_TTS_KEY).toBeUndefined();
+  });
+
+  it("launches full-task-scoped turns with empty host settings and only the explicit gateway", async () => {
+    await create();
+    const dump = join(scratch, "full-profile.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    process.env.AOS_STARTUP_DIRECTIVE = "must-not-survive";
+
+    await instance.adapter.sendTurn({
+      threadId: "t-full-profile",
+      turnToken: "turn-token-123456789012345678901234",
+      text: "work",
+      system: "OpenMaus explicit prompt",
+      accessProfile: "full-task-scoped",
+      autoApprove: true,
+      integrations: {
+        capabilityGateway: {
+          command: process.execPath,
+          args: ["/tmp/capability-proxy.js"],
+          env: { OMB_TURN_TOKEN: "turn-token-123456789012345678901234" },
+        },
+        composio: {
+          command: process.execPath,
+          args: ["/tmp/connector-proxy.js"],
+          env: { OMB_CONNECTOR_UPSTREAM_URL: "https://example.test/mcp" },
+        },
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv).not.toContain("--safe-mode");
+    expect(seen.argv).not.toContain("--bare");
+    expect(seen.argv[seen.argv.indexOf("--setting-sources") + 1]).toBe("");
+    expect(seen.argv).toContain("--strict-mcp-config");
+    const tools = seen.argv[seen.argv.indexOf("--tools") + 1];
+    expect(tools).toContain("mcp__openmaus_capabilities__call_capability");
+    expect(tools).not.toContain("Bash");
+    expect(tools).not.toContain("Read");
+    expect(seen.argv).toContain("--system-prompt");
+    expect(seen.argv).not.toContain("--append-system-prompt");
+    expect(seen.env.AOS_STARTUP_DIRECTIVE).toBeUndefined();
+    expect(Object.keys(seen.mcpConfig.mcpServers).sort()).toEqual([
+      "ogb",
+      "openmaus_capabilities",
+    ]);
+    const allowed = seen.argv[seen.argv.indexOf("--allowedTools") + 1];
+    expect(allowed).toContain("mcp__openmaus_capabilities");
+    expect(seen.argv[seen.argv.indexOf("--permission-mode") + 1]).toBe("acceptEdits");
+    expect(allowed).toContain("mcp__ogb");
+    expect(allowed).not.toContain("mcp__composio");
+    delete process.env.AOS_STARTUP_DIRECTIVE;
+  });
+
+  it("uses bare mode with an app-owned CredVault helper when an API-key alias is configured", async () => {
+    await create(undefined, { OMB_CLAUDE_API_KEY_ALIAS: "openmaus/claude-api" });
+    const dump = join(scratch, "full-profile-bare.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-full-profile-bare",
+      turnToken: "turn-token-bare-1234567890123456789",
+      text: "work",
+      system: "OpenMaus explicit prompt",
+      accessProfile: "full-task-scoped",
+      autoApprove: true,
+      integrations: {
+        capabilityGateway: {
+          command: process.execPath,
+          args: ["/tmp/capability-proxy.js"],
+          env: { OMB_TURN_TOKEN: "turn-token-bare-1234567890123456789" },
+        },
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv).toContain("--bare");
+    expect(seen.argv).not.toContain("--setting-sources");
+    const settings = JSON.parse(seen.argv[seen.argv.indexOf("--settings") + 1]);
+    expect(settings.apiKeyHelper).toContain("claude-api-key-helper");
+    expect(settings.apiKeyHelper).toContain("openmaus/claude-api");
+    expect(JSON.stringify(settings)).not.toMatch(/sk-ant-|api[_-]?key\s*[:=]/i);
+    expect(seen.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(seen.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(seen.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
   });
 
   it("uses instance credentials when launching an injected local model", async () => {

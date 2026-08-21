@@ -1,7 +1,7 @@
 {
   "name": "openmausbot",
   "private": true,
-  "version": "0.1.27",
+  "version": "0.1.28",
   "description": "A local-first chat app for running a team of AI agents.",
   "homepage": "https://github.com/milind-soni/OpenMausBot",
   "repository": {
@@ -61,6 +61,10 @@
     "broker:deploy": "wrangler deploy --config cloudflare/composio-broker/wrangler.jsonc"
   },
   "dependencies": {
+    "@langfuse/otel": "5.10.1",
+    "@langfuse/tracing": "5.10.1",
+    "@opentelemetry/sdk-node": "0.221.0",
+    "@sentry/node": "10.70.0",
     "@trycua/cua-driver": "0.20.0",
     "clsx": "^2.1.1",
     "lucide-react": "^0.539.0",

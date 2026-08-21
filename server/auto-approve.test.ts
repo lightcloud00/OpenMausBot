@@ -2,9 +2,21 @@
 // WITHOUT a human looking, so they get pinned down hard: what auto mode
 // waves through, what it refuses to wave through, and the fact that a
 // question is never answered by the machine.
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
-import { approvalKey, autoDecision, looksDestructive, looksSensitive } from "./auto-approve.ts";
+import {
+  approvalKey,
+  autoDecision,
+  fullTaskScopedHardDeny,
+  looksCatastrophic,
+  looksDestructive,
+  looksLikeCredentialValueDisclosure,
+  looksSensitive,
+} from "./auto-approve.ts";
 
 describe("looksDestructive", () => {
   const dangerous = [
@@ -55,6 +67,94 @@ describe("looksSensitive", () => {
   for (const text of ["cat README.md", "npm run env-check", "echo $PATH", "cat src/environment.ts"]) {
     it(`allows: ${text}`, () => expect(looksSensitive(text)).toBe(false));
   }
+});
+
+describe("full-task-scoped hard denials", () => {
+  for (const command of [
+    "rm -rf /",
+    "rm -rf $HOME",
+    "diskutil eraseDisk APFS Blank disk4",
+    "dd if=/dev/zero of=/dev/rdisk3",
+    "DROP DATABASE production",
+    "terraform destroy -auto-approve",
+    "gh repo delete owner/project --yes",
+    "bash -lc 'rm -rf /'",
+    "python3 -c 'import shutil; shutil.rmtree(\"/\")'",
+    "ln -s / /tmp/root-link && rm -rf /tmp/root-link",
+    "echo cm0gLXJmIC8= | base64 -d | sh",
+    "python3 -c \"exec(bytes.fromhex('726d202d7266202f'))\"",
+    "delete_project production",
+  ]) {
+    it(`rejects catastrophic action: ${command}`, () => expect(looksCatastrophic(command)).toBe(true));
+  }
+
+  for (const command of [
+    "rm -rf build",
+    "git reset --hard HEAD~1",
+    "git push --force-with-lease origin feature",
+    "DROP TABLE disposable_fixture",
+    "deploy production",
+  ]) {
+    it(`permits scoped full-access action: ${command}`, () => expect(looksCatastrophic(command)).toBe(false));
+  }
+
+  for (const command of [
+    "cv resolve github_token",
+    "credvault export --all",
+    "security find-generic-password -w -s github",
+    "printenv",
+    "cat ~/.codex/auth.json",
+    "python3 -c 'import os; print(os.environ)'",
+    "call read_credential_value",
+  ]) {
+    it(`rejects credential disclosure: ${command}`, () =>
+      expect(looksLikeCredentialValueDisclosure(command)).toBe(true));
+  }
+
+  it("returns the stable hard-deny identifiers", () => {
+    expect(fullTaskScopedHardDeny("Bash", "rm -rf /")).toBe("catastrophic-destruction");
+    expect(fullTaskScopedHardDeny("Bash", "cv resolve sentry")).toBe("credential-value-disclosure");
+    expect(fullTaskScopedHardDeny("Bash", "git push --force-with-lease origin feature")).toBeNull();
+  });
+
+  it("keeps logical-alias operations available", () => {
+    expect(looksLikeCredentialValueDisclosure("list_credential_aliases")).toBe(false);
+    expect(looksLikeCredentialValueDisclosure("select_credential_alias sentryreadonly")).toBe(false);
+  });
+
+  it("blocks structured credential-store reads without blocking non-secret writes", () => {
+    for (const path of [
+      "~/.codex/auth.json",
+      "~/.openmausbot/config.json",
+      "~/Library/Application Support/openmausbot/credentials.bin",
+      "~/.aws/credentials",
+      "~/.ssh/id_rsa",
+      "~/.env.production",
+    ]) {
+      expect(fullTaskScopedHardDeny("openmaus-host:filesystem_read", JSON.stringify({ path }))).toBe("credential-value-disclosure");
+    }
+    expect(fullTaskScopedHardDeny("openmaus-host:filesystem_write", JSON.stringify({ path: "~/.env.example", content: "MODE=test" }))).toBeNull();
+  });
+
+  it("resolves repository roots, relative paths, and symlink variants without blocking scoped deletes", () => {
+    const root = mkdtempSync(join(tmpdir(), "omb-deny-repo-"));
+    const repo = join(root, "project");
+    const subdir = join(repo, "build");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    mkdirSync(subdir);
+    const link = join(root, "repo-link");
+    symlinkSync(repo, link);
+    try {
+      expect(fullTaskScopedHardDeny("Bash", "rm -rf .", { cwd: repo })).toBe("catastrophic-destruction");
+      expect(fullTaskScopedHardDeny("Bash", `rm -rf '${repo}'`, { cwd: root })).toBe("catastrophic-destruction");
+      expect(fullTaskScopedHardDeny("delete_directory", JSON.stringify({ path: link }), { cwd: root })).toBe("catastrophic-destruction");
+      expect(fullTaskScopedHardDeny("filesystem_delete", JSON.stringify({ path: "/", recursive: true }), { cwd: root })).toBe("catastrophic-destruction");
+      expect(fullTaskScopedHardDeny("filesystem_delete", JSON.stringify({ path: homedir(), recursive: true }), { cwd: root })).toBe("catastrophic-destruction");
+      expect(fullTaskScopedHardDeny("Bash", "rm -rf build", { cwd: repo })).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("approvalKey", () => {
@@ -123,6 +223,24 @@ describe("autoDecision", () => {
       }),
     ).toBeNull();
   });
+
+  it("auto-approves non-denied local-computer actions in full-task-scoped mode", () => {
+    expect(
+      autoDecision(
+        { accessProfile: "full-task-scoped", autoApprove: true },
+        "mcp__computer__click",
+        "Click the Deploy button",
+        { scope: "local-computer" },
+      ),
+    ).toBe("auto-approved mcp__computer__click");
+  });
+
+  it("allows force pushes but not catastrophic erasure in full-task-scoped mode", () => {
+    const bot = { accessProfile: "full-task-scoped" as const, autoApprove: true };
+    expect(autoDecision(bot, "Bash", "git push --force-with-lease origin feature")).toBeTruthy();
+    expect(autoDecision(bot, "Bash", "rm -rf /")).toBeNull();
+    expect(autoDecision(bot, "Bash", "cv resolve github")).toBeNull();
+  });
 });
 
 describe("unattended turns", () => {
@@ -139,5 +257,16 @@ describe("unattended turns", () => {
   it("still auto-approves the same action when a person started the turn", () => {
     expect(autoDecision(bot, "Bash", "git status")).toBeTruthy();
     expect(autoDecision(bot, "Bash", "git status", { unattended: false })).toBeTruthy();
+  });
+
+  it("uses the explicit full-task-scoped profile for authenticated automation", () => {
+    expect(
+      autoDecision(
+        { accessProfile: "full-task-scoped", autoApprove: true },
+        "Bash",
+        "git push origin release",
+        { unattended: true },
+      ),
+    ).toBeTruthy();
   });
 });

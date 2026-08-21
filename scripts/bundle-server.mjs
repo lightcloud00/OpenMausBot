@@ -18,11 +18,22 @@
 // drivers/ nested; import.meta.url still resolves to the same location, so
 // that lookup is unaffected.
 import { build } from "esbuild";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const server = join(root, "server");
+let sourceSha = "unknown";
+try {
+  sourceSha = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+} catch {
+  // Source identity remains explicit when the build is made from an archive.
+}
 
 // Every file run as its own process. Keep in sync with the spawn sites above.
 const ENTRY_POINTS = [
@@ -32,6 +43,9 @@ const ENTRY_POINTS = [
   "vps-container-mcp.ts",
   "permission-proxy.ts",
   "connector-proxy.ts",
+  "capability-proxy.ts",
+  "claude-api-key-helper.ts",
+  "telemetry-sink.ts",
   "drivers/agents-proxy.ts",
   "drivers/dweb-proxy.ts",
   "drivers/phone-proxy.ts",
@@ -47,5 +61,6 @@ await build({
   outdir: join(root, "dist-server"),
   // Written after tsc, replacing its output for these entry points.
   allowOverwrite: true,
+  define: { __OMB_SOURCE_SHA__: JSON.stringify(sourceSha) },
   logLevel: "info",
 });

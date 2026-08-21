@@ -135,7 +135,23 @@ process.stdin.on("data", (chunk) => {
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
         notify("item/started", { item: { id: "i1", type: "commandExecution", command: "ls -la" } });
         if (mode === "approval") {
-          out({ jsonrpc: "2.0", id: 100, method: "execCommandApproval", params: { command: "rm -rf scratch" } });
+          const gatewayApproval = process.env.FAKE_CODEX_APPROVAL_KIND === "gateway";
+          out({
+            jsonrpc: "2.0",
+            id: 100,
+            method: gatewayApproval ? "item/mcpToolCall/requestApproval" : "execCommandApproval",
+            params: gatewayApproval
+              ? {
+                  server: "openmaus_capabilities",
+                  tool: "call_capability",
+                  arguments: {
+                    server: "openmaus-host",
+                    tool: "filesystem_delete",
+                    arguments: { path: process.env.FAKE_CODEX_APPROVAL_COMMAND ?? "scratch" },
+                  },
+                }
+              : { command: process.env.FAKE_CODEX_APPROVAL_COMMAND ?? "rm -rf scratch" },
+          });
           // turn continues from the approval response handler above
         } else {
           finishTurn();

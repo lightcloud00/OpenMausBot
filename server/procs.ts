@@ -10,14 +10,132 @@
 import {
   spawn,
   execFile,
+  execFileSync,
   type ChildProcess,
   type ChildProcessByStdio,
   type ExecFileOptions,
   type SpawnOptions,
 } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolveCliSpawn, type ResolvedSpawn } from "./env-path.ts";
+
+interface OwnedProcess {
+  pid: number;
+  executable: string;
+  startIdentity: string;
+}
+
+let processRegistryDir: string | null = null;
+const ownedProcesses = new Map<number, OwnedProcess>();
+
+function processIdentity(pid: number): { executable: string; startIdentity: string } | null {
+  if (process.platform === "win32") {
+    try {
+      const script = [
+        `$p = Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\"`,
+        "if (-not $p) { exit 1 }",
+        "$p | Select-Object CreationDate,ExecutablePath,Name | ConvertTo-Json -Compress",
+      ].join("; ");
+      const value = JSON.parse(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+        encoding: "utf8",
+        timeout: 2_000,
+        windowsHide: true,
+      }).trim()) as { CreationDate?: string; ExecutablePath?: string; Name?: string };
+      if (!value.CreationDate) return null;
+      return {
+        startIdentity: value.CreationDate,
+        executable: basename(value.ExecutablePath || value.Name || ""),
+      };
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const value = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart=", "-o", "comm="], {
+      encoding: "utf8",
+      timeout: 1_000,
+      windowsHide: true,
+    }).trim();
+    const match = value.match(/^(.{24})\s+(.+)$/);
+    if (!match) return null;
+    return { startIdentity: match[1]!.trim(), executable: basename(match[2]!.trim()) };
+  } catch {
+    return null;
+  }
+}
+
+function ownerAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function registryFile(ownerPid = process.pid): string | null {
+  return processRegistryDir ? join(processRegistryDir, `${ownerPid}.json`) : null;
+}
+
+function writeProcessRegistry(): void {
+  const path = registryFile();
+  if (!path) return;
+  mkdirSync(processRegistryDir!, { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(temporary, JSON.stringify({
+      schema: "openmaus.owned-process-groups.v1",
+      ownerPid: process.pid,
+      children: [...ownedProcesses.values()],
+    }, null, 2), { mode: 0o600 });
+    renameSync(temporary, path);
+  } catch {
+    try { unlinkSync(temporary); } catch {}
+  }
+}
+
+function unregisterOwnedProcess(pid: number): void {
+  if (!ownedProcesses.delete(pid)) return;
+  writeProcessRegistry();
+}
+
+/** Reap only process groups whose former owner is dead and whose PID still
+ * matches the recorded OS start identity and executable. */
+export function configureProcessRegistry(directory: string): void {
+  processRegistryDir = directory;
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  for (const name of readdirSync(directory).filter((item) => /^\d+\.json$/.test(item))) {
+    const path = join(directory, name);
+    try {
+      const value = JSON.parse(readFileSync(path, "utf8")) as { schema?: string; ownerPid?: number; children?: OwnedProcess[] };
+      if (value.schema !== "openmaus.owned-process-groups.v1" || value.ownerPid === process.pid) continue;
+      if (ownerAlive(Number(value.ownerPid))) continue;
+      for (const child of Array.isArray(value.children) ? value.children : []) {
+        const observed = processIdentity(Number(child.pid));
+        if (!observed || observed.startIdentity !== child.startIdentity || observed.executable !== child.executable) continue;
+        if (process.platform === "win32") {
+          execFile("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true }, () => {});
+        } else {
+          try { process.kill(-child.pid, "SIGTERM"); } catch {}
+          setTimeout(() => {
+            const remaining = processIdentity(Number(child.pid));
+            if (remaining?.startIdentity !== child.startIdentity || remaining.executable !== child.executable) return;
+            try { process.kill(-child.pid, "SIGKILL"); } catch {}
+          }, 5_000).unref();
+        }
+      }
+      unlinkSync(path);
+    } catch {
+      // Malformed or raced registry files are not authority to kill anything.
+    }
+  }
+  writeProcessRegistry();
+}
+
+export function clearProcessRegistry(): void {
+  const path = registryFile();
+  if (path) try { unlinkSync(path); } catch {}
+  ownedProcesses.clear();
+  processRegistryDir = null;
+}
 
 export function resolveCli(cli: string, args: string[] = []): ResolvedSpawn {
   return resolveCliSpawn(cli, args);
@@ -35,6 +153,22 @@ export function spawnCli(
     // win32: taskkill /T does the reaping instead (see killCliTree)
     ...(process.platform === "win32" ? { windowsHide: true } : { detached: true }),
   }) as ChildProcessByStdio<Writable, Readable, Readable>; // callers always pipe all three
+
+  if (child.pid && processRegistryDir) {
+    const pid = child.pid;
+    let registered = false;
+    const register = () => {
+      if (registered || child.exitCode !== null || child.signalCode !== null) return;
+      const observed = processIdentity(pid);
+      if (!observed) return;
+      registered = true;
+      ownedProcesses.set(pid, { pid, ...observed });
+      writeProcessRegistry();
+      child.once("close", () => unregisterOwnedProcess(pid));
+    };
+    register();
+    if (!registered) setTimeout(register, 25).unref();
+  }
 
   // A write to a dying child's stdin fails differently per platform, and one
   // of the ways is fatal. On POSIX the kill is synchronous, the stream is
@@ -83,18 +217,20 @@ export function describeSpawnFailure(err: NodeJS.ErrnoException, cli: string): S
 /** Stop a CLI and every process it spawned (MCP proxies included). */
 export function killCliTree(child: ChildProcess): void {
   const pid = child.pid;
-  if (!pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (!pid) return;
 
   if (process.platform === "win32") {
     execFile("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, (err) => {
-      if (!err) return;
-      try {
-        // taskkill is unavailable or the tree lookup failed. At least stop
-        // the process we own instead of leaving the entire turn running.
-        child.kill();
-      } catch {
-        /* already gone */
+      if (err) {
+        try {
+          // taskkill is unavailable or the tree lookup failed. At least stop
+          // the process we own instead of leaving the entire turn running.
+          child.kill();
+        } catch {
+          /* already gone */
+        }
       }
+      unregisterOwnedProcess(pid);
     });
     return;
   }
@@ -107,6 +243,7 @@ export function killCliTree(child: ChildProcess): void {
       /* already gone */
     }
   }
+  unregisterOwnedProcess(pid);
 }
 
 /** Per-turn broker channel: unix socket on POSIX, named pipe on Windows

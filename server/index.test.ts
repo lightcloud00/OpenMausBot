@@ -209,6 +209,10 @@ beforeAll(async () => {
       OMB_BOX_API: `http://127.0.0.1:${boxStubPort}`,
       OMB_COMPOSIO_API: `http://127.0.0.1:${boxStubPort}/api/v3.1`,
       OMB_STATIC_DIR: staticDir,
+      // The integration test exercises the sanitized local telemetry journal
+      // directly. External sink processes would add CredVault/provider
+      // startup latency without improving that assertion.
+      OMB_TELEMETRY_DISABLED: "1",
       FAKE_CLAUDE_MODE: "hang",
       FAKE_CLAUDE_DUMP: fakeClaudeDump,
     },
@@ -216,7 +220,10 @@ beforeAll(async () => {
   });
   child.stderr!.on("data", (c) => (stderr += c));
 
-  const deadline = Date.now() + 20_000;
+  // Node's strip-only TypeScript loader must transform the full server graph
+  // in this integration harness. On a busy desktop that cold start can exceed
+  // 20 seconds even though the packaged JavaScript server starts normally.
+  const deadline = Date.now() + 60_000;
   for (;;) {
     try {
       const res = await fetch(`${BASE}/api/health`);
@@ -228,7 +235,7 @@ beforeAll(async () => {
     if (child.exitCode !== null) throw new Error(`server exited ${child.exitCode}. stderr:\n${stderr}`);
     await new Promise((r) => setTimeout(r, 150));
   }
-}, 30_000);
+}, 75_000);
 
 afterAll(async () => {
   boxStub?.close();
@@ -254,6 +261,53 @@ describe("harness HTTP API", () => {
     expect(body.app).toBe("openmausbot");
     expect(typeof body.pid).toBe("number");
     expect(body.static).toBe(true);
+  });
+
+  it("owns and traces authenticated external capability turns", async () => {
+    const endpoint = JSON.parse(readFileSync(join(home, ".openmausbot", "runtime", "capability-gateway.json"), "utf8"));
+    const headers = {
+      authorization: `Bearer ${endpoint.authorization}`,
+      "content-type": "application/json",
+    };
+    const opened = await fetch(`${BASE}/api/internal/capabilities/turns`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        client: "hermes-manus",
+        threadId: "external-trace-test",
+        promptSummary: "sanitized external task",
+      }),
+    });
+    expect(opened.status).toBe(201);
+    const lease = await opened.json() as {
+      turnToken: string;
+      manifest: { schema: string; profile: string };
+    };
+    expect(lease.manifest).toMatchObject({ schema: "openmaus.capability-profile.v1", profile: "full-task-scoped" });
+
+    const called = await fetch(`${BASE}/api/internal/capabilities/call`, {
+      method: "POST",
+      headers: { ...headers, "x-openmaus-turn-token": lease.turnToken },
+      body: JSON.stringify({ server: "openmaus-host", tool: "filesystem_stat", arguments: { path: home } }),
+    });
+    expect(called.status).toBe(200);
+    const callBody = await called.json() as { result: { type: string } };
+    expect(callBody.result).toMatchObject({ type: "directory" });
+
+    const ended = await fetch(`${BASE}/api/internal/capabilities/turns/${lease.turnToken}`, {
+      method: "DELETE",
+      headers,
+    });
+    expect(ended.status).toBe(200);
+    const journal = readFileSync(join(home, ".openmausbot", "telemetry", "turns.ndjson"), "utf8");
+    const trace = journal.trim().split("\n").map((line) => JSON.parse(line)).findLast((row) => row.threadId === "external-trace-test");
+    expect(trace).toMatchObject({
+      application: "openmausbot",
+      botId: "hermes-manus",
+      engine: "openmaus-gateway",
+      outcome: "completed",
+      tools: [{ name: "openmaus-host:filesystem_stat", ok: true }],
+    });
   });
 
   it("serves packaged UI assets and preserves API 404s", async () => {
@@ -610,7 +664,7 @@ describe("harness HTTP API", () => {
     } finally {
       stream.close();
     }
-  });
+  }, 90_000);
 
   it("imports a team as a project: one room, on a folder", async () => {
     // The manifest still describes only people. Room name and folder come
@@ -785,7 +839,7 @@ describe("harness HTTP API", () => {
     for (const bot of [trusted, impostor, legacy.body.bots[0], secondBot]) {
       expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(200);
     }
-  });
+  }, 90_000);
 
   it("keeps the rest of a duplicate's fields when the source engine is offline", async () => {
     // duplicateBot POSTs a blank bot, then PATCHes the source's whole
@@ -1665,7 +1719,7 @@ describe("instance CLI override API", () => {
     expect((await api("PATCH", "/api/instances/nope", { cli: "/x" })).status).toBe(404);
     expect((await api("PATCH", "/api/instances/ghost", { cli: 42 })).status).toBe(400);
     expect((await api("PATCH", "/api/instances/ghost", { cli: "/x\ny" })).status).toBe(400);
-  });
+  }, 90_000);
 
   it("echoes a path-ish name back as the only cli candidate", async () => {
     const res = await api("GET", "/api/cli-candidates?name=/opt/definitely/not/here");
@@ -1711,7 +1765,7 @@ describe("instance CLI override API", () => {
     const overlapping = await api("PATCH", "/api/instances/ghost", { cli: "/tmp/ghost-overlap" });
     expect(overlapping.status).toBe(409);
     expect((await slowConfigWrite).status).toBe(200);
-  });
+  }, 90_000);
 });
 
 describe("computer control API (who is driving)", () => {

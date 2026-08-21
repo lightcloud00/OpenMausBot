@@ -41,5 +41,8 @@ export const SPAWNED_PROXIES = {
   agents: resolveProxy("drivers/agents-proxy"),
   dweb: resolveProxy("drivers/dweb-proxy"),
   connectors: resolveProxy("connector-proxy"),
+  capabilities: resolveProxy("capability-proxy"),
+  claudeApiKeyHelper: resolveProxy("claude-api-key-helper"),
+  telemetrySink: resolveProxy("telemetry-sink"),
   phone: resolveProxy("drivers/phone-proxy"),
 } as const;

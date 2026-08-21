@@ -35,6 +35,31 @@ let desktopViewerContextId = null;
 // identities match. This must run before Electron becomes ready.
 if (process.platform === "linux") app.setDesktopName("com.openmausbot.app.desktop");
 
+// Development/package acceptance runs can keep every Electron-owned artifact
+// away from the installed app without changing production defaults. An
+// explicit Chromium --user-data-dir remains authoritative; Electron applies
+// that switch itself, so an environment override must not silently replace it.
+function appPathOverride(name) {
+  const configured = process.env[name]?.trim();
+  if (!configured) return null;
+  if (!path.isAbsolute(configured)) throw new Error(`${name} must be an absolute path`);
+  const resolved = path.resolve(configured);
+  if (resolved === path.parse(resolved).root) throw new Error(`${name} must not be a filesystem root`);
+  fs.mkdirSync(resolved, { recursive: true, mode: 0o700 });
+  if (!fs.statSync(resolved).isDirectory()) throw new Error(`${name} must name a directory`);
+  return resolved;
+}
+
+const USER_DATA_OVERRIDE = app.commandLine.hasSwitch("user-data-dir")
+  ? null
+  : appPathOverride("OMB_USER_DATA_DIR");
+if (USER_DATA_OVERRIDE) app.setPath("userData", USER_DATA_OVERRIDE);
+const LOG_DIR_OVERRIDE = appPathOverride("OMB_LOG_DIR");
+if (LOG_DIR_OVERRIDE) app.setPath("logs", LOG_DIR_OVERRIDE);
+
+const CREDENTIALS_FILE = path.join(app.getPath("userData"), "credentials.bin");
+const LOG_DIR = app.getPath("logs");
+
 // Packaged: the harness server ships in Resources (compiled JS, zero deps)
 // and runs on Electron's own Node via utilityProcess. It serves the built
 // UI too, so the window talks to one origin and there is no dev proxy.
@@ -44,8 +69,6 @@ if (process.platform === "linux") app.setDesktopName("com.openmausbot.app.deskto
 let serverProc = null;
 let serverReady = true;
 let secureCredentials = {};
-
-const CREDENTIALS_FILE = path.join(app.getPath("userData"), "credentials.bin");
 
 async function loadSecureCredentials() {
   try {
@@ -184,7 +207,6 @@ async function ensureManagedComposioCredentials() {
 // Console.app-visible; %APPDATA%\OpenMausBot\logs on Windows), which is also
 // why stdio is piped, not inherited — under a Finder/Explorer launch the
 // parent's stdio leads nowhere and a failed boot is otherwise undiagnosable.
-const LOG_DIR = app.getPath("logs");
 let logStream = null;
 import {
   companionEnabledAtRest,
@@ -219,6 +241,7 @@ async function startServerOn(port) {
       OMB_RESOURCES_PATH: process.resourcesPath,
       OMB_SKILLS_DIR: path.join(process.resourcesPath, "skills"),
       OMB_PORT: String(port),
+      OMB_RELEASE: app.getVersion(),
       OMB_USER_DATA: app.getPath("userData"),
       ...(secureCredentials.composioApiKey
         ? { COMPOSIO_API_KEY: secureCredentials.composioApiKey }
