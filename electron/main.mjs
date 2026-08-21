@@ -33,6 +33,7 @@ let desktopViewerContextId = null;
 const SMOKE_TEST = process.env.OMB_SMOKE_TEST === "1";
 const SMOKE_CUA = SMOKE_TEST && process.env.OMB_SMOKE_CUA === "1";
 const SMOKE_BUNDLED_CUA = SMOKE_TEST && process.env.OMB_SMOKE_BUNDLED_CUA === "1";
+const SMOKE_HARD_DEATH_CUA = SMOKE_TEST && process.env.OMB_SMOKE_HARD_DEATH === "1";
 
 // GNOME groups the window with its installed desktop entry only when both
 // identities match. This must run before Electron becomes ready.
@@ -893,7 +894,7 @@ app.whenReady().then(async () => {
   // failure — computer use degrades to "unavailable", the rest still works.
   cuaReady =
     (process.platform === "darwin" || process.platform === "linux") &&
-    (!SMOKE_TEST || SMOKE_CUA || SMOKE_BUNDLED_CUA)
+    (!SMOKE_TEST || SMOKE_CUA || SMOKE_BUNDLED_CUA || SMOKE_HARD_DEATH_CUA)
       ? startCua().catch((e) => {
           console.error("[cua] start failed:", e);
           return { mode: "unavailable", reason: String(e) };
