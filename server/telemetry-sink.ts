@@ -1,4 +1,5 @@
 import { createInterface } from "node:readline";
+import { readFileSync } from "node:fs";
 
 import { NodeSDK } from "@opentelemetry/sdk-node";
 import { LangfuseSpanProcessor } from "@langfuse/otel";
@@ -8,7 +9,30 @@ import * as Sentry from "@sentry/node";
 import { protectedEnvironmentValues, redactKnownValues, redactSecrets } from "./redact.ts";
 import type { TelemetryEnvelope, TelemetryErrorEnvelope, TelemetryTraceEnvelope } from "./telemetry-protocol.ts";
 
-const kind = process.env.OMB_TELEMETRY_KIND;
+interface RuntimeConfig {
+  schema: "openmaus.telemetry-sink-runtime.v1";
+  kind: "sentry" | "langfuse";
+  release: string;
+  environment: string;
+  langfuseBaseUrl: string;
+}
+
+function loadRuntimeConfig(): RuntimeConfig {
+  const value = JSON.parse(readFileSync(process.argv[2] ?? "", "utf8")) as Partial<RuntimeConfig>;
+  if (
+    value.schema !== "openmaus.telemetry-sink-runtime.v1" ||
+    !["sentry", "langfuse"].includes(String(value.kind)) ||
+    typeof value.release !== "string" ||
+    typeof value.environment !== "string" ||
+    typeof value.langfuseBaseUrl !== "string"
+  ) {
+    throw new Error("invalid telemetry sink runtime configuration");
+  }
+  return value as RuntimeConfig;
+}
+
+const runtime = loadRuntimeConfig();
+const kind = runtime.kind;
 const protectedValues = protectedEnvironmentValues();
 
 function sanitize<T>(input: T): T {
@@ -26,8 +50,8 @@ if (kind === "sentry") {
   if (!process.env.SENTRY_DSN) throw new Error("Sentry telemetry credential was not injected");
   Sentry.init({
     dsn: process.env.SENTRY_DSN,
-    release: process.env.OMB_RELEASE,
-    environment: process.env.OMB_TELEMETRY_ENVIRONMENT ?? "production",
+    release: runtime.release,
+    environment: runtime.environment,
     sendDefaultPii: false,
     beforeSend: (event) => sanitize(event),
   });
@@ -38,9 +62,9 @@ if (kind === "sentry") {
   langfuseProcessor = new LangfuseSpanProcessor({
     publicKey: process.env.LANGFUSE_PUBLIC_KEY,
     secretKey: process.env.LANGFUSE_SECRET_KEY,
-    baseUrl: process.env.LANGFUSE_BASE_URL ?? "http://127.0.0.1:3030",
-    environment: process.env.OMB_TELEMETRY_ENVIRONMENT ?? "production",
-    release: process.env.OMB_RELEASE,
+    baseUrl: runtime.langfuseBaseUrl,
+    environment: runtime.environment,
+    release: runtime.release,
     mediaUploadEnabled: false,
     exportMode: "immediate",
     mask: ({ data }) => sanitize(data),
@@ -80,7 +104,7 @@ function sentryError(envelope: TelemetryErrorEnvelope): void {
 
 function langfuseTrace(envelope: TelemetryTraceEnvelope): void {
   const clean = sanitize(envelope);
-  const release = process.env.OMB_RELEASE ?? clean.release;
+  const release = runtime.release || clean.release;
   const metadata = {
     application: clean.application,
     botId: clean.botId,
@@ -109,7 +133,7 @@ function langfuseTrace(envelope: TelemetryTraceEnvelope): void {
       tags,
       metadata,
       version: clean.sourceSha,
-      environment: process.env.OMB_TELEMETRY_ENVIRONMENT ?? "production",
+      environment: runtime.environment,
     },
     () => {
       const root = startObservation(
@@ -119,7 +143,7 @@ function langfuseTrace(envelope: TelemetryTraceEnvelope): void {
           output: { summary: clean.responseSummary, outcome: clean.outcome },
           metadata,
           version: clean.sourceSha,
-          environment: process.env.OMB_TELEMETRY_ENVIRONMENT ?? "production",
+          environment: runtime.environment,
           level: clean.outcome === "failed" ? "ERROR" : "DEFAULT",
           ...(clean.errorSummary ? { statusMessage: clean.errorSummary } : {}),
         },

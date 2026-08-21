@@ -7,7 +7,11 @@ import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { RuntimeEvent } from "./contracts.ts";
-import { TelemetryManager } from "./telemetry.ts";
+import {
+  TelemetryManager,
+  telemetrySinkRuntimeConfig,
+  telemetrySinkSpawnSpec,
+} from "./telemetry.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -54,6 +58,71 @@ function event(type: RuntimeEvent["type"], extra: Record<string, unknown> = {}):
 }
 
 describe("TelemetryManager", () => {
+  it("uses one multi-binding CredVault stdio broker and restores packaged Node mode", () => {
+    const env = {
+      PATH: "/safe/bin",
+      HOME: "/safe/home",
+      OMB_LANGFUSE_PUBLIC_KEY_ALIAS: "langfuse-public-alias",
+      OMB_LANGFUSE_SECRET_KEY_ALIAS: "langfuse-secret-alias",
+      OMB_TELEMETRY_ENVIRONMENT: "acceptance",
+      OMB_LANGFUSE_BASE_URL: "http://127.0.0.1:3030",
+      SHOULD_NOT_PASS: "forbidden",
+    };
+    const spec = telemetrySinkSpawnSpec("langfuse", "/app/server/telemetry-sink.cjs", "/private/sink-langfuse.json", {
+      platform: "darwin",
+      executable: "/app/OpenMausBot Helper",
+      env,
+    });
+    expect(spec.cli).toBe("cv");
+    expect(spec.args.slice(0, 3)).toEqual(["--source", "main", "stdio-exec"]);
+    expect(spec.args).toContain("LANGFUSE_PUBLIC_KEY=langfuse-public-alias");
+    expect(spec.args).toContain("LANGFUSE_SECRET_KEY=langfuse-secret-alias");
+    expect(spec.args.filter((arg) => arg === "stdio-exec")).toHaveLength(1);
+    expect(spec.args).not.toContain("exec");
+    expect(spec.args).toContain("/usr/bin/env");
+    expect(spec.args).toContain("ELECTRON_RUN_AS_NODE=1");
+    expect(spec.args).not.toContain("OMB_TELEMETRY_KIND=langfuse");
+    expect(spec.args).not.toContain("OMB_TELEMETRY_ENVIRONMENT=acceptance");
+    expect(spec.args.join(" ")).not.toContain("127.0.0.1");
+    expect(spec.args.slice(-3)).toEqual([
+      "/app/OpenMausBot Helper",
+      "/app/server/telemetry-sink.cjs",
+      "/private/sink-langfuse.json",
+    ]);
+    expect(spec.env).not.toHaveProperty("SHOULD_NOT_PASS");
+    expect(spec.args.join(" ")).not.toContain("forbidden");
+  });
+
+  it("uses the fixed Windows launcher without putting credential values in argv", () => {
+    const spec = telemetrySinkSpawnSpec("sentry", "C:\\OpenMaus\\server\\telemetry-sink.cjs", "C:\\private\\sink-sentry.json", {
+      platform: "win32",
+      executable: "C:\\OpenMaus\\OpenMausBot Helper.exe",
+      env: {
+        COMSPEC: "C:\\Windows\\System32\\cmd.exe",
+        OMB_SENTRY_DSN_ALIAS: "sentry-logical-alias",
+        OMB_LANGFUSE_BASE_URL: "https://user:secret@example.test/path",
+      },
+    });
+    expect(spec.args).toContain("SENTRY_DSN=sentry-logical-alias");
+    expect(spec.args).toContain("C:\\OpenMaus\\server\\telemetry-node-launcher.cmd");
+    expect(spec.args.join(" ")).not.toContain("user:secret");
+  });
+
+  it("stores only bounded non-secret runtime metadata outside broker argv", () => {
+    expect(
+      telemetrySinkRuntimeConfig("langfuse", "bad release & value", {
+        OMB_TELEMETRY_ENVIRONMENT: "acceptance",
+        OMB_LANGFUSE_BASE_URL: "https://user:secret@example.test/path",
+      }),
+    ).toEqual({
+      schema: "openmaus.telemetry-sink-runtime.v1",
+      kind: "langfuse",
+      release: "unknown",
+      environment: "acceptance",
+      langfuseBaseUrl: "http://127.0.0.1:3030",
+    });
+  });
+
   it("emits one sanitized trace per turn with generation, tool, usage, and correlation metadata", () => {
     const dir = mkdtempSync(join(tmpdir(), "omb-telemetry-"));
     dirs.push(dir);

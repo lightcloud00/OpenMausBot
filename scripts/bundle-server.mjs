@@ -19,6 +19,7 @@
 // that lookup is unaffected.
 import { build } from "esbuild";
 import { execFileSync } from "node:child_process";
+import { copyFile, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -45,7 +46,6 @@ const ENTRY_POINTS = [
   "connector-proxy.ts",
   "capability-proxy.ts",
   "claude-api-key-helper.ts",
-  "telemetry-sink.ts",
   "drivers/agents-proxy.ts",
   "drivers/dweb-proxy.ts",
   "drivers/phone-proxy.ts",
@@ -64,3 +64,26 @@ await build({
   define: { __OMB_SOURCE_SHA__: JSON.stringify(sourceSha) },
   logLevel: "info",
 });
+
+// The OpenTelemetry/Sentry dependency graph contains dynamic CommonJS
+// requires. Keeping this one process as CJS avoids an ESM bundle that builds
+// successfully and then fails immediately on `require("util")` at runtime.
+await build({
+  entryPoints: [join(server, "telemetry-sink.ts")],
+  bundle: true,
+  platform: "node",
+  target: "node20",
+  format: "cjs",
+  outfile: join(root, "dist-server", "telemetry-sink.cjs"),
+  define: { __OMB_SOURCE_SHA__: JSON.stringify(sourceSha) },
+  logLevel: "info",
+});
+await rm(join(root, "dist-server", "telemetry-sink.js"), { force: true });
+
+// Windows cannot apply ELECTRON_RUN_AS_NODE to the packaged Helper with
+// /usr/bin/env. The fixed launcher carries only bounded non-secret metadata;
+// CredVault still injects provider values directly into its child environment.
+await copyFile(
+  join(server, "telemetry-node-launcher.cmd"),
+  join(root, "dist-server", "telemetry-node-launcher.cmd"),
+);

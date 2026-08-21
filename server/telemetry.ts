@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { join, win32 as winPath } from "node:path";
 
 import type { ChildProcessByStdio } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
@@ -59,28 +59,119 @@ function summary(value: string, max = SUMMARY_CHARS): string {
   return value.replace(/\s+/g, " ").trim().slice(0, max);
 }
 
-function sinkAliases(kind: SinkKind): Array<{ alias: string; env: string }> {
+function sinkAliases(kind: SinkKind, env: NodeJS.ProcessEnv): Array<{ alias: string; env: string }> {
   if (kind === "sentry") {
-    return [{ alias: process.env.OMB_SENTRY_DSN_ALIAS ?? "sentry_dsn_gusdigital_ios", env: "SENTRY_DSN" }];
+    return [{ alias: env.OMB_SENTRY_DSN_ALIAS ?? "sentry_dsn_gusdigital_ios", env: "SENTRY_DSN" }];
   }
   return [
-    { alias: process.env.OMB_LANGFUSE_PUBLIC_KEY_ALIAS ?? "langfuse_local_init_project_public_key", env: "LANGFUSE_PUBLIC_KEY" },
-    { alias: process.env.OMB_LANGFUSE_SECRET_KEY_ALIAS ?? "langfuse_local_init_project_secret_key", env: "LANGFUSE_SECRET_KEY" },
+    { alias: env.OMB_LANGFUSE_PUBLIC_KEY_ALIAS ?? "langfuse_local_init_project_public_key", env: "LANGFUSE_PUBLIC_KEY" },
+    { alias: env.OMB_LANGFUSE_SECRET_KEY_ALIAS ?? "langfuse_local_init_project_secret_key", env: "LANGFUSE_SECRET_KEY" },
   ];
 }
 
-function cleanEnvironment(kind: SinkKind, release: string): NodeJS.ProcessEnv {
+function cleanEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const keep = ["HOME", "USERPROFILE", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "SHELL"] as const;
   const env: NodeJS.ProcessEnv = {
     PATH: augmentedPath(),
-    ELECTRON_RUN_AS_NODE: "1",
-    OMB_TELEMETRY_KIND: kind,
-    OMB_RELEASE: release,
-    OMB_TELEMETRY_ENVIRONMENT: process.env.OMB_TELEMETRY_ENVIRONMENT ?? "production",
   };
-  if (kind === "langfuse") env.LANGFUSE_BASE_URL = process.env.OMB_LANGFUSE_BASE_URL ?? "http://127.0.0.1:3030";
-  for (const name of keep) if (process.env[name]) env[name] = process.env[name];
+  for (const name of keep) if (source[name]) env[name] = source[name];
   return env;
+}
+
+function boundedRuntimeValue(value: string | undefined, fallback: string, max: number): string {
+  const candidate = value?.trim() ?? "";
+  return candidate && candidate.length <= max && /^[A-Za-z0-9._+-]+$/.test(candidate)
+    ? candidate
+    : fallback;
+}
+
+function langfuseBaseUrl(value: string | undefined): string {
+  try {
+    const parsed = new URL(value?.trim() || "http://127.0.0.1:3030");
+    if (!/^https?:$/.test(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+      return "http://127.0.0.1:3030";
+    }
+    return parsed.href.replace(/\/$/, "");
+  } catch {
+    return "http://127.0.0.1:3030";
+  }
+}
+
+export interface TelemetrySinkSpawnSpec {
+  cli: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+}
+
+export interface TelemetrySinkRuntimeConfig {
+  schema: "openmaus.telemetry-sink-runtime.v1";
+  kind: SinkKind;
+  release: string;
+  environment: string;
+  langfuseBaseUrl: string;
+}
+
+export function telemetrySinkRuntimeConfig(
+  kind: SinkKind,
+  release: string,
+  env: NodeJS.ProcessEnv = process.env,
+): TelemetrySinkRuntimeConfig {
+  return {
+    schema: "openmaus.telemetry-sink-runtime.v1",
+    kind,
+    release: boundedRuntimeValue(release, "unknown", 128),
+    environment: boundedRuntimeValue(env.OMB_TELEMETRY_ENVIRONMENT, "production", 64),
+    langfuseBaseUrl: langfuseBaseUrl(env.OMB_LANGFUSE_BASE_URL),
+  };
+}
+
+/** Build one CredVault stdio broker invocation for all credentials a sink
+ * needs. CredVault deliberately strips the parent environment, so the final
+ * executable boundary restores only Electron's Node-mode flag. Bounded
+ * non-secret metadata travels in a private file; raw values remain inside
+ * CredVault and the sink. */
+export function telemetrySinkSpawnSpec(
+  kind: SinkKind,
+  sinkPath: string,
+  runtimeConfigPath: string,
+  options: {
+    platform?: NodeJS.Platform;
+    executable?: string;
+    env?: NodeJS.ProcessEnv;
+  } = {},
+): TelemetrySinkSpawnSpec {
+  const platform = options.platform ?? process.platform;
+  const executable = options.executable ?? process.execPath;
+  const source = options.env ?? process.env;
+  const bindings = sinkAliases(kind, source).flatMap(({ alias, env }) => ["--env", `${env}=${alias}`]);
+  let command: string;
+  let commandArgs: string[];
+  if (platform === "win32") {
+    command = source.ComSpec || source.COMSPEC || "cmd.exe";
+    commandArgs = [
+      "/d",
+      "/v:off",
+      "/s",
+      "/c",
+      winPath.join(winPath.dirname(sinkPath), "telemetry-node-launcher.cmd"),
+      executable,
+      sinkPath,
+      runtimeConfigPath,
+    ];
+  } else {
+    command = "/usr/bin/env";
+    commandArgs = [
+      "ELECTRON_RUN_AS_NODE=1",
+      executable,
+      sinkPath,
+      runtimeConfigPath,
+    ];
+  }
+  return {
+    cli: "cv",
+    args: ["--source", "main", "stdio-exec", ...bindings, "--", command, ...commandArgs],
+    env: cleanEnvironment(source),
+  };
 }
 
 /** Sanitized, non-blocking telemetry fan-out. Credentials are injected into
@@ -108,16 +199,17 @@ export class TelemetryManager {
   }
 
   private spawnDefault(kind: SinkKind): SinkChild {
-    const credentials = sinkAliases(kind);
-    let command = process.execPath;
-    let args = [this.options.sinkPath];
-    for (let i = credentials.length - 1; i >= 0; i--) {
-      const next = credentials[i]!;
-      args = ["exec", next.alias, next.env, "--", command, ...args];
-      command = "credvault";
-    }
-    return spawnCli(command, args, {
-      env: cleanEnvironment(kind, this.options.release),
+    const configPath = join(this.options.dataDir, "telemetry", `sink-${kind}.json`);
+    const temporary = `${configPath}.${process.pid}.tmp`;
+    writeFileSync(
+      temporary,
+      `${JSON.stringify(telemetrySinkRuntimeConfig(kind, this.options.release))}\n`,
+      { mode: 0o600 },
+    );
+    renameSync(temporary, configPath);
+    const spec = telemetrySinkSpawnSpec(kind, this.options.sinkPath, configPath);
+    return spawnCli(spec.cli, spec.args, {
+      env: spec.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
   }
