@@ -84,6 +84,16 @@ describe("full-task-scoped hard denials", () => {
     "echo cm0gLXJmIC8= | base64 -d | sh",
     "python3 -c \"exec(bytes.fromhex('726d202d7266202f'))\"",
     "delete_project production",
+    "bash -lc \"$(printf Y20wZ0xYSm1JQzg9 | base64 -d | base64 -d)\"",
+    "python3 -c 'import os; os.system(\"rm \" + \"-rf \" + \"/\")'",
+    "python3 -c 'import subprocess; subprocess.run([\"rm\", \"-rf\", \"/\"])'",
+    "node -e 'require(\"child_process\").execSync(String.fromCharCode(114,109,32,45,114,102,32,47))'",
+    "python3 -c 'exec(chr(114)+chr(109)+chr(32)+chr(45)+chr(114)+chr(102)+chr(32)+chr(47))'",
+    "ruby -e 'require \"fileutils\"; FileUtils.rm_rf(\"/\")'",
+    "perl -MFile::Path -e 'remove_tree(\"/\")'",
+    "bash -lc 'rm%2520-rf%2520%252F'",
+    "printf '\\162\\155\\040\\055\\162\\146\\040\\057' | sh",
+    "powershell -EncodedCommand UgBlAG0AbwB2AGUALQBJAHQAZQBtACAAQwA6AFwAIAAtAFIAZQBjAHUAcgBzAGUAIAAtAEYAbwByAGMAZQA=",
   ]) {
     it(`rejects catastrophic action: ${command}`, () => expect(looksCatastrophic(command)).toBe(true));
   }
@@ -94,6 +104,9 @@ describe("full-task-scoped hard denials", () => {
     "git push --force-with-lease origin feature",
     "DROP TABLE disposable_fixture",
     "deploy production",
+    "python3 -c 'print(\"hello\")'",
+    "node -e 'console.log([\"rm\", \"-rf\", \"/\"].join(\" \"))'",
+    "echo Z2l0IHN0YXR1cw== | base64 -d | sh",
   ]) {
     it(`permits scoped full-access action: ${command}`, () => expect(looksCatastrophic(command)).toBe(false));
   }
@@ -106,6 +119,11 @@ describe("full-task-scoped hard denials", () => {
     "cat ~/.codex/auth.json",
     "python3 -c 'import os; print(os.environ)'",
     "call read_credential_value",
+    "echo WTJGMElINHZMbU52WkdWNEwyRjFkR2d1YW5OdmJnPT0= | base64 -d | base64 -d | sh",
+    "open -a 'Keychain Access'",
+    "open chrome://password-manager",
+    "printenv PATH",
+    "Get-ChildItem Env:\\",
   ]) {
     it(`rejects credential disclosure: ${command}`, () =>
       expect(looksLikeCredentialValueDisclosure(command)).toBe(true));
@@ -115,6 +133,41 @@ describe("full-task-scoped hard denials", () => {
     expect(fullTaskScopedHardDeny("Bash", "rm -rf /")).toBe("catastrophic-destruction");
     expect(fullTaskScopedHardDeny("Bash", "cv resolve sentry")).toBe("credential-value-disclosure");
     expect(fullTaskScopedHardDeny("Bash", "git push --force-with-lease origin feature")).toBeNull();
+  });
+
+  it("fails closed only when an execution wrapper hides an unresolved payload", () => {
+    expect(looksCatastrophic('echo "$BLOB" | base64 -d | sh')).toBe(true);
+    expect(looksCatastrophic('bash -lc "$DYNAMIC_COMMAND"')).toBe(true);
+    expect(looksCatastrophic("python3 -c 'exec(payload)'")).toBe(true);
+    expect(looksCatastrophic("python3 scripts/build_fixture.py")).toBe(false);
+    expect(looksCatastrophic("env MODE=test node scripts/build.js")).toBe(false);
+  });
+
+  it("reconstructs structured and concatenated credential-store reads", () => {
+    expect(
+      fullTaskScopedHardDeny(
+        "Bash",
+        "python3 -c 'print(open(\"~/.codex/\" + \"auth.json\").read())'",
+      ),
+    ).toBe("credential-value-disclosure");
+    expect(
+      fullTaskScopedHardDeny(
+        "Bash",
+        "python3 -c 'import subprocess; subprocess.run([\"cat\", \"~/.codex/auth.json\"])'",
+      ),
+    ).toBe("credential-value-disclosure");
+    expect(fullTaskScopedHardDeny("openmaus-computer:open_app", JSON.stringify({ name: "Keychain Access" }))).toBe(
+      "credential-value-disclosure",
+    );
+    expect(fullTaskScopedHardDeny("openmaus-computer:open_url", JSON.stringify({ url: "chrome://password-manager" }))).toBe(
+      "credential-value-disclosure",
+    );
+  });
+
+  it("does not mistake an env-prefixed task command for an environment dump", () => {
+    expect(looksLikeCredentialValueDisclosure("env MODE=test pnpm test")).toBe(false);
+    expect(looksLikeCredentialValueDisclosure("printenv PATH")).toBe(true);
+    expect(looksLikeCredentialValueDisclosure("env")).toBe(true);
   });
 
   it("keeps logical-alias operations available", () => {

@@ -210,6 +210,24 @@ function connectedAppsIntegration(botId: string, threadId: string) {
   });
 }
 
+/** Manus Desktop and the Hermes /manus route enter through an authenticated
+ * external lease rather than a provider driver. Give those leases the same
+ * available app-owned integrations that an in-app full-profile turn folds
+ * into the gateway; the host catalog alone omits connected apps, local
+ * computer control, and optional dweb. Backends remain lazy. */
+async function externalAppCapabilityServers(client: string, threadId: string) {
+  const integrations: NonNullable<SendTurnInput["integrations"]> = {};
+  if (composio.configured(cfg)) {
+    const connection = await connectedAppsIntegration(client, threadId);
+    if (connection) integrations.composio = connection;
+  }
+  const localComputer = readCuaConnection();
+  if (localComputer) integrations.localComputer = localComputer;
+  const dwebUrl = process.env.DWEB_URL?.trim();
+  if (dwebUrl) integrations.dweb = { url: dwebUrl };
+  return appCapabilityServers(integrations);
+}
+
 // ── computer control (who is driving) ──────────────────────────────────
 // The person can take the wheel of a bot's computer from the panel; while
 // they hold it, the bot's computer proxies refuse every action. The record
@@ -617,6 +635,45 @@ const externalCapabilityTelemetry = new Map<string, {
   turnId: string;
   correlationId: string;
 }>();
+const activeRendererTurns = new Map<string, {
+  botId: string;
+  botName: string;
+  threadId: string;
+  turnId?: string;
+  engine: string;
+  model: string;
+  correlationId: string;
+}>();
+
+function registerActiveTurn(input: {
+  botId: string;
+  botName: string;
+  threadId: string;
+  engine: string;
+  model: string;
+  prompt: string;
+}): string {
+  const correlationId = telemetry.registerTurn(input);
+  activeRendererTurns.set(input.threadId, { ...input, correlationId });
+  return correlationId;
+}
+
+function rendererTurnContext(body: Record<string, unknown>) {
+  const requestedThread = typeof body.threadId === "string" ? activeRendererTurns.get(body.threadId) : undefined;
+  if (requestedThread) return requestedThread;
+  if (typeof body.botId === "string") {
+    const byBot = [...activeRendererTurns.values()].filter((turn) => turn.botId === body.botId);
+    if (byBot.length === 1) return byBot[0];
+  }
+  return activeRendererTurns.size === 1 ? [...activeRendererTurns.values()][0] : undefined;
+}
+
+bus.subscribe((event) => {
+  const active = activeRendererTurns.get(event.threadId);
+  if (!active) return;
+  if (!active.turnId) active.turnId = event.turnId;
+  if (event.type === "turn.completed") activeRendererTurns.delete(event.threadId);
+});
 
 function externalCapabilityEvent(
   token: string,
@@ -723,6 +780,7 @@ const watchdog = new TurnWatchdog({
     turnUsage.delete(turn.threadId);
     roomStallCompletions.stall(turn.threadId);
     telemetry.failTurn(turn.threadId, new Error("turn stalled without runtime activity"));
+    activeRendererTurns.delete(turn.threadId);
     // ACP interruption settles within five seconds; other adapters settle
     // sooner. Keep ownership during that grace period so another turn cannot
     // overlap the process we are stopping. The normal turn.completed fold
@@ -1526,7 +1584,7 @@ async function startTurn(
   store.setActivity(bot.id, "working");
   store.patchBot(bot.id, { unread: false });
   turnUsage.delete(threadId);
-  telemetry.registerTurn({
+  registerActiveTurn({
     botId: bot.id,
     botName: bot.name,
     threadId,
@@ -1821,6 +1879,7 @@ async function startTurn(
       }
     } catch (e) {
       telemetry.failTurn(threadId, e);
+      activeRendererTurns.delete(threadId);
       if (capabilityToken) closeCapabilityTurn(threadId, capabilityToken);
       localVmLease.release(threadId);
       if (localVmActiveThread === threadId) localVmActiveThread = null;
@@ -2111,7 +2170,7 @@ async function runGroupMemberTurn(
     });
     unregisterStall = roomStallCompletions.register(group.threadId, () => finish("stalled"));
     watchdog.watch(group.threadId, bot.id);
-    telemetry.registerTurn({
+    registerActiveTurn({
       botId: bot.id,
       botName: bot.name,
       threadId: group.threadId,
@@ -2133,6 +2192,7 @@ async function runGroupMemberTurn(
       })
       .catch((err) => {
         telemetry.failTurn(group.threadId, err);
+        activeRendererTurns.delete(group.threadId);
         if (capabilityToken) closeCapabilityTurn(group.threadId, capabilityToken);
         store.appendMessage(group.threadId, {
           role: "bot",
@@ -2433,6 +2493,7 @@ async function reloadProviders() {
     });
     store.setActivity(b.id, "idle");
     telemetry.failTurn(b.threadId, new Error("provider settings changed during turn"));
+    activeRendererTurns.delete(b.threadId);
   }
   // killed turns settle here without a turn.completed event, so anything
   // queued behind them drains now — onto the freshly loaded fleet
@@ -2557,6 +2618,12 @@ const server = createServer(async (req, res) => {
           const cwd = typeof body.cwd === "string" && body.cwd.trim() ? body.cwd.trim() : undefined;
           const turnToken = randomBytes(32).toString("hex");
           capabilityGateway.beginTurn(turnToken, { botId: client, threadId, cwd, ttlMs: 60 * 60_000 });
+          try {
+            capabilityGateway.extendTurn(turnToken, await externalAppCapabilityServers(client, threadId));
+          } catch (error) {
+            capabilityGateway.endTurn(turnToken);
+            throw error;
+          }
           const turnId = `external-${randomUUID()}`;
           const correlationId = telemetry.registerTurn({
             botId: client,
@@ -2565,7 +2632,7 @@ const server = createServer(async (req, res) => {
             engine: "openmaus-gateway",
             model: typeof body.model === "string" ? body.model.slice(0, 160) : "external-client",
             prompt: typeof body.promptSummary === "string" ? body.promptSummary.slice(0, 4_000) : "authenticated external full-task-scoped capability session",
-          });
+          }, turnId);
           externalCapabilityTelemetry.set(turnToken, { client, threadId, turnId, correlationId });
           externalCapabilityEvent(turnToken, { type: "turn.started" });
           return json(res, 201, { turnToken, manifest: capabilityGateway.inventory(turnToken).manifest });
@@ -2868,6 +2935,13 @@ const server = createServer(async (req, res) => {
     }
     if (method === "POST" && path === "/api/telemetry/error") {
       const body = await readBody(req);
+      const bodyRecord = body && typeof body === "object" && !Array.isArray(body)
+        ? body as Record<string, unknown>
+        : {};
+      const active = rendererTurnContext(bodyRecord);
+      const diagnostics = bodyRecord.diagnostics && typeof bodyRecord.diagnostics === "object" && !Array.isArray(bodyRecord.diagnostics)
+        ? bodyRecord.diagnostics as Record<string, unknown>
+        : undefined;
       telemetry.captureError(
         Object.assign(new Error(String(body.message ?? "renderer error")), {
           name: typeof body.name === "string" ? body.name.slice(0, 120) : "RendererError",
@@ -2875,13 +2949,17 @@ const server = createServer(async (req, res) => {
         }),
         {
           component: "renderer",
-          botId: typeof body.botId === "string" ? body.botId : undefined,
-          threadId: typeof body.threadId === "string" ? body.threadId : undefined,
-          turnId: typeof body.turnId === "string" ? body.turnId : undefined,
-          correlationId: typeof body.correlationId === "string" ? body.correlationId : undefined,
+          botId: active?.botId ?? (typeof body.botId === "string" ? body.botId : undefined),
+          botName: active?.botName,
+          threadId: active?.threadId ?? (typeof body.threadId === "string" ? body.threadId : undefined),
+          turnId: active?.turnId ?? (typeof body.turnId === "string" ? body.turnId : undefined),
+          engine: active?.engine,
+          model: active?.model,
+          correlationId: active?.correlationId ?? (typeof body.correlationId === "string" ? body.correlationId : undefined),
+          diagnostics,
         },
       );
-      return json(res, 202, { accepted: true });
+      return json(res, 202, { accepted: true, correlated: Boolean(active) });
     }
 
     // ── routines calendar ────────────────────────────────────────────────

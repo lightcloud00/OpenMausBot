@@ -132,9 +132,13 @@ export function ensureOpenMausCodexHome(dataDir = DATA_DIR): string {
       `[permissions.${OPENMAUS_CODEX_PERMISSIONS}]`,
       'description = "Provider-native tools are inert; all task capabilities use the OpenMaus gateway."',
       "",
-      `[permissions.${OPENMAUS_CODEX_PERMISSIONS}.filesystem]`,
-      '":minimal" = "read"',
-      "",
+      // Deliberately omit the filesystem table. A strict-config app-server
+      // probe against Codex 0.147.0 initialized and started this profile,
+      // reported that filesystem access remains restricted, and bound the
+      // thread to this named profile. Granting even `:minimal = "read"`
+      // would let a future native reader bypass the gateway's credential
+      // path denial. Native shell/unified-exec/view-image tools are disabled
+      // above, so task reads and writes have one route: openmaus_capabilities.
       `[permissions.${OPENMAUS_CODEX_PERMISSIONS}.network]`,
       "enabled = false",
       "",

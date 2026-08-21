@@ -172,7 +172,8 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(config).toContain("shell_tool = false");
     expect(config).toContain("unified_exec = false");
     expect(config).toContain("hooks = false");
-    expect(config).toContain('":minimal" = "read"');
+    expect(config).not.toContain(`[permissions.openmaus-gateway-only.filesystem]`);
+    expect(config).not.toContain('":minimal"');
     expect(config).toContain("enabled = false");
     const argv = seen.argv.join(" ");
     expect(argv).toContain("mcp_servers.openmaus_capabilities.command");

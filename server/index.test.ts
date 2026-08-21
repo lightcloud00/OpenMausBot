@@ -208,6 +208,7 @@ beforeAll(async () => {
       OMB_WEBHOOK_PORT: String(WEBHOOK_PORT),
       OMB_BOX_API: `http://127.0.0.1:${boxStubPort}`,
       OMB_COMPOSIO_API: `http://127.0.0.1:${boxStubPort}/api/v3.1`,
+      DWEB_URL: "http://127.0.0.1:9",
       OMB_STATIC_DIR: staticDir,
       // The integration test exercises the sanitized local telemetry journal
       // directly. External sink processes would add CredVault/provider
@@ -281,9 +282,10 @@ describe("harness HTTP API", () => {
     expect(opened.status).toBe(201);
     const lease = await opened.json() as {
       turnToken: string;
-      manifest: { schema: string; profile: string };
+      manifest: { schema: string; profile: string; toolInventory: string[] };
     };
     expect(lease.manifest).toMatchObject({ schema: "openmaus.capability-profile.v1", profile: "full-task-scoped" });
+    expect(lease.manifest.toolInventory).toContain("openmaus-dweb");
 
     const called = await fetch(`${BASE}/api/internal/capabilities/call`, {
       method: "POST",

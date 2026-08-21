@@ -46,6 +46,8 @@ const CATASTROPHIC = [
   /\bdd\s+[^|\n]*\bof=\s*['"]?\/dev\/(?:disk|rdisk|sd|nvme)/i,
   /\b(?:rm|unlink)\s+[^|\n]*-[a-z]*r[a-z]*f[a-z]*\s+(?:--\s+)?(?:['"]?(?:\/|~|\.\.?|\$HOME|\$\{HOME\}|\/Users(?:\/[^/\s'";]+)?|\/System|\/Library|\/Applications|\/Volumes|\/private)['"]?)(?:\s|$|[;&])/i,
   /\b(?:shutil\.rmtree|fs\.rmSync|fs\.rm)\s*\(\s*['"](?:\/|~|\.|\.\.|\/Users(?:\/[^/'"]+)?|\/System|\/Library|\/Applications)['"]/i,
+  /\b(?:FileUtils\.)?rm_r[f]?\s*\(?\s*['"](?:\/|~|\.|\.\.|\/Users(?:\/[^/'"]+)?|\/System|\/Library|\/Applications)['"]/i,
+  /\b(?:File::Path::)?remove_tree\s*\(?\s*['"](?:\/|~|\.|\.\.|\/Users(?:\/[^/'"]+)?|\/System|\/Library|\/Applications)['"]/i,
   /\b(?:shutdown|reboot|halt)\b/i,
   /:\(\)\s*\{.*\}\s*;?\s*:/,
   /\bDROP\s+(?:DATABASE|SCHEMA)\b/i,
@@ -67,7 +69,11 @@ const CREDENTIAL_VALUE_DISCLOSURE = [
   /(?:^|[\s/'"])(?:\.credvault|\.config\/credvault|Library\/.*CredVault)(?:\/|[\s'"]|$)/i,
   /(?:^|[\s/'"])(?:Library\/Keychains|Library\/.*\/(?:Cookies|Login Data)|\.config\/(?:gcloud|gh|glab)|\.kube\/config)(?:\/|[\s'"]|$)/i,
   /\bsecurity\s+find-(?:generic|internet)-password\b/i,
-  /\b(?:printenv|env)(?:\s|$)|\bps\s+(?:-[^\n]*e|[^\n]*\beww\b)/i,
+  /(?:^|[\n;&|])\s*(?:\/usr\/bin\/)?printenv\b/im,
+  /(?:^|[\n;&|])\s*(?:\/usr\/bin\/)?env\s*(?:$|[;&|])/im,
+  /(?:^|[\n;&|])\s*(?:export\s+-p|declare\s+-x|set)\s*(?:$|[;&|])/im,
+  /\b(?:Get-ChildItem|gci|dir)\s+Env:\\?/i,
+  /\bps\s+(?:-[^\n]*e|[^\n]*\beww\b)/i,
   /\b(?:authorization|proxy-authorization)\s*:\s*(?:bearer|basic)\b/i,
   /\b(?:cat|sed|awk|perl|python\w*|node)\b[^\n]*(?:\.env(?:\.|\s|$)|\.ssh\/|\.aws\/credentials|\.netrc|\.npmrc|auth\.json|credentials?\.json)/i,
   /\b(?:get|read|resolve|reveal|show|export|dump|decrypt|print)[_\s-]*(?:secret|credential|credential[_\s-]*value|vault[_\s-]*value)\b/i,
@@ -78,6 +84,8 @@ const CREDENTIAL_VALUE_DISCLOSURE = [
   /\bps\s+(?:auxe|e(?:ww|f)?|-[^\n]*e)\b/i,
   /\b(?:gh|glab)\s+auth\s+token\b|\bgcloud\s+auth\s+print-(?:access|identity)-token\b/i,
   /\b(?:pass|op)\s+(?:show|read|item\s+get)\b/i,
+  /\b(?:secret-tool\s+lookup|kwallet-query\b[^\n]*(?:read-password|-r\b))/i,
+  /\b(?:Keychain Access|chrome:\/\/(?:settings\/(?:passwords|cookies)|password-manager)|passwords\.google\.com|1Password|Bitwarden|LastPass|Dashlane)\b/i,
 ];
 
 const CREDENTIAL_STORE_PATH = [
@@ -95,11 +103,191 @@ const CREDENTIAL_STORE_PATH = [
   /[\\/]proc[\\/](?:self|\d+)[\\/]environ(?:[\s'"\\]|$)/i,
 ];
 
-function printableDecoded(value: Buffer): string | null {
-  if (!value.length || value.length > 100_000) return null;
-  const text = value.toString("utf8");
+const MAX_SAFETY_TEXT = 100_000;
+const MAX_SAFETY_VARIANTS = 128;
+const MAX_SAFETY_ROUNDS = 4;
+
+function printableText(text: string): string | null {
+  if (!text.length || text.length > MAX_SAFETY_TEXT || text.includes("\u0000")) return null;
   const printable = [...text].filter((char) => /[\t\n\r\x20-\x7e]/.test(char)).length;
   return printable / Math.max(1, text.length) >= 0.9 ? text : null;
+}
+
+function printableDecoded(value: Buffer): string[] {
+  if (!value.length || value.length > MAX_SAFETY_TEXT) return [];
+  const decoded = new Set<string>();
+  const utf8 = printableText(value.toString("utf8"));
+  if (utf8) decoded.add(utf8);
+  if (value.length % 2 === 0) {
+    const little = printableText(value.toString("utf16le"));
+    if (little) decoded.add(little);
+    const swapped = Buffer.allocUnsafe(value.length);
+    for (let i = 0; i < value.length; i += 2) {
+      swapped[i] = value[i + 1]!;
+      swapped[i + 1] = value[i]!;
+    }
+    const big = printableText(swapped.toString("utf16le"));
+    if (big) decoded.add(big);
+  }
+  return [...decoded];
+}
+
+function decodeEscapes(text: string): string {
+  return text
+    .replace(/%u([0-9a-f]{4})/gi, (_match, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
+    .replace(/&#x([0-9a-f]{2,6});?/gi, (_match, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/\\x([0-9a-f]{2})/gi, (_match, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
+    .replace(/\\u\{([0-9a-f]{1,6})\}/gi, (_match, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/\\u([0-9a-f]{4})/gi, (_match, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
+    .replace(/\\([0-7]{2,3})/g, (_match, octal: string) => String.fromCharCode(Number.parseInt(octal, 8)));
+}
+
+function quotedValue(token: string): string {
+  return decodeEscapes(token.slice(1, -1));
+}
+
+/** Fold only explicit string construction, not whitespace-separated shell
+ * arguments. This catches Python/JS/Ruby/Perl `"rm " + "-rf " + "/"` and
+ * shell-adjacent `'r''m'` without turning `echo "rm" "-rf" "/"` into a
+ * deletion that command would never execute. */
+function constructedStrings(text: string): string[] {
+  const quoted = [...text.matchAll(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g)];
+  const out: string[] = [];
+  for (let start = 0; start < quoted.length; start += 1) {
+    let joined = quotedValue(quoted[start]![0]);
+    let end = quoted[start]!.index! + quoted[start]![0].length;
+    for (let next = start + 1; next < quoted.length; next += 1) {
+      const gap = text.slice(end, quoted[next]!.index!);
+      if (!(gap === "" || /^\s*(?:\+|\.)\s*$/.test(gap))) break;
+      joined += quotedValue(quoted[next]![0]);
+      end = quoted[next]!.index! + quoted[next]![0].length;
+      if (joined.length <= MAX_SAFETY_TEXT) out.push(joined);
+    }
+  }
+
+  // argv arrays hide executable words behind commas:
+  // subprocess.run(["rm", "-rf", "/"]) / spawn("rm", ["-rf", "/"]).
+  for (const match of text.matchAll(/\[([^\]\n]{1,20000})\]/g)) {
+    const prefix = text.slice(Math.max(0, match.index! - 500), match.index!);
+    if (!/(?:subprocess\.(?:run|call|check_call|check_output|Popen)|child_process\.(?:spawn|spawnSync|execFile|execFileSync)|\b(?:spawn|spawnSync|execFile|execFileSync))\s*\([^)]*$/i.test(prefix)) continue;
+    const values = [...match[1].matchAll(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g)].map((item) => quotedValue(item[0]));
+    const command = [...prefix.matchAll(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g)].at(-1);
+    if (command) values.unshift(quotedValue(command[0]));
+    if (values.length >= 2) out.push(values.join(" "));
+  }
+  for (const match of text.matchAll(/%w\[([^\]\n]{1,20000})\]/g)) out.push(match[1].trim());
+  for (const match of text.matchAll(/%w\(([^)\n]{1,20000})\)/g)) out.push(match[1].trim());
+  return out;
+}
+
+function numericCharacterStrings(text: string): string[] {
+  const out: string[] = [];
+  for (const match of text.matchAll(/(?:String\.)?fromCharCode\s*\(([^)]{1,20000})\)/gi)) {
+    const values = match[1].split(",").map((item) => Number(item.trim()));
+    if (values.length && values.every((value) => Number.isInteger(value) && value >= 0 && value <= 0x10ffff)) {
+      out.push(String.fromCodePoint(...values));
+    }
+  }
+  for (const match of text.matchAll(/(?:chr\s*\(\s*\d{1,7}\s*\)\s*(?:\+|\.)\s*)+chr\s*\(\s*\d{1,7}\s*\)/gi)) {
+    const values = [...match[0].matchAll(/chr\s*\(\s*(\d{1,7})\s*\)/gi)].map((item) => Number(item[1]));
+    if (values.every((value) => value >= 0 && value <= 0x10ffff)) out.push(String.fromCodePoint(...values));
+  }
+  for (const match of text.matchAll(/(?:\[char\]\s*\d{1,7}\s*\+\s*)+\[char\]\s*\d{1,7}/gi)) {
+    const values = [...match[0].matchAll(/\[char\]\s*(\d{1,7})/gi)].map((item) => Number(item[1]));
+    if (values.every((value) => value >= 0 && value <= 0x10ffff)) out.push(String.fromCodePoint(...values));
+  }
+  return out;
+}
+
+function wrappedPayloads(text: string): string[] {
+  const out: string[] = [];
+  const wrappers = [
+    /\b(?:ba|z|da|k)?sh\b[^\n;&|]{0,160}?-(?:c|lc)\s+(["'])([\s\S]{1,20000}?)\1/gi,
+    /\b(?:python\w*|node|ruby|perl)\b[^\n;&|]{0,160}?-(?:c|e)\s+(["'])([\s\S]{1,20000}?)\1/gi,
+    /\b(?:powershell|pwsh)\b[^\n;&|]{0,160}?-(?:command|c)\s+(["'])([\s\S]{1,20000}?)\1/gi,
+    /\b(?:eval|exec|system|popen|execSync|spawnSync)\s*\(\s*(["'])([\s\S]{1,20000}?)\1/gi,
+  ];
+  for (const wrapper of wrappers) for (const match of text.matchAll(wrapper)) out.push(decodeEscapes(match[2]));
+  return out;
+}
+
+function base64Decoded(token: string): string[] {
+  const raw = token.replace(/^['"]|['"]$/g, "").replace(/-/g, "+").replace(/_/g, "/");
+  if (raw.length < 8 || raw.length > MAX_SAFETY_TEXT * 2 || raw.length % 4 === 1 || !/^[A-Za-z0-9+/]+={0,2}$/.test(raw)) return [];
+  const padded = raw + "=".repeat((4 - (raw.length % 4)) % 4);
+  try {
+    return printableDecoded(Buffer.from(padded, "base64"));
+  } catch {
+    return [];
+  }
+}
+
+function hexDecoded(token: string): string[] {
+  const raw = token.replace(/^0x/i, "");
+  if (raw.length < 12 || raw.length > MAX_SAFETY_TEXT * 2 || raw.length % 2 || !/^[0-9a-f]+$/i.test(raw)) return [];
+  try {
+    return printableDecoded(Buffer.from(raw, "hex"));
+  } catch {
+    return [];
+  }
+}
+
+interface SafetyAnalysis {
+  variants: string[];
+  opaqueExecution: boolean;
+}
+
+function analyzeSafetyText(text: string): SafetyAnalysis {
+  const variants = new Set<string>([text.slice(0, MAX_SAFETY_TEXT)]);
+  let saturated = text.length > MAX_SAFETY_TEXT;
+  let decodedPayloads = 0;
+  let encodedCandidates = 0;
+  const add = (value: string | null | undefined): void => {
+    if (!value || variants.has(value)) return;
+    if (variants.size >= MAX_SAFETY_VARIANTS || value.length > MAX_SAFETY_TEXT) {
+      saturated = true;
+      return;
+    }
+    variants.add(value);
+  };
+
+  for (let round = 0; round < MAX_SAFETY_ROUNDS; round += 1) {
+    const before = variants.size;
+    for (const current of [...variants]) {
+      if (/%(?:[0-9a-f]{2}|u[0-9a-f]{4})/i.test(current)) {
+        try {
+          add(decodeURIComponent(current));
+          add(decodeURIComponent(current.replace(/\+/g, "%20")));
+        } catch {}
+      }
+      add(decodeEscapes(current));
+      for (const value of constructedStrings(current)) add(value);
+      for (const value of numericCharacterStrings(current)) add(value);
+      for (const value of wrappedPayloads(current)) add(value);
+
+      for (const match of current.matchAll(/(?:^|[^A-Za-z0-9+/_=-])([A-Za-z0-9+/_-]{8,}={0,2})(?=$|[^A-Za-z0-9+/_=-])/g)) {
+        encodedCandidates += 1;
+        const decoded = base64Decoded(match[1]);
+        decodedPayloads += decoded.length ? 1 : 0;
+        for (const value of decoded) add(value);
+      }
+      for (const match of current.matchAll(/(?:^|[^0-9a-f])((?:0x)?[0-9a-f]{12,})(?=$|[^0-9a-f])/gi)) {
+        encodedCandidates += 1;
+        const decoded = hexDecoded(match[1]);
+        decodedPayloads += decoded.length ? 1 : 0;
+        for (const value of decoded) add(value);
+      }
+    }
+    if (variants.size === before) break;
+  }
+
+  const executionSink = /(?:\|\s*(?:ba|z|da|k)?sh\b|\b(?:ba|z|da|k)?sh\b[^\n;&|]{0,160}?-(?:c|lc)\b|\b(?:python\w*|node|ruby|perl)\b[^\n;&|]{0,160}?-(?:c|e)\b|\b(?:powershell|pwsh)\b[^\n;&|]{0,160}?-(?:encodedcommand|enc|command|c)\b|\b(?:eval|exec|system|popen|execSync|spawnSync)\s*\()/i.test(text);
+  const encodedIndirection = /(?:base64\b[^\n;&|]{0,80}(?:-d|--decode)|\b(?:atob|fromhex|decodeURIComponent)\s*\(|Buffer\.from\b[^\n]{0,160}['"](?:base64|hex)['"]|\bxxd\s+-r\s+-p\b|-(?:encodedcommand|enc)\b|\\x[0-9a-f]{2}|%[0-9a-f]{2})/i.test(text);
+  const opaqueVariableWrapper = /(?:\b(?:ba|z|da|k)?sh\b[^\n;&|]{0,160}?-(?:c|lc)|\b(?:python\w*|node|ruby|perl)\b[^\n;&|]{0,160}?-(?:c|e)|\b(?:eval|exec|system|popen|execSync|spawnSync)\s*\()\s*["']?\s*(?:\$\{?[A-Za-z_]|[A-Za-z_]\w*\s*\))/i.test(text);
+  return {
+    variants: [...variants],
+    opaqueExecution: saturated || opaqueVariableWrapper || (executionSink && encodedIndirection && (encodedCandidates === 0 || decodedPayloads === 0)),
+  };
 }
 
 /** Expand common command-obfuscation wrappers before classification. This is
@@ -107,33 +295,7 @@ function printableDecoded(value: Buffer): string | null {
  * percent escapes, base64, hex, and JS/Python-style character escapes without
  * executing the candidate text. */
 export function safetyTextVariants(text: string): string[] {
-  const variants = new Set<string>([text]);
-  for (let round = 0; round < 2; round += 1) {
-    for (const current of [...variants]) {
-      try {
-        const decoded = decodeURIComponent(current.replace(/\+/g, "%20"));
-        if (decoded !== current) variants.add(decoded);
-      } catch {}
-      const escaped = current
-        .replace(/\\x([0-9a-f]{2})/gi, (_match, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
-        .replace(/\\u([0-9a-f]{4})/gi, (_match, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
-      if (escaped !== current) variants.add(escaped);
-      for (const match of current.matchAll(/(?:^|[^A-Za-z0-9+/=])([A-Za-z0-9+/]{8,}={0,2})(?=$|[^A-Za-z0-9+/=])/g)) {
-        try {
-          const decoded = printableDecoded(Buffer.from(match[1], "base64"));
-          if (decoded) variants.add(decoded);
-        } catch {}
-      }
-      for (const match of current.matchAll(/(?:^|[^0-9a-f])([0-9a-f]{12,})(?=$|[^0-9a-f])/gi)) {
-        if (match[1].length % 2) continue;
-        try {
-          const decoded = printableDecoded(Buffer.from(match[1], "hex"));
-          if (decoded) variants.add(decoded);
-        } catch {}
-      }
-    }
-  }
-  return [...variants];
+  return analyzeSafetyText(text).variants;
 }
 
 /** First matching pattern's source, so a verdict can NAME the rule that
@@ -233,7 +395,8 @@ export function looksSensitive(text: string): boolean {
 }
 
 export function looksCatastrophic(text: string, cwd?: string): boolean {
-  return matchSafety(CATASTROPHIC, text) !== null || targetsCatastrophicFilesystem("shell", text, cwd);
+  const analysis = analyzeSafetyText(text);
+  return analysis.opaqueExecution || analysis.variants.some((variant) => matchFirst(CATASTROPHIC, variant) !== null) || targetsCatastrophicFilesystem("shell", text, cwd);
 }
 
 export function looksLikeCredentialValueDisclosure(text: string): boolean {
@@ -347,9 +510,12 @@ export function autoVerdict(
   const destructiveRules = fullTaskScoped ? CATASTROPHIC : DESTRUCTIVE;
   const sensitiveRules = fullTaskScoped ? CREDENTIAL_VALUE_DISCLOSURE : SENSITIVE;
   const match = fullTaskScoped ? matchSafety : matchFirst;
-  const destructive = fullTaskScoped && targetsCatastrophicFilesystem(tool, summary, context?.cwd)
-    ? "catastrophic-filesystem-target"
-    : match(destructiveRules, summary) ?? match(destructiveRules, tool);
+  const opaqueExecution = fullTaskScoped && analyzeSafetyText(`${tool}\n${summary}`).opaqueExecution;
+  const destructive = opaqueExecution
+    ? "opaque-execution-indirection"
+    : fullTaskScoped && targetsCatastrophicFilesystem(tool, summary, context?.cwd)
+      ? "catastrophic-filesystem-target"
+      : match(destructiveRules, summary) ?? match(destructiveRules, tool);
   const sensitive = destructive ? null : match(sensitiveRules, summary) ?? match(sensitiveRules, tool);
   const destructiveSource = fullTaskScoped ? ("catastrophic-guard" as const) : ("destructive-guard" as const);
   const sensitiveSource = fullTaskScoped ? ("credential-value-guard" as const) : ("sensitive-guard" as const);
