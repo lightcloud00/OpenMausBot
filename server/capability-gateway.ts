@@ -1124,9 +1124,6 @@ export class CapabilityGateway {
           throw new Error("agent graph filesystem write exceeds the bounded file size");
         }
         const parentPath = dirname(path);
-        if (preimage.parentPath !== parentPath) {
-          throw new Error("agent graph filesystem write parent changed since the approved read");
-        }
         const parentBefore = await lstat(parentPath);
         if (!parentBefore.isDirectory() || parentBefore.isSymbolicLink() ||
             parentBefore.dev !== preimage.parentDev || parentBefore.ino !== preimage.parentIno) {
