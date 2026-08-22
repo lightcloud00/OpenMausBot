@@ -250,6 +250,23 @@ describe("CapabilityGateway", () => {
     ]);
   });
 
+  it("launches the Windows Node runtime directly without the Electron cmd wrapper", () => {
+    const spec = credentialBackendSpawnSpec(
+      { alias: "logical-alias", envVar: "PROVIDER_ACCESS_TOKEN" },
+      {
+        command: "C:\\Safe Tools\\cv.exe",
+        platform: "win32",
+        executable: "C:\\hostedtoolcache\\windows\\node\\24\\node.exe",
+        proxyPath: "C:\\workspace\\server\\credential-redacting-proxy.ts",
+      },
+    );
+    const separatorIndex = spec.args.indexOf("--");
+    expect(spec.args.slice(separatorIndex + 1)).toEqual([
+      "C:\\hostedtoolcache\\windows\\node\\24\\node.exe",
+      "C:\\workspace\\server\\credential-redacting-proxy.ts",
+    ]);
+  });
+
   it("scopes selections to a turn, isolates concurrent aliases, and redacts split credential output", async () => {
     chmodSync(FAKE, 0o755);
     chmodSync(FAKE_CREDENTIAL_BROKER, 0o755);
