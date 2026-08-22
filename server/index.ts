@@ -788,15 +788,56 @@ bus.subscribe((event: RuntimeEvent) => {
       break;
     case "request.opened": {
       const permission = event.requestType === "permission";
-      // Auto mode / always-allow: answer routine tool permissions for the
-      // bot so it keeps working. A QUESTION always reaches the human — the
-      // whole point of asking is that a person decides — and anything that
-      // looks destructive stops even in auto mode.
+      // Guarded autonomy answers safe scoped permissions so work keeps
+      // moving. Questions always reach the human, broad destruction asks,
+      // and raw protected-value access is denied without showing a card.
       const asker = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
       const unattended = permission && asker && event.requestId ? isUnattended(asker.id) : false;
       const verdict = permission && asker && event.requestId
         ? autoVerdict(asker, event.tool, event.summary, { unattended, scope: event.approvalScope })
         : null;
+      if (verdict?.behavior === "deny" && asker && event.requestId) {
+        const instance = event.providerInstanceId
+          ? registry.get(event.providerInstanceId)
+          : registry.get(asker.modelSelection.instanceId);
+        const requestId = event.requestId;
+        const { tool, summary } = event;
+        // Fail closed: a protected-value request is denied by the provider,
+        // never converted into a human card that can wave the guard through.
+        void (async () => {
+          try {
+            if (!instance) throw new Error("provider unavailable");
+            const outcome = await instance.adapter.respondToRequest(event.threadId, requestId, { behavior: "deny" });
+            if (outcome === "unavailable") throw new Error("the ask is no longer open");
+            pushMessage({
+              role: "bot",
+              kind: "activity",
+              tool: { name: `blocked ${tool}: protected value access`, ok: false },
+            });
+            appendDecision(DATA_DIR, {
+              threadId: event.threadId,
+              requestId,
+              botId: asker.id,
+              botName: asker.name,
+              tool,
+              summary,
+              decision: "auto-denied",
+              source: verdict.source,
+              rule: verdict.rule,
+              unattended: unattended || undefined,
+            });
+          } catch {
+            // Do not fall back to an Allow/Deny card: delivery failure must
+            // not weaken a deny into a prompt that can expose the value.
+            pushMessage({
+              role: "bot",
+              kind: "activity",
+              tool: { name: `blocked ${tool}: could not deliver protected-value denial`, ok: false },
+            });
+          }
+        })();
+        break;
+      }
       if (verdict?.approve && asker && event.requestId) {
         const settled = verdict.approve;
         const instance = event.providerInstanceId
@@ -831,6 +872,7 @@ bus.subscribe((event: RuntimeEvent) => {
               decision: "auto-approved",
               source: verdict.source,
               rule: verdict.rule,
+              unattended: unattended || undefined,
             });
           } catch {
             // couldn't answer it for them — hand it back to the human
@@ -887,11 +929,14 @@ bus.subscribe((event: RuntimeEvent) => {
             permission && !event.approvalScope
               ? approvalKey(event.tool, event.summary, event.approvalScope)
               : undefined,
-          // in auto mode a card can only mean the guard stopped it — say so
+          // State the actual exceptional reason; safe scoped work never
+          // reaches this card merely because an Auto toggle is off.
           held:
-            permission && asker?.autoApprove
-              ? "This looked destructive, so auto mode stopped to ask."
-              : undefined,
+            permission && verdict?.source === "destructive-guard"
+              ? "Broad irreversible destruction requires confirmation."
+              : permission && verdict?.source === "local-computer-block"
+                ? "Local computer control needs explicit Auto mode."
+                : undefined,
           approvalScope: event.approvalScope,
         },
       });

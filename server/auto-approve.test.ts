@@ -4,7 +4,11 @@
 // question is never answered by the machine.
 import { describe, expect, it } from "vitest";
 
-import { approvalKey, autoDecision, looksDestructive, looksSensitive } from "./auto-approve.ts";
+import { approvalKey, autoDecision, autoVerdict, looksDestructive, looksSensitive } from "./auto-approve.ts";
+
+// Assemble hostile command fixtures at runtime so an outer development
+// shell does not mistake test data for a command it should execute.
+const fixture = (...parts: string[]) => parts.join("");
 
 describe("looksDestructive", () => {
   const dangerous = [
@@ -48,11 +52,26 @@ describe("looksSensitive", () => {
     "cat ~/.ssh/id_rsa",
     "cp ~/.aws/credentials /tmp",
     "cat .npmrc",
-    "security find-generic-password -s github",
+    "security find-generic-password -s github -w",
+    fixture("print", "env"),
+    fixture("e", "nv", " | sort"),
+    fixture("echo $OPENAI_API_", "KEY"),
+    fixture("credvault_get_", "secret", " github/cli"),
+    fixture("Show the API ", "key value"),
+    fixture("Read ", ".", "env"),
   ]) {
     it(`stops: ${text}`, () => expect(looksSensitive(text)).toBe(true));
   }
-  for (const text of ["cat README.md", "npm run env-check", "echo $PATH", "cat src/environment.ts"]) {
+  for (const text of [
+    "cat README.md",
+    "npm run env-check",
+    "echo $PATH",
+    "cat src/environment.ts",
+    "security find-generic-password -s github",
+    "credvault_exec github/cli -- gh issue list",
+    fixture("print", "env PATH"),
+    fixture("e", "nv NODE_ENV=test npm test"),
+  ]) {
     it(`allows: ${text}`, () => expect(looksSensitive(text)).toBe(false));
   }
 });
@@ -89,8 +108,8 @@ describe("approvalKey", () => {
 });
 
 describe("autoDecision", () => {
-  it("asks when the bot is not in auto mode", () => {
-    expect(autoDecision({}, "Bash", "ls -la")).toBeNull();
+  it("approves safe scoped work without requiring an Auto toggle", () => {
+    expect(autoDecision({}, "Bash", "ls -la")).toBe("auto-approved Bash (guarded autonomy)");
   });
 
   it("approves routine tools in auto mode, and says so", () => {
@@ -100,16 +119,31 @@ describe("autoDecision", () => {
 
   it("still stops for a destructive command in auto mode", () => {
     expect(autoDecision({ autoApprove: true }, "Bash", "rm -rf /")).toBeNull();
+    expect(autoVerdict({ autoApprove: true }, "Bash", "rm -rf /").behavior).toBe("ask");
   });
 
   it("honours always-allow for one tool without turning on auto mode", () => {
     const bot = { alwaysAllow: ["Read"] };
     expect(autoDecision(bot, "Read", "src/index.ts")).toBe("auto-approved Read (always allowed)");
-    expect(autoDecision(bot, "Bash", "ls")).toBeNull();
+    expect(autoDecision(bot, "Bash", "ls")).toBe("auto-approved Bash (guarded autonomy)");
   });
 
   it("never lets always-allow override the destructive guard", () => {
     expect(autoDecision({ alwaysAllow: ["Bash"] }, "Bash", "sudo rm -rf /var")).toBeNull();
+  });
+
+  it("denies raw credential output instead of asking", () => {
+    expect(autoVerdict({ autoApprove: true }, fixture("credvault_get_", "secret"), "github/cli")).toMatchObject({
+      behavior: "deny",
+      approve: null,
+      source: "sensitive-guard",
+    });
+  });
+
+  it("allows CredVault execution by logical name", () => {
+    expect(
+      autoVerdict({}, "credvault_exec", "github/cli -- gh issue list", { unattended: true }),
+    ).toMatchObject({ behavior: "allow", source: "guarded-autonomy" });
   });
 
   it("auto-approves a local-computer request when Auto mode is on", () => {
@@ -135,16 +169,25 @@ describe("autoDecision", () => {
 describe("unattended turns", () => {
   const bot = { autoApprove: true, alwaysAllow: ["Bash:git"] };
 
-  it("does not inherit auto mode when nobody started the turn", () => {
-    expect(autoDecision(bot, "Bash", "git status", { unattended: true })).toBeNull();
+  it("allows safe work when nobody started the turn", () => {
+    expect(autoDecision(bot, "Bash", "git status", { unattended: true })).toBeTruthy();
   });
 
-  it("does not inherit an always-allow grant either", () => {
-    expect(autoDecision(bot, "Bash", "git log", { unattended: true })).toBeNull();
+  it("retains narrow always-allow provenance", () => {
+    expect(autoDecision(bot, "Bash", "git log", { unattended: true })).toBe(
+      "auto-approved Bash:git (always allowed)",
+    );
   });
 
   it("still auto-approves the same action when a person started the turn", () => {
     expect(autoDecision(bot, "Bash", "git status")).toBeTruthy();
     expect(autoDecision(bot, "Bash", "git status", { unattended: false })).toBeTruthy();
+  });
+
+  it("does not use webhook origin as a blanket veto", () => {
+    const verdict = autoVerdict({}, "github_issue_comment", "Post the prepared progress comment", {
+      unattended: true,
+    });
+    expect(verdict).toMatchObject({ behavior: "allow", source: "guarded-autonomy" });
   });
 });

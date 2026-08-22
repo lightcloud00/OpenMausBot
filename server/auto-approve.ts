@@ -1,8 +1,7 @@
-// Auto mode: when a bot may answer its own permission requests.
+// Guarded autonomy: routine scoped work keeps moving without asking.
 //
-// Two ways in — the bot is in auto mode, or the user pressed "Always
-// allow" for that one tool — and one way out: anything that reads as
-// destructive stops and asks a human anyway.
+// Permission requests have three outcomes: safe scoped work is allowed,
+// broad irreversible destruction asks, and raw secret output is denied.
 //
 // The guard is deliberately tiny and literal. It is NOT a security
 // boundary (an agent set on damage has a thousand spellings for `rm`);
@@ -12,22 +11,39 @@
 
 const DESTRUCTIVE = [
   /\brm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i, // rm -rf, rm -fr, rm -r -f
+  /\brm\s+[^|;&\n]*(?:--recursive|--force)[^|;&\n]*(?:--recursive|--force)/i,
   /\bmkfs\b|\bdiskutil\s+erase|\bdd\s+[^|]*\bof=\/dev\//i,
   /\bshutdown\b|\breboot\b|\bhalt\b/i,
   /:\(\)\s*\{.*\}\s*;?\s*:/, // fork bomb
-  /\bgit\s+push\s+[^|]*--force(-with-lease)?\b|\bgit\s+reset\s+--hard\b/i,
+  /\bgit\s+push\s+[^|]*--force(-with-lease)?\b|\bgit\s+reset\s+--hard\b|\bgit\s+clean\s+-[^\s]*f/i,
+  /\bgit\s+(?:branch|tag)\s+-D\b|\bgh\s+repo\s+delete\b/i,
   /\bDROP\s+(TABLE|DATABASE)\b|\bTRUNCATE\s+TABLE\b/i,
   /\bsudo\s+rm\b|\bchmod\s+-R\s+777\s+\//i,
+  /\b(?:terraform\s+destroy|kubectl\s+delete\s+(?:namespace|cluster)|docker\s+system\s+prune)\b/i,
+  /\b(?:curl|wget)\b[^|;&\n]*\|\s*(?:sudo\s+)?(?:ba)?sh\b/i,
 ];
 
-// Not destructive, but exactly what you don't hand over unattended: a
-// bot reading your keys is quiet, permanent, and unrecoverable.
-const SENSITIVE = [
+// Names and paths that may contain protected values. A mention alone is
+// safe; matchRawValueAccess combines these with an output/transfer action.
+const SENSITIVE_NAME = [
   /(^|[\s/"'])\.env(\.|$|["'\s])/i,
   /\.ssh\/|id_rsa|id_ed25519|authorized_keys/i,
   /\.aws\/credentials|\.netrc|\.npmrc|\.pypirc|\.docker\/config\.json/i,
   /security\s+find-(generic|internet)-password|\bkeychain\b/i,
   /\bcredentials?\.json\b|\bserviceaccount\b/i,
+];
+
+// A path/name is not itself a leak. Require an operation that emits or
+// transfers its contents; brokered execution by logical name stays routine.
+const VALUE_READ_VERB = /\b(?:read|cat|head|tail|less|more|sed|awk|grep|strings|base64|xxd|cp|scp|rsync)\b/i;
+const VALUE_OUTPUT_OPERATIONS = [
+  /\bsecurity\s+find-(?:generic|internet)-password\b[^|;&\n]*\s-w(?:\s|$)/i,
+  /\bcredvault[_-]?(?:get[_-]?secret|read[_-]?secret|show[_-]?secret|reveal|export|raw)\b/i,
+  /\b(?:get|read|show|reveal|dump|export)[_-]?(?:secret|credential|token|password)[_-]?(?:value|raw)?\b/i,
+  /^\s*(?:sudo\s+)?(?:\/usr\/bin\/)?(?:env|set)\s*(?:$|[|>&])/i,
+  /^\s*(?:sudo\s+)?(?:\/usr\/bin\/)?printenv(?:\s*$|\s+[A-Z0-9_]*(?:KEY|TOKEN|PASSWORD|SECRET|CREDENTIAL)[A-Z0-9_]*\s*$)/i,
+  /\b(?:echo|printf)\b[^|;&\n]*\$(?:\{)?[A-Z0-9_]*(?:KEY|TOKEN|PASSWORD|SECRET|CREDENTIAL)[A-Z0-9_]*(?:\})?/i,
+  /\b(?:show|print|reveal|return|dump|export|copy)\b.{0,48}\b(?:api[- ]?key|access[- ]?token|password|secret|credential)\s+(?:value|contents?)\b/i,
 ];
 
 /** First matching pattern's source, so a verdict can NAME the rule that
@@ -39,8 +55,15 @@ function matchFirst(rules: RegExp[], text: string): string | null {
   return null;
 }
 
+function matchRawValueAccess(text: string): string | null {
+  const direct = matchFirst(VALUE_OUTPUT_OPERATIONS, text);
+  if (direct) return direct;
+  const path = matchFirst(SENSITIVE_NAME, text);
+  return path && VALUE_READ_VERB.test(text) ? `${VALUE_READ_VERB.source} + ${path}` : null;
+}
+
 export function looksSensitive(text: string): boolean {
-  return matchFirst(SENSITIVE, text) !== null;
+  return matchRawValueAccess(text) !== null;
 }
 
 export function looksDestructive(text: string): boolean {
@@ -75,12 +98,12 @@ export interface AutoApprover {
   alwaysAllow?: string[];
 }
 
-/** Why a verdict landed the way it did. `unattended-block` exists only in
- * contrast: a grant WOULD have fired, and the only thing that stopped it
- * was that nobody started this turn — the most audit-worthy card of all. */
+/** Why a verdict landed the way it did. `unattended-block` remains for old
+ * decision-log rows; safe webhook work now uses guarded autonomy. */
 export type AutoVerdictSource =
   | "always-allow"
   | "auto-mode"
+  | "guarded-autonomy"
   | "unattended-block"
   | "local-computer-block"
   | "destructive-guard"
@@ -88,7 +111,9 @@ export type AutoVerdictSource =
   | "no-grant";
 
 export interface AutoVerdict {
-  /** Chip text when the bot may answer itself, null when a human decides.
+  /** Provider behavior. `ask` leaves the request open for a human. */
+  behavior: "allow" | "deny" | "ask";
+  /** Chip text for an automatic allow; null for ask or deny.
    * The string becomes the chip in the transcript, so an auto-approved
    * action is never invisible. */
   approve: string | null;
@@ -114,49 +139,37 @@ export function autoVerdict(
     scope?: "local-computer";
   },
 ): AutoVerdict {
-  // the guards outrank the grants, so an "always allow" can never widen
-  // into them
+  // Guards outrank every grant. Destruction asks; raw value access denies.
   const destructive = matchFirst(DESTRUCTIVE, summary) ?? matchFirst(DESTRUCTIVE, tool);
-  const sensitive = destructive ? null : matchFirst(SENSITIVE, summary);
-  // The grant is computed even when a hard block will refuse it: the row
-  // worth auditing is "this WOULD have auto-approved, and only the block
-  // stood in the way", which cannot be told apart from an ordinary
-  // "nobody granted this" card without knowing both halves.
+  const sensitive = destructive ? null : matchRawValueAccess(`${tool} ${summary}`);
+  if (sensitive) return { behavior: "deny", approve: null, source: "sensitive-guard", rule: sensitive };
+  if (destructive) return { behavior: "ask", approve: null, source: "destructive-guard", rule: destructive };
+
   const key = approvalKey(tool, summary, context?.scope);
-  const grant =
-    destructive || sensitive
-      ? null
-      : bot.alwaysAllow?.includes(key)
-        ? { approve: `auto-approved ${key} (always allowed)`, source: "always-allow" as const, rule: key }
-        : bot.autoApprove
-          ? { approve: `auto-approved ${tool}`, source: "auto-mode" as const, rule: undefined }
-          : null;
-  if (context?.unattended) {
-    // Auto mode is something a person switched on for turns they are present
-    // for. A webhook turn begins with nobody watching, on a payload someone
-    // else wrote, so it does not inherit that decision — the guard above is a
-    // pattern list its own comment calls "not a security boundary", and it
-    // must not stand in for a human at 3am. A guard that would have carded
-    // anyway keeps its own name; the block is only the story when it is the
-    // thing that changed the outcome.
-    if (grant) return { approve: null, source: "unattended-block", rule: grant.rule };
-    if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
-    if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
-    return { approve: null, source: "no-grant" };
-  }
+  // Host click/type metadata can be too weak to classify safely. Auto mode
+  // remains the explicit opt-in for the user's active desktop.
   if (context?.scope === "local-computer" && !bot.autoApprove) {
-    // Host control is not covered by a remembered always-allow grant.
-    // After the Auto-on-this-computer warning, unclassified GUI actions
-    // (click/type) may auto-approve; destructive/sensitive still card.
-    if (grant) return { approve: null, source: "local-computer-block", rule: grant.rule };
-    if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
-    if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
-    return { approve: null, source: "no-grant" };
+    return {
+      behavior: "ask",
+      approve: null,
+      source: "local-computer-block",
+      rule: bot.alwaysAllow?.includes(key) ? key : undefined,
+    };
   }
-  if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
-  if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
-  if (grant) return { approve: grant.approve, source: grant.source, rule: grant.rule };
-  return { approve: null, source: "no-grant" };
+
+  // Safe scoped work is automatic. Webhook origin is provenance, not a
+  // blanket veto; the same destructive and raw-value guards still apply.
+  const grant =
+    bot.alwaysAllow?.includes(key)
+      ? { approve: `auto-approved ${key} (always allowed)`, source: "always-allow" as const, rule: key }
+      : bot.autoApprove
+        ? { approve: `auto-approved ${tool}`, source: "auto-mode" as const, rule: undefined }
+        : {
+            approve: `auto-approved ${tool} (guarded autonomy)`,
+            source: "guarded-autonomy" as const,
+            rule: undefined,
+          };
+  return { behavior: "allow", ...grant };
 }
 
 /** Why this request may be answered without the human, or null to ask. */
@@ -171,5 +184,6 @@ export function autoDecision(
     scope?: "local-computer";
   },
 ): string | null {
-  return autoVerdict(bot, tool, summary, context).approve;
+  const verdict = autoVerdict(bot, tool, summary, context);
+  return verdict.behavior === "allow" ? verdict.approve : null;
 }
