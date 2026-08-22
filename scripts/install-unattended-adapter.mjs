@@ -146,6 +146,7 @@ function serviceIsLoaded() {
 
 function ensureLaunchAgent(path, body) {
   if (existsSync(path)) {
+    if (lstatSync(path).isSymbolicLink()) fail("LaunchAgent artifact must not be a symlink");
     if (readFileSync(path, "utf8") !== body) fail("existing LaunchAgent artifact does not match the exact generation");
     return;
   }
@@ -184,6 +185,7 @@ export function main() {
   const generation = join(runtimeRoot, expectedSha);
   const receiptPath = join(generation, "receipt.json");
   if (existsSync(generation)) {
+    if (lstatSync(generation).isSymbolicLink()) fail("runtime generation must not be a symlink");
     const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
     if (
       receipt.source_sha !== expectedSha ||

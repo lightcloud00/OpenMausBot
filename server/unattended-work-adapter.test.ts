@@ -86,4 +86,13 @@ describe("UnattendedWorkAdapter", () => {
     expect(unattendedWorkAdapterFromEnv({ OMB_UNATTENDED_WORK_ENABLED: "true" }).enabled).toBe(false);
     expect(unattendedWorkAdapterFromEnv({ OMB_UNATTENDED_WORK_ENABLED: "1" }).enabled).toBe(true);
   });
+
+  it("bounds a loopback response before parsing it", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response("x".repeat(256 * 1024 + 1)),
+    );
+    const adapter = new UnattendedWorkAdapter({ enabled: true, fetchImpl });
+
+    await expect(adapter.health()).rejects.toThrow("response is too large");
+  });
 });

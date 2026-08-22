@@ -88,6 +88,34 @@ function adapterSnapshot(enabled: boolean): UnattendedWorkAdapterSnapshot {
   };
 }
 
+async function boundedResponseBytes(response: Response): Promise<Uint8Array> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+    throw new UnattendedWorkAdapterError("unattended-work response is too large");
+  }
+  if (!response.body) return new Uint8Array();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const next = await reader.read();
+    if (next.done) break;
+    total += next.value.byteLength;
+    if (total > MAX_RESPONSE_BYTES) {
+      await reader.cancel();
+      throw new UnattendedWorkAdapterError("unattended-work response is too large");
+    }
+    chunks.push(next.value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
 export class UnattendedWorkAdapter {
   readonly enabled: boolean;
   private readonly baseUrl: URL;
@@ -157,10 +185,7 @@ export class UnattendedWorkAdapter {
         : "unattended-work service is unavailable";
       throw new UnattendedWorkAdapterError(message, 503);
     }
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > MAX_RESPONSE_BYTES) {
-      throw new UnattendedWorkAdapterError("unattended-work response is too large");
-    }
+    const bytes = await boundedResponseBytes(response);
     let body: PlaneResponse;
     try {
       body = PlaneResponseSchema.parse(JSON.parse(new TextDecoder().decode(bytes)));
