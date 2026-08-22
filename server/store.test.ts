@@ -61,6 +61,20 @@ describe("Store", () => {
     expect(reloaded.bot(bot.id)?.composio).toBe(false);
   });
 
+  it("persists the observer-router profile and removes unknown capability profiles", () => {
+    const store = new Store(selection);
+    const observer = store.createBot();
+    const invalid = store.createBot();
+    store.patchBot(observer.id, { accessProfile: "observer-router" });
+    const raw: BotRecord[] = JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"));
+    (raw.find((bot) => bot.id === invalid.id) as unknown as { accessProfile: string }).accessProfile = "unbounded";
+    writeFileSync(join(DATA_DIR, "bots.json"), JSON.stringify(raw));
+
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(observer.id)?.accessProfile).toBe("observer-router");
+    expect(reloaded.bot(invalid.id)?.accessProfile).toBeUndefined();
+  });
+
   it("rotates colors across created bots", () => {
     const store = new Store(selection);
     const first = store.createBot();

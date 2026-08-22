@@ -1,12 +1,11 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 
-import { createCapabilityProfileManifest, type CapabilityProfileManifest } from "./access-profile.ts";
+import { createObserverRouterProfileManifest, type CapabilityProfileManifest } from "./access-profile.ts";
 import { augmentedPath } from "./env-path.ts";
 import { writeFileAtomic } from "./atomic.ts";
-import { BUILTIN_CAPABILITY_TOOLS } from "./builtin-capability-tools.ts";
 
 export type HostMcpServer =
   | { type: "builtin" }
@@ -22,9 +21,9 @@ export interface HostMcpCatalog {
 const BLOCKED_SERVER = /(?:^|[-_.])cred(?:ential)?vault(?:$|[-_.])|credvault/i;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/;
 const FLEET_BRIDGE_NAME = "aos-fleet-bridge";
-const FLEET_BRIDGE_CODEX_DUPLICATE = /^aos-fleet-bridge-codex(?:-\d+)?$/;
 const FLEET_BRIDGE_SCRIPT = /(?:^|[\\/])aos_fleet_bridge_mcp\.py$/;
 const OPENMAUS_SURFACE = "openmausbot";
+const BRIDGE_VALUE_FLAGS = new Set(["--surface", "--state-dir", "--ledger", "--ledger-timeout", "--inbox"]);
 
 function safeName(value: unknown): string | null {
   return typeof value === "string" && NAME.test(value) && !BLOCKED_SERVER.test(value) ? value : null;
@@ -134,46 +133,39 @@ export function parseCodexMcpList(
   return servers;
 }
 
-function mergeCatalogs(
-  claude: Record<string, HostMcpServer>,
-  codex: Record<string, HostMcpServer>,
-): Record<string, HostMcpServer> {
-  const merged = { ...claude };
-  for (const [name, server] of Object.entries(codex)) {
-    if (!merged[name]) {
-      merged[name] = server;
-      continue;
-    }
-    if (JSON.stringify(merged[name]) === JSON.stringify(server)) continue;
-    let candidate = `${name}-codex`;
-    let suffix = 2;
-    while (merged[candidate]) candidate = `${name}-codex-${suffix++}`;
-    merged[candidate] = server;
+function pinnedFleetBridge(server: HostMcpServer | undefined): Extract<HostMcpServer, { type: "stdio" }> | null {
+  if (!server || server.type !== "stdio") return null;
+  const commandName = basename(server.command).toLowerCase();
+  if (!/^python(?:3(?:\.\d+)?)?(?:\.exe)?$/.test(commandName)) return null;
+  if (server.args.length < 3 || !isAbsolute(server.args[0]) || !FLEET_BRIDGE_SCRIPT.test(server.args[0])) return null;
+  if (server.args.filter((argument) => FLEET_BRIDGE_SCRIPT.test(argument)).length !== 1) return null;
+  const args = [...server.args];
+  const seen = new Set<string>();
+  for (let index = 1; index < args.length; index += 2) {
+    const flag = args[index];
+    const value = args[index + 1];
+    if (!BRIDGE_VALUE_FLAGS.has(flag) || seen.has(flag) || typeof value !== "string" || !value.trim()) return null;
+    seen.add(flag);
   }
-  return merged;
+  if (!seen.has("--surface")) return null;
+  const surfaceIndex = args.indexOf("--surface");
+  args[surfaceIndex + 1] = OPENMAUS_SURFACE;
+  // The observer bridge needs no credential or provider environment. Strip it
+  // rather than importing arbitrary values from a host IDE configuration.
+  return { type: "stdio", command: server.command, args, env: {} };
 }
 
-/** Pin the imported bridge to OpenMausBot instead of the host CLI identity. */
-function pinFleetBridgeForOpenMaus(
-  servers: Record<string, HostMcpServer>,
-): Record<string, HostMcpServer> {
-  const server = servers[FLEET_BRIDGE_NAME];
-  const pinned = { ...servers };
-  for (const name of Object.keys(pinned)) {
-    if (FLEET_BRIDGE_CODEX_DUPLICATE.test(name)) delete pinned[name];
-  }
-  if (!server || server.type !== "stdio") return pinned;
-  const surfaceIndex = server.args.indexOf("--surface");
-  const scriptCount = server.args.filter((argument) => FLEET_BRIDGE_SCRIPT.test(argument)).length;
-  const surfaceCount = server.args.filter((argument) => argument === "--surface").length;
-  if (scriptCount !== 1 || surfaceCount !== 1 || surfaceIndex + 1 >= server.args.length) {
-    delete pinned[FLEET_BRIDGE_NAME];
-    return pinned;
-  }
-  const args = [...server.args];
-  args[surfaceIndex + 1] = OPENMAUS_SURFACE;
-  pinned[FLEET_BRIDGE_NAME] = { ...server, args };
-  return pinned;
+/** Select one exact bridge identity. Ambiguous source scripts fail closed;
+ * equivalent Claude/Codex registrations collapse to the smallest safe argv. */
+function selectFleetBridgeForOpenMaus(
+  claude: Record<string, HostMcpServer>,
+  codex: Record<string, HostMcpServer>,
+): Extract<HostMcpServer, { type: "stdio" }> | null {
+  const candidates = [pinnedFleetBridge(claude[FLEET_BRIDGE_NAME]), pinnedFleetBridge(codex[FLEET_BRIDGE_NAME])]
+    .filter((server): server is Extract<HostMcpServer, { type: "stdio" }> => Boolean(server));
+  if (!candidates.length) return null;
+  if (new Set(candidates.map((server) => server.args[0])).size !== 1) return null;
+  return candidates.sort((left, right) => left.args.length - right.args.length || left.command.localeCompare(right.command))[0];
 }
 
 export function loadHostMcpCatalog(options: {
@@ -207,28 +199,20 @@ export function loadHostMcpCatalog(options: {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") codexState = "invalid";
   }
-  const servers: Record<string, HostMcpServer> = {
-    ...pinFleetBridgeForOpenMaus(mergeCatalogs(claude, codex)),
-    // Provider-native shell/file tools are not available to Manus Desktop
-    // or the Hermes route. Keep one app-owned core surface in the same
-    // gateway so every full-task-scoped client receives the same baseline.
-    "openmaus-host": { type: "builtin" },
-  };
-  const inventory = Object.entries(servers).flatMap(([name, server]) =>
-    server.type === "builtin"
-      ? BUILTIN_CAPABILITY_TOOLS.map((tool) => `${name}:${tool.name}`)
-      : [name],
-  );
+  const bridge = selectFleetBridgeForOpenMaus(claude, codex);
+  const servers: Record<string, HostMcpServer> = bridge ? { [FLEET_BRIDGE_NAME]: bridge } : {};
   return {
     servers,
-    manifest: createCapabilityProfileManifest({ toolInventory: inventory }),
+    // Tool schemas are intentionally not projected here. The gateway exposes
+    // its fixed observer projection only when the agent requests tools/list.
+    manifest: createObserverRouterProfileManifest({ serverInventory: Object.keys(servers) }),
     sources: { claude: claudeState, codex: codexState },
   };
 }
 
 export function writeHostMcpManifest(dataDir: string, catalog: HostMcpCatalog): string {
   const directory = join(dataDir, "capability-profiles");
-  const path = join(directory, "full-task-scoped.json");
+  const path = join(directory, "observer-router.json");
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   writeFileAtomic(
     path,

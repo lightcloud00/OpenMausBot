@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, win32 as winPath } from "node:path";
 import { z } from "zod";
 
-import { createCapabilityProfileManifest } from "./access-profile.ts";
+import { createCapabilityProfileManifest, createObserverRouterProfileManifest } from "./access-profile.ts";
 import { fullTaskScopedHardDeny } from "./auto-approve.ts";
 import { BUILTIN_CAPABILITY_TOOLS } from "./builtin-capability-tools.ts";
 import { augmentedPath } from "./env-path.ts";
@@ -13,6 +13,14 @@ import type { HostMcpCatalog, HostMcpServer } from "./host-mcp.ts";
 import { killCliTree, spawnCli } from "./procs.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { windowsCmdCommand } from "./windows-cmd.ts";
+import {
+  OBSERVER_BRIDGE_SERVER,
+  OBSERVER_TURN_TTL_MS,
+  ObserverTaskPresenceAdapter,
+  observerBridgeCall,
+  observerBridgeToolDefinitions,
+  type ObserverTaskPresenceOptions,
+} from "./observer-task-presence.ts";
 import {
   isSecretName,
   protectedEnvironmentValues,
@@ -412,6 +420,7 @@ interface ActiveTurn {
   expiresAt: number;
   servers: Record<string, HostMcpServer>;
   interactiveInput: string;
+  completedCalls: Map<string, any>;
 }
 
 interface BackendSlot {
@@ -427,6 +436,7 @@ export interface CapabilityGatewayOptions {
   now?: () => number;
   listAliases?: () => Promise<string[]>;
   credentialBroker?: CredentialBrokerOptions;
+  observerPresence?: ObserverTaskPresenceOptions;
 }
 
 /** App-owned MCP union. The provider sees one small proxy; backend processes
@@ -441,6 +451,8 @@ export class CapabilityGateway {
   private readonly now: () => number;
   private readonly protectedValues: Set<string>;
   private readonly credentialBroker: CredentialBrokerOptions;
+  private readonly observerOnly: boolean;
+  private readonly observerPresence: ObserverTaskPresenceAdapter | null;
 
   constructor(
     catalog: HostMcpCatalog,
@@ -451,6 +463,10 @@ export class CapabilityGateway {
     this.now = options.now ?? Date.now;
     this.listAliasesImpl = options.listAliases ?? listCredentialAliases;
     this.credentialBroker = options.credentialBroker ?? {};
+    this.observerOnly = catalog.manifest.profile === "observer-router";
+    this.observerPresence = this.observerOnly
+      ? new ObserverTaskPresenceAdapter(options.observerPresence)
+      : null;
     this.protectedValues = protectedEnvironmentValues();
     this.protectServerValues(catalog.servers);
   }
@@ -466,15 +482,20 @@ export class CapabilityGateway {
   }): void {
     if (!token || token.length < 24) throw new Error("invalid capability turn token");
     if (this.activeTurns.has(token)) this.endTurn(token);
+    const requestedTtl = turn.ttlMs ?? (this.observerOnly ? OBSERVER_TURN_TTL_MS : 24 * 60 * 60_000);
+    const ttlMs = this.observerOnly
+      ? Math.min(Math.max(requestedTtl, 1), OBSERVER_TURN_TTL_MS)
+      : requestedTtl;
     this.activeTurns.set(token, {
       botId: turn.botId,
       threadId: turn.threadId,
       cwd: turn.cwd,
-      expiresAt: this.now() + (turn.ttlMs ?? 24 * 60 * 60_000),
-      servers: { ...turn.servers },
+      expiresAt: this.now() + ttlMs,
+      servers: this.observerOnly ? {} : { ...turn.servers },
       interactiveInput: "",
+      completedCalls: new Map(),
     });
-    this.protectServerValues(turn.servers ?? {});
+    if (!this.observerOnly) this.protectServerValues(turn.servers ?? {});
   }
 
   endTurn(token: string): void {
@@ -513,6 +534,10 @@ export class CapabilityGateway {
 
   extendTurn(token: string, servers: Record<string, HostMcpServer>): void {
     this.requireTurn(token);
+    // App integrations, computers, shell/file tools, and arbitrary MCPs are
+    // outside the observer profile. Ignore the app's generic extension step
+    // while retaining the single identity-pinned catalog bridge.
+    if (this.observerOnly) return;
     const turn = this.activeTurns.get(token)!;
     for (const [name, server] of Object.entries(servers)) {
       if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/.test(name) || /cred(?:ential)?vault/i.test(name)) {
@@ -539,6 +564,7 @@ export class CapabilityGateway {
     const inventory = Object.entries(this.serversFor(token)).flatMap(([name, server]) =>
       server.type === "builtin" ? BUILTIN_CAPABILITY_TOOLS.map((tool) => `${name}:${tool.name}`) : [name],
     );
+    if (this.observerOnly) return createObserverRouterProfileManifest({ serverInventory: inventory });
     return createCapabilityProfileManifest({ toolInventory: inventory });
   }
 
@@ -552,6 +578,7 @@ export class CapabilityGateway {
 
   async aliases(token: string): Promise<string[]> {
     this.requireTurn(token);
+    if (this.observerOnly) throw new Error("observer profile does not expose credential aliases");
     return [...new Set(await this.listAliasesImpl())].filter((name) => /^[A-Za-z0-9_.\/-]{1,200}$/.test(name)).sort();
   }
 
@@ -562,6 +589,7 @@ export class CapabilityGateway {
     envVar: string,
   ): Promise<void> {
     this.requireTurn(token);
+    if (this.observerOnly) throw new Error("observer profile does not allow credential selection");
     const server = this.serverFor(token, serverName);
     if (!server) throw new Error("unknown capability server");
     if (server.type !== "stdio") {
@@ -667,6 +695,28 @@ export class CapabilityGateway {
 
   async listTools(token: string, serverName: string): Promise<any> {
     this.requireTurn(token);
+    if (this.observerOnly) {
+      if (serverName !== OBSERVER_BRIDGE_SERVER || !this.serverFor(token, serverName)) {
+        throw new Error("observer profile exposes only the identity-pinned fleet bridge");
+      }
+      const definitions = [
+        ...observerBridgeToolDefinitions(),
+        ...(this.observerPresence?.toolDefinitions() ?? []),
+      ];
+      const tools = [...new Map(definitions.map((tool) => [tool.name, tool])).values()];
+      return {
+        tools,
+        _meta: {
+          "openmaus.observer": {
+            schema: "openmaus.observer_tool_projection.v1",
+            surface: "openmausbot",
+            instructionAuthority: false,
+            mutationAuthority: "ack-only",
+            duplicateToolsSuppressed: definitions.length - tools.length,
+          },
+        },
+      };
+    }
     if (this.serverFor(token, serverName)?.type === "builtin") return { tools: BUILTIN_CAPABILITY_TOOLS };
     const backend = this.backend(token, serverName);
     try {
@@ -678,6 +728,7 @@ export class CapabilityGateway {
 
   async callTool(token: string, serverName: string, tool: string, args: JsonObject): Promise<any> {
     this.requireTurn(token);
+    if (this.observerOnly) return this.callObserverTool(token, serverName, tool, args);
     const turn = this.activeTurns.get(token)!;
     const interactive = /(?:computer|browser|cua|desktop)/i.test(`${serverName}:${tool}`);
     const interactiveInput = interactive ? this.interactiveText(turn, tool, args) : null;
@@ -708,6 +759,88 @@ export class CapabilityGateway {
         };
       }
       return this.sanitize(result, { preserveImages: interactive });
+    } finally {
+      this.releaseBackend(backend.key);
+    }
+  }
+
+  private observerDenied(reason: string): JsonObject {
+    return {
+      content: [{ type: "text", text: `OpenMausBot observer denied this capability request: ${reason}.` }],
+      isError: true,
+      _meta: {
+        "openmaus.observer": {
+          instructionAuthority: false,
+          mutationAuthority: "none",
+        },
+      },
+    };
+  }
+
+  private observerResult(tool: string, result: any, duplicateSuppressed = false): any {
+    const sanitized = this.sanitize(result);
+    if (!sanitized || typeof sanitized !== "object" || Array.isArray(sanitized)) return sanitized;
+    const currentMeta = sanitized._meta && typeof sanitized._meta === "object" && !Array.isArray(sanitized._meta)
+      ? sanitized._meta
+      : {};
+    return {
+      ...sanitized,
+      _meta: {
+        ...currentMeta,
+        "openmaus.observer": {
+          schema: "openmaus.observer_result.v1",
+          tool,
+          surface: "openmausbot",
+          instructionAuthority: false,
+          mutationAuthority: tool === "message_ack" ? "ack-only" : "none",
+          duplicateSuppressed,
+        },
+      },
+    };
+  }
+
+  private async callObserverTool(token: string, serverName: string, tool: string, args: JsonObject): Promise<any> {
+    if (serverName !== OBSERVER_BRIDGE_SERVER || !this.serverFor(token, serverName)) {
+      return this.observerDenied("only the identity-pinned fleet bridge is available");
+    }
+    if (this.observerPresence?.handles(tool)) {
+      try {
+        const result = await this.observerPresence.callTool(tool, args);
+        return this.observerResult(tool, {
+          content: [{ type: "text", text: JSON.stringify(result) }],
+          structuredContent: result,
+          isError: false,
+        });
+      } catch {
+        return this.observerDenied("invalid observer read request");
+      }
+    }
+    let call;
+    try {
+      call = observerBridgeCall(tool, args);
+    } catch {
+      return this.observerDenied("invalid observer bridge request");
+    }
+    if (!call) {
+      return this.observerDenied(
+        "tool is outside list/status/proposals and addressed pull/ack/status scope",
+      );
+    }
+    const turn = this.activeTurns.get(token)!;
+    if (call.duplicateKey && turn.completedCalls.has(call.duplicateKey)) {
+      return this.observerResult(tool, turn.completedCalls.get(call.duplicateKey), true);
+    }
+    const backend = this.backend(token, serverName);
+    try {
+      const result = await backend.client.request("tools/call", {
+        name: call.backendTool,
+        arguments: call.arguments,
+      });
+      const safeResult = this.observerResult(tool, result);
+      if (call.duplicateKey && safeResult?.isError !== true) {
+        turn.completedCalls.set(call.duplicateKey, safeResult);
+      }
+      return safeResult;
     } finally {
       this.releaseBackend(backend.key);
     }

@@ -4,11 +4,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { createCapabilityProfileManifest } from "./access-profile.ts";
+import { createCapabilityProfileManifest, createObserverRouterProfileManifest } from "./access-profile.ts";
 import { CapabilityGateway, credentialBackendSpawnSpec } from "./capability-gateway.ts";
 import type { HostMcpCatalog } from "./host-mcp.ts";
 
 const FAKE = join(dirname(fileURLToPath(import.meta.url)), "testing", "fake-capability-mcp.ts");
+const FAKE_OBSERVER = join(dirname(fileURLToPath(import.meta.url)), "testing", "fake-observer-bridge-mcp.ts");
 const FAKE_CREDENTIAL_BROKER = join(dirname(fileURLToPath(import.meta.url)), "testing", "fake-credential-broker.ts");
 const CREDENTIAL_REDACTOR = join(dirname(fileURLToPath(import.meta.url)), "credential-redacting-proxy.ts");
 const TOKEN = "turn-token-123456789012345678901234";
@@ -403,5 +404,159 @@ describe("CapabilityGateway", () => {
     } finally {
       delete process.env.GATEWAY_TEST_SECRET;
     }
+  });
+
+  it("projects one lazy observer bridge and denies every non-observer capability before startup", async () => {
+    chmodSync(FAKE_OBSERVER, 0o755);
+    const directory = mkdtempSync(join(tmpdir(), "omb-observer-gateway-"));
+    temporary.push(directory);
+    const receipt = join(directory, "calls.ndjson");
+    const observerCatalog: HostMcpCatalog = {
+      servers: {
+        "aos-fleet-bridge": {
+          type: "stdio",
+          command: process.execPath,
+          args: [FAKE_OBSERVER],
+          env: { OBSERVER_CALL_RECEIPT: receipt },
+        },
+      },
+      manifest: createObserverRouterProfileManifest({ serverInventory: ["aos-fleet-bridge"] }),
+      sources: { claude: "loaded", codex: "loaded" },
+    };
+    const gateway = new CapabilityGateway(observerCatalog, {
+      observerPresence: {
+        presenceDir: join(directory, "presence"),
+        proposalFeedPath: join(directory, "proposals.json"),
+      },
+    });
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, {
+      botId: "ada",
+      threadId: "observer-task",
+      ttlMs: 60 * 60_000,
+      servers: { "openmaus-host": { type: "builtin" } },
+    });
+    gateway.extendTurn(TOKEN, {
+      "openmaus-computer": { type: "stdio", command: process.execPath, args: [FAKE], env: {} },
+    });
+
+    expect(gateway.inventory(TOKEN)).toMatchObject({
+      manifest: {
+        profile: "observer-router",
+        telemetryMode: "metadata",
+        toolInventory: ["aos-fleet-bridge"],
+      },
+      servers: [{ name: "aos-fleet-bridge", type: "stdio" }],
+    });
+    const listed = await gateway.listTools(TOKEN, "aos-fleet-bridge");
+    const names = listed.tools.map((tool: { name: string }) => tool.name);
+    expect(names).toEqual([
+      "protocol_capabilities",
+      "surface_status",
+      "inbox_pull",
+      "message_ack",
+      "task_status",
+      "presence_list",
+      "presence_status",
+      "improvement_proposals",
+    ]);
+    expect(names).not.toEqual(expect.arrayContaining([
+      "task_submit",
+      "task_result",
+      "task_cancel",
+      "wake",
+      "shell_execute",
+      "filesystem_write",
+      "filesystem_delete",
+      "deploy",
+      "send_message",
+      "permission_grant",
+      "publish",
+      "transcript_read",
+      "session_control",
+      "hindsight_retain",
+      "obsidian_write",
+    ]));
+    expect(gateway.stats().activeBackends).toEqual([]);
+    await expect(gateway.aliases(TOKEN)).rejects.toThrow(/does not expose credential aliases/);
+    await expect(
+      gateway.selectCredentialAlias(TOKEN, "aos-fleet-bridge", "alias", "TOKEN"),
+    ).rejects.toThrow(/does not allow credential selection/);
+
+    for (const tool of [
+      "task_submit",
+      "task_result",
+      "task_cancel",
+      "wake",
+      "shell_execute",
+      "filesystem_write",
+      "filesystem_delete",
+      "deploy_production",
+      "send_message",
+      "permission_escalate",
+      "external_publish",
+      "transcript_read",
+      "session_control",
+      "hindsight_retain",
+      "obsidian_write",
+    ]) {
+      const denied = await gateway.callTool(TOKEN, "aos-fleet-bridge", tool, {});
+      expect(denied).toMatchObject({ isError: true });
+    }
+    expect(gateway.stats().activeBackends).toEqual([]);
+
+    const pulled = await gateway.callTool(TOKEN, "aos-fleet-bridge", "inbox_pull", { limit: 3 });
+    expect(pulled.structuredContent).toEqual({
+      name: "inbox_list",
+      arguments: { surface: "openmausbot", limit: 3 },
+    });
+    expect(pulled._meta["openmaus.observer"]).toMatchObject({
+      instructionAuthority: false,
+      mutationAuthority: "none",
+    });
+  });
+
+  it("suppresses duplicate acknowledgements and rejects calls after the five-minute lease", async () => {
+    chmodSync(FAKE_OBSERVER, 0o755);
+    const directory = mkdtempSync(join(tmpdir(), "omb-observer-lease-"));
+    temporary.push(directory);
+    const receipt = join(directory, "calls.ndjson");
+    let now = 1_000_000;
+    const gateway = new CapabilityGateway({
+      servers: {
+        "aos-fleet-bridge": {
+          type: "stdio",
+          command: process.execPath,
+          args: [FAKE_OBSERVER],
+          env: { OBSERVER_CALL_RECEIPT: receipt },
+        },
+      },
+      manifest: createObserverRouterProfileManifest({ serverInventory: ["aos-fleet-bridge"] }),
+      sources: { claude: "missing", codex: "loaded" },
+    }, { now: () => now, idleTimeoutMs: 60_000 });
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, { botId: "ada", threadId: "observer", ttlMs: 60 * 60_000 });
+
+    const first = await gateway.callTool(TOKEN, "aos-fleet-bridge", "message_ack", {
+      entry_id: "abcdef1234567890",
+      note: "read",
+    });
+    const duplicate = await gateway.callTool(TOKEN, "aos-fleet-bridge", "message_ack", {
+      entry_id: "abcdef1234567890",
+      note: "different note is still the same acknowledgement",
+    });
+    expect(first._meta["openmaus.observer"].duplicateSuppressed).toBe(false);
+    expect(duplicate._meta["openmaus.observer"].duplicateSuppressed).toBe(true);
+    const calls = readFileSync(receipt, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(calls).toEqual([{
+      name: "message_ack",
+      arguments: { entry_id: "abcdef1234567890", note: "read", surface: "openmausbot" },
+    }]);
+
+    now += 300_001;
+    await expect(
+      gateway.callTool(TOKEN, "aos-fleet-bridge", "surface_status", {}),
+    ).rejects.toThrow(/turn is no longer active/);
+    expect(readFileSync(receipt, "utf8").trim().split("\n")).toHaveLength(1);
   });
 });

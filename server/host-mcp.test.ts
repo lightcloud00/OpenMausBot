@@ -68,7 +68,7 @@ describe("host MCP catalog", () => {
     });
   });
 
-  it("merges the two intentional inventories and hashes names only", () => {
+  it("does not project the ambient host catalog or built-in shell/file tools", () => {
     const catalog = loadHostMcpCatalog({
       home: "/does/not/exist",
       runCodexList: () =>
@@ -77,15 +77,12 @@ describe("host MCP catalog", () => {
           { name: "credvault", enabled: true, transport: { type: "stdio", command: "/bin/credvault-mcp", args: [] } },
         ]),
     });
-    expect(catalog.manifest.toolInventory).toEqual([
-      "openmaus-host:filesystem_delete",
-      "openmaus-host:filesystem_read",
-      "openmaus-host:filesystem_stat",
-      "openmaus-host:filesystem_write",
-      "openmaus-host:shell_execute",
-      "sentry",
-    ]);
-    expect(catalog.servers["openmaus-host"]).toEqual({ type: "builtin" });
+    expect(catalog.manifest).toMatchObject({
+      profile: "observer-router",
+      telemetryMode: "metadata",
+      toolInventory: [],
+    });
+    expect(catalog.servers).toEqual({});
     expect(JSON.stringify(catalog.manifest)).not.toContain("/bin/sentry");
     expect(catalog.sources).toEqual({ claude: "missing", codex: "loaded" });
   });
@@ -101,7 +98,8 @@ describe("host MCP catalog", () => {
     });
     const path = writeHostMcpManifest(dataDir, catalog);
     const saved = readFileSync(path, "utf8");
-    expect(saved).toContain('"schema": "openmaus.capability-profile.v1"');
+    expect(path).toMatch(/observer-router\.json$/);
+    expect(saved).toContain('"profile": "observer-router"');
     expect(saved).not.toContain("/secret/path");
   });
 
@@ -147,7 +145,9 @@ describe("host MCP catalog", () => {
     });
     expect(catalog.servers["aos-fleet-bridge-codex"]).toBeUndefined();
     expect(catalog.servers["aos-fleet-bridge-codex-2"]).toBeUndefined();
-    expect(catalog.manifest.toolInventory).toContain("aos-fleet-bridge");
+    expect(Object.keys(catalog.servers)).toEqual(["aos-fleet-bridge"]);
+    expect(catalog.manifest.toolInventory).toEqual(["aos-fleet-bridge"]);
+    expect(catalog.manifest.profile).toBe("observer-router");
   });
 
   it("drops a named fleet bridge that cannot be identity-pinned", () => {
@@ -168,5 +168,81 @@ describe("host MCP catalog", () => {
 
     expect(catalog.servers["aos-fleet-bridge"]).toBeUndefined();
     expect(catalog.manifest.toolInventory).not.toContain("aos-fleet-bridge");
+  });
+
+  it("rejects bridge commands with executable flags or ambiguous source scripts", () => {
+    const dangerous = loadHostMcpCatalog({
+      home: "/does/not/exist",
+      runCodexList: () => JSON.stringify([{
+        name: "aos-fleet-bridge",
+        enabled: true,
+        transport: {
+          type: "stdio",
+          command: "/usr/bin/python3",
+          args: ["-c", "/runtime/aos_fleet_bridge_mcp.py", "--surface", "codex"],
+        },
+      }]),
+    });
+    expect(dangerous.servers).toEqual({});
+
+    const home = mkdtempSync(join(tmpdir(), "omb-fleet-bridge-ambiguous-"));
+    writeFileSync(join(home, ".claude.json"), JSON.stringify({
+      mcpServers: {
+        "aos-fleet-bridge": {
+          command: "/opt/homebrew/bin/python3",
+          args: ["/runtime/one/aos_fleet_bridge_mcp.py", "--surface", "claude"],
+        },
+      },
+    }));
+    const ambiguous = loadHostMcpCatalog({
+      home,
+      runCodexList: () => JSON.stringify([{
+        name: "aos-fleet-bridge",
+        enabled: true,
+        transport: {
+          type: "stdio",
+          command: "/usr/bin/python3",
+          args: ["/runtime/two/aos_fleet_bridge_mcp.py", "--surface", "codex"],
+        },
+      }]),
+    });
+    expect(ambiguous.servers).toEqual({});
+  });
+
+  it("strips bridge environment values and chooses the smallest equivalent registration", () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-fleet-bridge-minimal-"));
+    const bridgeScript = "/runtime/aos_fleet_bridge_mcp.py";
+    writeFileSync(join(home, ".claude.json"), JSON.stringify({
+      mcpServers: {
+        "aos-fleet-bridge": {
+          command: "/opt/homebrew/bin/python3",
+          args: [bridgeScript, "--surface", "claude", "--state-dir", "/state"],
+          env: { SECRET_TOKEN: "must-not-cross" },
+        },
+        sentry: { command: "/bin/sentry", args: [] },
+      },
+    }));
+    const catalog = loadHostMcpCatalog({
+      home,
+      runCodexList: () => JSON.stringify([{
+        name: "aos-fleet-bridge",
+        enabled: true,
+        transport: {
+          type: "stdio",
+          command: "/usr/bin/python3",
+          args: [bridgeScript, "--surface", "codex"],
+        },
+      }]),
+    });
+    expect(catalog.servers).toEqual({
+      "aos-fleet-bridge": {
+        type: "stdio",
+        command: "/usr/bin/python3",
+        args: [bridgeScript, "--surface", "openmausbot"],
+        env: {},
+      },
+    });
+    expect(JSON.stringify(catalog)).not.toContain("must-not-cross");
+    expect(JSON.stringify(catalog)).not.toContain("sentry");
   });
 });
