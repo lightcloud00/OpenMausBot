@@ -107,7 +107,7 @@ import { WebhookManager } from "./webhooks.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
-import { unattendedWorkAdapterFromEnv } from "./unattended-work-adapter.ts";
+import { unattendedWorkAdapterFromEnv, unattendedWorkRequestIdFromPath } from "./unattended-work-adapter.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
 const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
@@ -2391,12 +2391,13 @@ const server = createServer(async (req, res) => {
     if (origin && !isAllowedOrigin(origin)) {
       return json(res, 403, { error: "forbidden: cross-origin request" });
     }
+    const unattendedStatusRequestId = method === "GET" ? unattendedWorkRequestIdFromPath(path) : null;
     if (UNATTENDED_ADAPTER_ONLY && path.startsWith("/api/")) {
       const allowed =
         (method === "GET" && path === "/api/health") ||
         (method === "GET" && path === "/api/unattended-work/health") ||
         (method === "POST" && path === "/api/unattended-work") ||
-        (method === "GET" && /^\/api\/unattended-work\/[A-Za-z0-9._:-]{1,160}$/.test(path));
+        unattendedStatusRequestId !== null;
       if (!allowed) return json(res, 404, { error: "route unavailable in unattended adapter mode" });
     }
     // ── internal peer-agent comms (localhost + shared token only) ──────
@@ -3897,9 +3898,8 @@ const server = createServer(async (req, res) => {
       }
       return json(res, 200, await unattendedWork.submit(await readBody(req)));
     }
-    m = path.match(/^\/api\/unattended-work\/([A-Za-z0-9._:-]{1,160})$/);
-    if (method === "GET" && m) {
-      return json(res, 200, await unattendedWork.status(m[1]));
+    if (method === "GET" && unattendedStatusRequestId !== null) {
+      return json(res, 200, await unattendedWork.status(unattendedStatusRequestId));
     }
 
     // identity handshake for the packaged app's port fallback: the forked

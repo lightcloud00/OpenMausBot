@@ -116,15 +116,15 @@ export function UnattendedWorkPanel() {
         subtitle="Exact baseline, isolated worktree, task branch, allowed paths, acceptance commands, and owning issue are required. Invalid requests stay in triage."
       >
         <div className="grid grid-cols-2 gap-2">
-          <input className={inputClass} value={fields.repository} onChange={(e) => set("repository", e.target.value)} placeholder="owner/repository" />
-          <input className={inputClass} value={fields.issue} onChange={(e) => set("issue", e.target.value)} placeholder="Issue number" inputMode="numeric" />
-          <input className="col-span-2 w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none" value={fields.repoPath} onChange={(e) => set("repoPath", e.target.value)} placeholder="/absolute/path/to/isolated-worktree" />
-          <input className={inputClass} value={fields.baselineSha} onChange={(e) => set("baselineSha", e.target.value)} placeholder="40-character baseline SHA" />
-          <input className={inputClass} value={fields.taskBranch} onChange={(e) => set("taskBranch", e.target.value)} placeholder="codex/task-branch" />
-          <textarea className={`${inputClass} min-h-24 resize-y`} value={fields.allowedPaths} onChange={(e) => set("allowedPaths", e.target.value)} placeholder={"Allowed paths, one per line\nsrc/\ntests/"} />
-          <textarea className={`${inputClass} min-h-24 resize-y`} value={fields.acceptanceTests} onChange={(e) => set("acceptanceTests", e.target.value)} placeholder={"Acceptance commands, one per line\npnpm typecheck\npnpm test"} />
-          <input className={inputClass} value={fields.tokenBudget} onChange={(e) => set("tokenBudget", e.target.value)} placeholder="Token budget" inputMode="numeric" />
-          <input className={inputClass} value={fields.maxRuntimeSeconds} onChange={(e) => set("maxRuntimeSeconds", e.target.value)} placeholder="Runtime seconds (max 7200)" inputMode="numeric" />
+          <input aria-label="Repository owner and name" className={inputClass} value={fields.repository} onChange={(e) => set("repository", e.target.value)} placeholder="owner/repository" />
+          <input aria-label="Owning issue number" className={inputClass} value={fields.issue} onChange={(e) => set("issue", e.target.value)} placeholder="Issue number" inputMode="numeric" />
+          <input aria-label="Isolated repository worktree path" className="col-span-2 w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none" value={fields.repoPath} onChange={(e) => set("repoPath", e.target.value)} placeholder="/absolute/path/to/isolated-worktree" />
+          <input aria-label="Baseline Git commit SHA" className={inputClass} value={fields.baselineSha} onChange={(e) => set("baselineSha", e.target.value)} placeholder="40-character baseline SHA" />
+          <input aria-label="Task branch name" className={inputClass} value={fields.taskBranch} onChange={(e) => set("taskBranch", e.target.value)} placeholder="codex/task-branch" />
+          <textarea aria-label="Allowed repository paths" className={`${inputClass} min-h-24 resize-y`} value={fields.allowedPaths} onChange={(e) => set("allowedPaths", e.target.value)} placeholder={"Allowed paths, one per line\nsrc/\ntests/"} />
+          <textarea aria-label="Acceptance test commands" className={`${inputClass} min-h-24 resize-y`} value={fields.acceptanceTests} onChange={(e) => set("acceptanceTests", e.target.value)} placeholder={"Acceptance commands, one per line\npnpm typecheck\npnpm test"} />
+          <input aria-label="Token budget" className={inputClass} value={fields.tokenBudget} onChange={(e) => set("tokenBudget", e.target.value)} placeholder="Token budget" inputMode="numeric" />
+          <input aria-label="Maximum runtime in seconds" className={inputClass} value={fields.maxRuntimeSeconds} onChange={(e) => set("maxRuntimeSeconds", e.target.value)} placeholder="Runtime seconds (max 7200)" inputMode="numeric" />
         </div>
         <button
           type="button"
@@ -138,7 +138,7 @@ export function UnattendedWorkPanel() {
 
       <Card title="Work status" subtitle="Read one request by its deterministic work ID.">
         <div className="flex gap-2">
-          <input className={inputClass} value={requestId} onChange={(e) => setRequestId(e.target.value)} placeholder="work-…" />
+          <input aria-label="Work request ID" className={inputClass} value={requestId} onChange={(e) => setRequestId(e.target.value)} placeholder="work-…" />
           <button type="button" disabled={!enabled || working || !requestId.trim()} onClick={() => void checkStatus()} className="shrink-0 rounded-lg border border-hairline/40 px-3 py-2 text-[13px] text-ink hover:bg-raised disabled:opacity-40">
             Check status
           </button>

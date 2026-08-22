@@ -12,7 +12,7 @@ The normal OpenMausBot server exposes them locally as `/api/unattended-work/heal
 
 ## Isolated adapter runtime
 
-`scripts/install-unattended-adapter.mjs` accepts one exact committed source SHA. It refuses a dirty or drifted worktree, packages only the standalone queue page plus the self-contained server bundle, creates a separate data home, assigns ports 8827 and 8828, and renders `com.gus.aos-unattended-openmausbot.plist` with `RunAtLoad=false` and `KeepAlive=false`. It does not bootstrap the LaunchAgent or replace `/Applications/OpenMausBot.app`.
+`scripts/install-unattended-adapter.mjs` accepts one exact committed source SHA. It refuses a dirty or drifted worktree, rebuilds the standalone queue page and self-contained server bundle from that checkout, and packages those runtime artifacts with a `source.tar` archive produced by `git archive` for exact-source audit and reproducibility. The archive is provenance material, not an executable runtime input. The installer also creates a separate data home, assigns ports 8827 and 8828, and renders `com.gus.aos-unattended-openmausbot.plist` with `RunAtLoad=false` and `KeepAlive=false`. It does not bootstrap the LaunchAgent or replace `/Applications/OpenMausBot.app`.
 
 The rendered runtime sets `OMB_UNATTENDED_ADAPTER_ONLY=1`. In this mode OpenMausBot loads zero provider instances, starts no routine scheduler, opens no webhook listener, and returns 404 for every API except application health and unattended-work health, submit, and status.
 

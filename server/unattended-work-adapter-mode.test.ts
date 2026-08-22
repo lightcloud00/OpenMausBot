@@ -90,5 +90,12 @@ describe("unattended adapter-only server mode", () => {
     });
     expect(response.status).toBe(403);
     await expect(response.json()).resolves.toMatchObject({ error: "OpenMausBot work ingress is disabled" });
+
+    const encodedStatus = await fetch(`${BASE}/api/unattended-work/${encodeURIComponent("work:123")}`);
+    expect(encodedStatus.status).toBe(403);
+    await expect(encodedStatus.json()).resolves.toMatchObject({ error: "OpenMausBot work ingress is disabled" });
+
+    const encodedSlash = await fetch(`${BASE}/api/unattended-work/work%2F123`);
+    expect(encodedSlash.status).toBe(404);
   });
 });

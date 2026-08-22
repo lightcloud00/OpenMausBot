@@ -18,6 +18,18 @@ const WorkRequestPayloadSchema = z.object({ ingress: z.literal("openmausbot").op
 type PlaneResponse = z.infer<typeof PlaneResponseSchema>;
 type WorkRequestPayload = z.input<typeof WorkRequestPayloadSchema>;
 
+export function unattendedWorkRequestIdFromPath(path: string): string | null {
+  const match = path.match(/^\/api\/unattended-work\/([^/]{1,480})$/);
+  if (!match) return null;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+  return REQUEST_ID.test(decoded) ? decoded : null;
+}
+
 export class UnattendedWorkAdapterError extends Error {
   readonly status: number;
 
@@ -149,10 +161,14 @@ export class UnattendedWorkAdapter {
     if (!parsed.success) {
       throw new UnattendedWorkAdapterError("work request must be a JSON object with openmausbot ingress", 400);
     }
-    return this.request("/v1/work", {
+    const receipt = await this.request("/v1/work", {
       method: "POST",
       body: JSON.stringify({ ...parsed.data, ingress: "openmausbot" }),
     });
+    if (receipt.live_accepted !== false) {
+      throw new UnattendedWorkAdapterError("unattended-work returned a non-dormant receipt", 502);
+    }
+    return receipt;
   }
 
   async status(requestId: string): Promise<PlaneResponse> {

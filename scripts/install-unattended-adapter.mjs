@@ -39,7 +39,13 @@ function argument(name, fallback = undefined) {
 }
 
 function run(command, args, options = {}) {
-  const result = spawnSync(command, args, { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...options });
+  const result = spawnSync(command, args, {
+    cwd: ROOT,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+    ...options,
+  });
   if (result.status !== 0) fail(`${basename(command)} failed: ${(result.stderr || result.stdout || "unknown error").trim()}`);
   return result.stdout.trim();
 }
@@ -64,16 +70,18 @@ function xml(value) {
     .replaceAll('"', "&quot;");
 }
 
-function treeHash(root) {
+export function treeHash(root, excluded = new Set()) {
   const hash = createHash("sha256");
   const visit = (directory) => {
     for (const name of readdirSync(directory).sort()) {
       const path = join(directory, name);
+      const artifactPath = relative(root, path);
+      if (excluded.has(artifactPath)) continue;
       const stat = lstatSync(path);
-      if (stat.isSymbolicLink()) fail(`runtime artifact contains symlink: ${relative(root, path)}`);
+      if (stat.isSymbolicLink()) fail(`runtime artifact contains symlink: ${artifactPath}`);
       if (stat.isDirectory()) visit(path);
       else if (stat.isFile()) {
-        hash.update(relative(root, path));
+        hash.update(artifactPath);
         hash.update("\0");
         hash.update(readFileSync(path));
         hash.update("\0");
@@ -82,6 +90,17 @@ function treeHash(root) {
   };
   visit(root);
   return hash.digest("hex");
+}
+
+function requireOwnedTarget(path, label, kind) {
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink()) fail(`${label} must not be a symlink`);
+  if (kind === "directory" ? !stat.isDirectory() : !stat.isFile()) {
+    fail(`${label} must be a ${kind}`);
+  }
+  const uid = process.getuid?.();
+  if (uid !== undefined && stat.uid !== uid) fail(`${label} must be owned by the current user`);
+  return stat;
 }
 
 function removeWriteBits(root) {
@@ -144,9 +163,10 @@ function serviceIsLoaded() {
   }).status === 0;
 }
 
-function ensureLaunchAgent(path, body) {
+export function ensureLaunchAgent(path, body) {
   if (existsSync(path)) {
-    if (lstatSync(path).isSymbolicLink()) fail("LaunchAgent artifact must not be a symlink");
+    requireOwnedTarget(path, "LaunchAgent artifact", "regular file");
+    chmodSync(path, 0o600);
     if (readFileSync(path, "utf8") !== body) fail("existing LaunchAgent artifact does not match the exact generation");
     return;
   }
@@ -172,8 +192,19 @@ export function main() {
   const actualSha = run("git", ["rev-parse", "HEAD"]);
   if (actualSha !== expectedSha) fail(`source SHA changed: expected ${expectedSha}, found ${actualSha}`);
   if (run("git", ["status", "--porcelain=v1", "--untracked-files=all"])) fail("source worktree is not clean");
+
+  // Build after validating the exact clean checkout. This binds every staged
+  // executable artifact to expectedSha instead of trusting whatever an older
+  // build happened to leave in ignored dist directories.
+  run("pnpm", ["build"]);
+  run("pnpm", ["build:server"]);
+  if (run("git", ["rev-parse", "HEAD"]) !== expectedSha) fail("source SHA changed during build");
+  if (run("git", ["status", "--porcelain=v1", "--untracked-files=all"])) {
+    fail("source worktree changed during build");
+  }
   for (const artifact of [join(ROOT, "dist", "unattended-work.html"), join(ROOT, "dist-server", "index.js")]) {
-    if (!existsSync(artifact) || lstatSync(artifact).isSymbolicLink()) fail(`required build artifact is missing or unsafe: ${artifact}`);
+    if (!existsSync(artifact)) fail(`required build artifact is missing: ${artifact}`);
+    requireOwnedTarget(artifact, "required build artifact", "regular file");
   }
 
   mkdirSync(runtimeRoot, { recursive: true, mode: 0o700 });
@@ -181,11 +212,15 @@ export function main() {
   if (realpathSync(runtimeRoot) !== runtimeRoot || realpathSync(dataRoot) !== dataRoot) {
     fail("runtime and data roots must not be symlinks");
   }
+  requireOwnedTarget(runtimeRoot, "runtime root", "directory");
+  requireOwnedTarget(dataRoot, "data root", "directory");
+  chmodSync(runtimeRoot, 0o700);
   chmodSync(dataRoot, 0o700);
   const generation = join(runtimeRoot, expectedSha);
   const receiptPath = join(generation, "receipt.json");
   if (existsSync(generation)) {
-    if (lstatSync(generation).isSymbolicLink()) fail("runtime generation must not be a symlink");
+    requireOwnedTarget(generation, "runtime generation", "directory");
+    requireOwnedTarget(receiptPath, "runtime receipt", "regular file");
     const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
     if (
       receipt.source_sha !== expectedSha ||
@@ -198,6 +233,9 @@ export function main() {
       !receipt.node_path
     ) {
       fail("existing generation receipt does not match");
+    }
+    if (treeHash(generation, new Set(["receipt.json"])) !== receipt.artifact_sha256) {
+      fail("existing generation artifact hash does not match");
     }
     const plist = launchAgent({
       node: receipt.node_path,
