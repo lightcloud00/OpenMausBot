@@ -125,7 +125,12 @@ import { readCuaConnection } from "./local-computer.ts";
 import { LocalVmIdleTimer } from "./local-vm-idle.ts";
 import { LocalVmLease, LocalVmLeasePool } from "./local-vm-lease.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
-import { createRetrievalRequest, OpenMausRetriever, type OpenMausRetrievalReceipt } from "./retrieval.ts";
+import {
+  canRetrieveTaskScope,
+  createRetrievalRequest,
+  OpenMausRetriever,
+  type OpenMausRetrievalReceipt,
+} from "./retrieval.ts";
 import { finalizeRetrievalReceipt, recordRetrievalReceipt } from "./retrieval-receipt.ts";
 import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
@@ -384,7 +389,16 @@ const telemetry = new TelemetryManager({
   release,
   ...(process.env.OMB_TELEMETRY_DISABLED === "1" ? { spawnSink: () => null } : {}),
 });
-const retriever = new OpenMausRetriever({ trustedPriorTurnRoot: DATA_DIR });
+const trustedPriorTurnPaths = (request: { threadId: string }): string[] => {
+  if (!/^[a-z0-9][a-z0-9._-]{0,255}$/iu.test(request.threadId)) return [];
+  return [
+    join(EVENTS_DIR, `${request.threadId}.ndjson`),
+    join(NATIVE_DIR, `${request.threadId}.ndjson`),
+    join(DATA_DIR, `messages-${request.threadId}.json`),
+    join(DATA_DIR, `messages-${request.threadId}.json.imported`),
+  ];
+};
+const retriever = new OpenMausRetriever({ trustedPriorTurnPaths });
 const improvementObserver = new ObserverTaskPresenceAdapter();
 bus.subscribe((event) => telemetry.handleRuntimeEvent(event));
 
@@ -1889,7 +1903,7 @@ async function startTurn(
         capabilityToken = openCapabilityTurn(bot.id, threadId, cwd, opts?.graphPermissionClass);
         integrations.capabilityGateway = capabilityIntegration(capabilityToken);
       }
-      if (!opts?.graphPermissionClass && bot.retrievalProfile === "task-scoped" && cwd) {
+      if (!opts?.graphPermissionClass && canRetrieveTaskScope(bot.retrievalProfile, cwd)) {
         const outcome = await retriever.retrieve(
           bot.retrievalProfile,
           createRetrievalRequest({
@@ -2666,7 +2680,7 @@ async function runGroupMemberTurn(
       return true;
     }
   }
-  if (bot.retrievalProfile === "task-scoped" && cwd) {
+  if (canRetrieveTaskScope(bot.retrievalProfile, cwd)) {
     const outcome = await retriever.retrieve(
       bot.retrievalProfile,
       createRetrievalRequest({
