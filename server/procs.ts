@@ -201,7 +201,10 @@ export function spawnCli(
       if (registered || child.exitCode !== null || child.signalCode !== null) return;
       const observed = await processIdentity(pid);
       if (observed.status !== "found") {
-        if (observed.status === "not-found" && Date.now() < registrationDeadline) {
+        // A freshly spawned Windows process can be visible to Get-Process
+        // before StartTime or Path is readable. Both unavailable and
+        // not-found are transient during this bounded registration window.
+        if (Date.now() < registrationDeadline) {
           setTimeout(() => void register(), 100).unref();
         }
         return;

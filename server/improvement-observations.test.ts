@@ -1,6 +1,6 @@
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { writeVerifiedAgentGraphObservation } from "./improvement-observations.ts";
@@ -76,7 +76,7 @@ describe("verified graph observations", () => {
     ]);
     expect(observation.timestamp).toBe("2026-08-22T00:03:00.000Z");
     expect(writeVerifiedAgentGraphObservation(verified, { directory })).toBeNull();
-    expect(readdirSync(directory)).toEqual([path!.split("/").at(-1)]);
+    expect(readdirSync(directory)).toEqual([basename(path!)]);
     writeFileSync(path!, "{}\n");
     expect(() => writeVerifiedAgentGraphObservation(verified, { directory })).toThrow(/different content/);
   });

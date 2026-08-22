@@ -11,7 +11,11 @@ import {
   createCapabilityProfileManifest,
   createObserverRouterProfileManifest,
 } from "./access-profile.ts";
-import { AGENT_GRAPH_MAX_FILE_BYTES, readStableAgentGraphFile } from "./agent-graph-evidence.ts";
+import {
+  AGENT_GRAPH_MAX_FILE_BYTES,
+  agentGraphNoFollowFlag,
+  readStableAgentGraphFile,
+} from "./agent-graph-evidence.ts";
 import { agentGraphPathWithinWorkspace, agentGraphWritePathAllowed } from "./agent-graph-permissions.ts";
 import { fullTaskScopedHardDeny } from "./auto-approve.ts";
 import { BUILTIN_CAPABILITY_TOOLS } from "./builtin-capability-tools.ts";
@@ -478,19 +482,33 @@ interface GraphWorkspaceIdentity {
 
 function captureGraphWorkspace(cwd: string | undefined): GraphWorkspaceIdentity {
   if (!cwd) throw new Error("agent graph turn requires an exact workspace root");
-  const root = resolve(cwd);
-  const info = lstatSync(root);
-  if (!info.isDirectory() || info.isSymbolicLink() || realpathSync(root) !== root) {
+  const requestedRoot = resolve(cwd);
+  const requestedInfo = lstatSync(requestedRoot);
+  if (!requestedInfo.isDirectory() || requestedInfo.isSymbolicLink()) {
     throw new Error("agent graph workspace root must be a real non-symlink directory");
   }
+  const root = realpathSync(requestedRoot);
+  const info = lstatSync(root);
+  if (!info.isDirectory() || info.isSymbolicLink() ||
+      info.dev !== requestedInfo.dev || info.ino !== requestedInfo.ino) {
+    throw new Error("agent graph workspace root identity changed during canonicalization");
+  }
   return { root, dev: info.dev, ino: info.ino };
+}
+
+function sameGraphPath(left: string, right: string): boolean {
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
 }
 
 function requireGraphWorkspace(identity: GraphWorkspaceIdentity | undefined): void {
   if (!identity) throw new Error("agent graph workspace identity is unavailable");
   try {
     const info = lstatSync(identity.root);
-    if (!info.isDirectory() || info.isSymbolicLink() || realpathSync(identity.root) !== identity.root ||
+    if (!info.isDirectory() || info.isSymbolicLink() || !sameGraphPath(realpathSync(identity.root), identity.root) ||
         info.dev !== identity.dev || info.ino !== identity.ino) {
       throw new Error("agent graph workspace root identity changed after dispatch");
     }
@@ -498,14 +516,6 @@ function requireGraphWorkspace(identity: GraphWorkspaceIdentity | undefined): vo
     if (error instanceof Error && error.message.includes("identity changed")) throw error;
     throw new Error("agent graph workspace root identity changed after dispatch");
   }
-}
-
-function graphNoFollowFlag(): number {
-  const flag = fsConstants.O_NOFOLLOW;
-  if (typeof flag !== "number" || flag === 0) {
-    throw new Error("agent graph filesystem access requires O_NOFOLLOW support");
-  }
-  return flag;
 }
 
 function graphFilePreimage(info: Stats, sha256: string, writable = true): GraphFilePreimage {
@@ -1102,7 +1112,7 @@ export class CapabilityGateway {
         }
         let finalInfo: Stats;
         if (preimage.kind === "file") {
-          const handle = await open(path, fsConstants.O_RDWR | graphNoFollowFlag());
+          const handle = await open(path, fsConstants.O_RDWR | agentGraphNoFollowFlag());
           try {
             const before = await handle.stat();
             if (!sameGraphFileIdentity(preimage, before)) {
@@ -1147,7 +1157,7 @@ export class CapabilityGateway {
           }
           const handle = await open(
             path,
-            fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | graphNoFollowFlag(),
+            fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | agentGraphNoFollowFlag(),
             0o600,
           );
           try {

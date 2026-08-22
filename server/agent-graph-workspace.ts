@@ -10,6 +10,8 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
+import { agentGraphNoFollowFlag } from "./agent-graph-evidence.ts";
+
 const MAX_GITDIR_POINTER_BYTES = 4 * 1024;
 
 interface DirectoryIdentity {
@@ -43,21 +45,29 @@ function exactDirectoryIdentity(path: string, label: string): DirectoryIdentity 
 }
 
 function readGitdirPointer(marker: string): { marker: MarkerIdentity; target: string } {
-  const noFollow = fsConstants.O_NOFOLLOW;
-  if (typeof noFollow !== "number" || noFollow === 0) {
-    throw new Error("agent graph workspace identity requires O_NOFOLLOW support");
+  const pathBefore = lstatSync(marker);
+  if (!pathBefore.isFile() || pathBefore.isSymbolicLink() || pathBefore.nlink !== 1 ||
+      pathBefore.size < 1 || pathBefore.size > MAX_GITDIR_POINTER_BYTES) {
+    throw new Error("linked-worktree .git marker must be a bounded single-link file");
   }
-  const fd = openSync(marker, fsConstants.O_RDONLY | noFollow);
+  const fd = openSync(marker, fsConstants.O_RDONLY | agentGraphNoFollowFlag());
   try {
     const before = fstatSync(fd);
     if (!before.isFile() || before.nlink !== 1 || before.size < 1 || before.size > MAX_GITDIR_POINTER_BYTES) {
       throw new Error("linked-worktree .git marker must be a bounded single-link file");
     }
+    if (before.dev !== pathBefore.dev || before.ino !== pathBefore.ino) {
+      throw new Error("linked-worktree .git marker changed before its identity was captured");
+    }
     const body = readFileSync(fd);
     const after = fstatSync(fd);
+    const pathAfter = lstatSync(marker);
     if (
       before.dev !== after.dev || before.ino !== after.ino || before.nlink !== after.nlink ||
-      before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs
+      before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs ||
+      !pathAfter.isFile() || pathAfter.isSymbolicLink() || pathAfter.nlink !== 1 ||
+      pathAfter.dev !== after.dev || pathAfter.ino !== after.ino || pathAfter.size !== after.size ||
+      pathAfter.mtimeMs !== after.mtimeMs || pathAfter.ctimeMs !== after.ctimeMs
     ) {
       throw new Error("linked-worktree .git marker changed while its identity was captured");
     }

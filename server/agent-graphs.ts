@@ -11,7 +11,11 @@ import {
 import { dirname, join } from "node:path";
 
 import { writeFileAtomic } from "./atomic.ts";
-import { AGENT_GRAPH_MAX_FILE_BYTES, readStableAgentGraphFile } from "./agent-graph-evidence.ts";
+import {
+  AGENT_GRAPH_MAX_FILE_BYTES,
+  agentGraphNoFollowFlag,
+  readStableAgentGraphFile,
+} from "./agent-graph-evidence.ts";
 import { DATA_DIR } from "./config.ts";
 import type { RuntimeEvent } from "./contracts.ts";
 import { redactSecretsInText } from "./redact.ts";
@@ -636,10 +640,7 @@ export class AgentGraphManager {
     let rootFingerprint: string | null = null;
     let stateFd: number | null = null;
     try {
-      if (typeof fsConstants.O_NOFOLLOW !== "number") {
-        throw new Error("agent graph state cannot be opened without following links on this platform");
-      }
-      stateFd = openSync(this.file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      stateFd = openSync(this.file, fsConstants.O_RDONLY | agentGraphNoFollowFlag());
       const metadata = fstatSync(stateFd);
       rootFingerprint = sha256(canonical({
         kind: metadata.isFile() ? "file" : "other",
@@ -1583,10 +1584,7 @@ export class AgentGraphManager {
     let fd: number | null = null;
     let serialized = "";
     try {
-      if (typeof fsConstants.O_NOFOLLOW !== "number") {
-        throw new Error("verified graph receipts cannot be opened without following links on this platform");
-      }
-      fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      fd = openSync(path, fsConstants.O_RDONLY | agentGraphNoFollowFlag());
       const before = fstatSync(fd);
       if (!before.isFile() || before.nlink !== 1 || before.size > this.maxFileBytes) {
         throw new Error("verified graph receipt is not a bounded single-link regular file");

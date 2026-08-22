@@ -66,7 +66,9 @@ function normalizedWorkspacePath(raw: string, workspaceRoot?: string): { root: s
     const lexicalInfo = lstatSync(lexicalRoot);
     if (!lexicalInfo.isDirectory() || lexicalInfo.isSymbolicLink()) return null;
     root = realpathSync(lexicalRoot);
-    if (root !== lexicalRoot || !lstatSync(root).isDirectory()) return null;
+    const canonicalInfo = lstatSync(root);
+    if (!canonicalInfo.isDirectory() || canonicalInfo.isSymbolicLink() ||
+        canonicalInfo.dev !== lexicalInfo.dev || canonicalInfo.ino !== lexicalInfo.ino) return null;
   } catch {
     return null;
   }

@@ -13,12 +13,16 @@ export interface StableAgentGraphFileRead {
   info: Stats;
 }
 
-function noFollowFlag(): number {
-  const flag = fsConstants.O_NOFOLLOW;
-  if (typeof flag !== "number" || flag === 0) {
-    throw new Error("agent graph filesystem access requires O_NOFOLLOW support");
-  }
-  return flag;
+export function agentGraphNoFollowFlag(
+  platform = process.platform,
+  nativeFlag: number | undefined = fsConstants.O_NOFOLLOW,
+): number {
+  if (typeof nativeFlag === "number" && nativeFlag !== 0) return nativeFlag;
+  // Node does not expose O_NOFOLLOW on Windows. Callers must pair this zero
+  // fallback with the same pre/post lstat, canonical-path, and descriptor
+  // identity checks used by readStableAgentGraphFile.
+  if (platform === "win32") return 0;
+  throw new Error("agent graph filesystem access requires O_NOFOLLOW support");
 }
 
 function stableFile(left: Stats, right: Stats): boolean {
@@ -29,6 +33,19 @@ function stableFile(left: Stats, right: Stats): boolean {
 function stableWorkspace(left: Stats, right: Stats): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.isDirectory() && right.isDirectory() &&
     !left.isSymbolicLink() && !right.isSymbolicLink();
+}
+
+function inside(root: string, candidate: string): boolean {
+  const value = relative(root, candidate);
+  return value === "" || (value !== ".." && !value.startsWith(`..${sep}`) && !isAbsolute(value));
+}
+
+function sameCanonicalPath(left: string, right: string): boolean {
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
 }
 
 /**
@@ -48,21 +65,28 @@ export async function readStableAgentGraphFile(
     /^~(?:[\\/]|$)/.test(rawPath.trim()) || !Number.isSafeInteger(maximumBytes) || maximumBytes < 1
   ) throw new Error("agent graph evidence path is invalid");
 
-  const root = resolve(workspaceRoot);
+  const requestedRoot = resolve(workspaceRoot);
+  const requestedRootInfo = await lstat(requestedRoot);
+  if (!requestedRootInfo.isDirectory() || requestedRootInfo.isSymbolicLink()) {
+    throw new Error("agent graph workspace root must be a real non-symlink directory");
+  }
+  // Bind the canonical directory object while accepting platform aliases such
+  // as Windows short names or macOS /var -> /private/var ancestors. The exact
+  // selected root itself still cannot be a symlink.
+  const root = await realpath(requestedRoot);
+  const rootBefore = await lstat(root);
+  if (!stableWorkspace(requestedRootInfo, rootBefore)) {
+    throw new Error("agent graph workspace root identity changed during canonicalization");
+  }
   const supplied = rawPath.trim();
-  const candidate = isAbsolute(supplied) ? resolve(supplied) : resolve(root, supplied);
-  const relativePath = relative(root, candidate);
-  if (!relativePath || relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+  const lexicalCandidate = isAbsolute(supplied) ? resolve(supplied) : resolve(requestedRoot, supplied);
+  if (!inside(requestedRoot, lexicalCandidate) || lexicalCandidate === requestedRoot) {
     throw new Error("agent graph evidence path is outside the approved workspace");
   }
 
-  const rootBefore = await lstat(root);
-  if (!rootBefore.isDirectory() || rootBefore.isSymbolicLink() || await realpath(root) !== root) {
-    throw new Error("agent graph workspace root must be a real non-symlink directory");
-  }
-
-  let current = root;
-  const components = relativePath.split(sep);
+  let current = requestedRoot;
+  const components = relative(requestedRoot, lexicalCandidate).split(sep);
+  let lexicalTarget: Stats | null = null;
   for (const [index, component] of components.entries()) {
     current = resolve(current, component);
     const info = await lstat(current);
@@ -70,6 +94,17 @@ export async function readStableAgentGraphFile(
     if (index < components.length - 1 && !info.isDirectory()) {
       throw new Error("agent graph evidence path has a non-directory parent");
     }
+    if (index === components.length - 1) lexicalTarget = info;
+  }
+
+  const candidate = await realpath(lexicalCandidate);
+  const relativePath = relative(root, candidate);
+  if (!inside(root, candidate) || !relativePath) {
+    throw new Error("agent graph evidence path is outside the approved workspace");
+  }
+  const canonicalTarget = await lstat(candidate);
+  if (!lexicalTarget || lexicalTarget.dev !== canonicalTarget.dev || lexicalTarget.ino !== canonicalTarget.ino) {
+    throw new Error("agent graph evidence changed during canonicalization");
   }
 
   // Component checks alone are not enough: a writable parent can be renamed
@@ -77,12 +112,9 @@ export async function readStableAgentGraphFile(
   // Bind the canonical target on both sides of the descriptor read. The
   // descriptor/path inode comparison below then rejects a parent restored to
   // a different in-workspace file after an outside target was opened.
-  if (await realpath(candidate) !== candidate) {
-    throw new Error("agent graph evidence paths cannot traverse symlinks");
-  }
   await hooks.afterPathValidation?.();
 
-  const handle = await open(candidate, fsConstants.O_RDONLY | noFollowFlag());
+  const handle = await open(candidate, fsConstants.O_RDONLY | agentGraphNoFollowFlag());
   try {
     const before = await handle.stat();
     if (!before.isFile() || before.nlink !== 1) {
@@ -95,9 +127,9 @@ export async function readStableAgentGraphFile(
     const pathAfter = await lstat(candidate);
     const rootAfter = await lstat(root);
     if (
-      !stableFile(before, after) || !stableFile(after, pathAfter) ||
-      canonicalAfter !== candidate ||
-      !stableWorkspace(rootBefore, rootAfter) || await realpath(root) !== root ||
+      !stableFile(canonicalTarget, before) || !stableFile(before, after) || !stableFile(after, pathAfter) ||
+      !sameCanonicalPath(canonicalAfter, candidate) ||
+      !stableWorkspace(rootBefore, rootAfter) || !sameCanonicalPath(await realpath(root), root) ||
       body.byteLength !== after.size
     ) throw new Error("agent graph evidence changed while it was being read");
     return {

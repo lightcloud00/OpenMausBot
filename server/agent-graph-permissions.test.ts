@@ -7,8 +7,8 @@ import { agentGraphVerdict } from "./agent-graph-permissions.ts";
 
 describe("agent graph permission envelope", () => {
   it("never auto-approves provider-native tools or unsandboxed shell execution", () => {
-    const context = { cwd: realpathSync("/tmp") };
-    expect(agentGraphVerdict("read", "filesystem_read", "/tmp/project/source.ts", context).approve).toBeNull();
+    const context = { cwd: realpathSync(tmpdir()) };
+    expect(agentGraphVerdict("read", "filesystem_read", join(context.cwd, "project", "source.ts"), context).approve).toBeNull();
     expect(agentGraphVerdict("read", "edit", "change source.ts", context).approve).toBeNull();
     expect(agentGraphVerdict("workspace-write", "edit", "change source.ts", context).approve).toBeNull();
     expect(agentGraphVerdict("workspace-write", "shell", "pnpm exec vitest run server/example.test.ts", context).approve).toBeNull();
@@ -33,7 +33,7 @@ describe("agent graph permission envelope", () => {
       tool: "call_capability",
       arguments: { server, tool, arguments: args },
     });
-    const context = { cwd: realpathSync("/tmp") };
+    const context = { cwd: realpathSync(tmpdir()) };
     expect(agentGraphVerdict("read", "call_capability", call("openmaus-host", "filesystem_read", { path: "README.md" }), context).approve).toBeTruthy();
     expect(agentGraphVerdict("read", "call_capability", call("openmaus-host", "filesystem_write", { path: "README.md" }), context).approve).toBeNull();
     expect(agentGraphVerdict("workspace-write", "call_capability", call("openmaus-host", "filesystem_write", { path: "README.md" }), context).approve).toBeNull();

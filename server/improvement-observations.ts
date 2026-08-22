@@ -2,20 +2,29 @@ import { createHash } from "node:crypto";
 import {
   closeSync,
   constants as fsConstants,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { agentGraphNoFollowFlag } from "./agent-graph-evidence.ts";
 import type { AgentGraphRunReceipt } from "./agent-graphs.ts";
 import { redactSecretsInText } from "./redact.ts";
 
 export const IMPROVEMENT_OBSERVATION_SCHEMA = "improvement_observation.v1" as const;
+
+function stableSingleLinkFile(left: ReturnType<typeof fstatSync>, right: ReturnType<typeof fstatSync>): boolean {
+  return left.isFile() && right.isFile() && left.nlink === 1 && right.nlink === 1 &&
+    left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
+    left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
 
 export function writeVerifiedAgentGraphObservation(
   receipt: AgentGraphRunReceipt,
@@ -30,9 +39,15 @@ export function writeVerifiedAgentGraphObservation(
   const directory = options.directory ?? process.env.AOS_IMPROVEMENT_OBSERVATIONS_DIR ??
     join(homedir(), ".local", "state", "self-improve-recs", "observations");
   mkdirSync(directory, { recursive: true });
-  const directoryInfo = lstatSync(directory);
-  if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) {
+  const requestedDirectoryInfo = lstatSync(directory);
+  if (!requestedDirectoryInfo.isDirectory() || requestedDirectoryInfo.isSymbolicLink()) {
     throw new Error("improvement observation directory must be a real directory");
+  }
+  const canonicalDirectory = realpathSync(directory);
+  const directoryInfo = lstatSync(canonicalDirectory);
+  if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink() ||
+      directoryInfo.dev !== requestedDirectoryInfo.dev || directoryInfo.ino !== requestedDirectoryInfo.ino) {
+    throw new Error("improvement observation directory identity changed during canonicalization");
   }
   const receiptHash = `sha256:${createHash("sha256").update(JSON.stringify(receipt)).digest("hex")}`;
   const at = new Date(receipt.verified_at).toISOString();
@@ -67,28 +82,52 @@ export function writeVerifiedAgentGraphObservation(
     sensitivity: "restricted",
     timestamp: at,
   };
-  const path = join(directory, `${observation.observation_id}.json`);
+  const path = join(canonicalDirectory, `${observation.observation_id}.json`);
   const serialized = JSON.stringify(observation, null, 2) + "\n";
-  if (typeof fsConstants.O_NOFOLLOW !== "number") {
-    throw new Error("improvement observations require O_NOFOLLOW support");
-  }
   let fd: number | null = null;
   try {
     fd = openSync(
       path,
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | agentGraphNoFollowFlag(),
       0o600,
     );
+    const before = fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1) {
+      throw new Error("new improvement observation is not a single-link regular file");
+    }
     writeFileSync(fd, serialized, { encoding: "utf8" });
     fsyncSync(fd);
+    const after = fstatSync(fd);
+    const pathAfter = lstatSync(path);
+    const directoryAfter = lstatSync(canonicalDirectory);
+    if (!stableSingleLinkFile(after, pathAfter) || after.dev !== before.dev || after.ino !== before.ino ||
+        after.size !== Buffer.byteLength(serialized, "utf8") || !directoryAfter.isDirectory() ||
+        directoryAfter.isSymbolicLink() || directoryAfter.dev !== directoryInfo.dev || directoryAfter.ino !== directoryInfo.ino) {
+      throw new Error("improvement observation path or directory changed while it was being written");
+    }
     return path;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const info = lstatSync(path);
-    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > 2 * 1024 * 1024) {
+    const pathBefore = lstatSync(path);
+    if (!pathBefore.isFile() || pathBefore.isSymbolicLink() || pathBefore.nlink !== 1 ||
+        pathBefore.size > 2 * 1024 * 1024) {
       throw new Error("existing improvement observation is not a bounded single-link regular file");
     }
-    if (readFileSync(path, "utf8") === serialized) return null;
+    fd = openSync(path, fsConstants.O_RDONLY | agentGraphNoFollowFlag());
+    const before = fstatSync(fd);
+    if (!stableSingleLinkFile(pathBefore, before) || before.size > 2 * 1024 * 1024) {
+      throw new Error("existing improvement observation changed before it was read");
+    }
+    const existing = readFileSync(fd, "utf8");
+    const after = fstatSync(fd);
+    const pathAfter = lstatSync(path);
+    const directoryAfter = lstatSync(canonicalDirectory);
+    if (!stableSingleLinkFile(before, after) || !stableSingleLinkFile(after, pathAfter) ||
+        Buffer.byteLength(existing, "utf8") !== after.size || !directoryAfter.isDirectory() ||
+        directoryAfter.isSymbolicLink() || directoryAfter.dev !== directoryInfo.dev || directoryAfter.ino !== directoryInfo.ino) {
+      throw new Error("existing improvement observation changed while it was being read");
+    }
+    if (existing === serialized) return null;
     throw new Error("deterministic improvement observation identity already contains different content");
   } finally {
     if (fd !== null) closeSync(fd);
