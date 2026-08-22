@@ -163,7 +163,9 @@ const retrievalEvidenceSchema = z.object({
   instruction_authority: z.literal(false),
   content_trust: z.literal("untrusted_retrieval_evidence"),
   persistent_process_started: z.literal(false),
-  index_stale: z.literal(false),
+  // Index-age degradation is telemetry, not source authority. Every accepted
+  // hit is still re-read and hash-verified below against current Mac bytes.
+  index_stale: z.boolean(),
   requires_current_source_readback: z.literal(false),
   truth: z.literal("working_set"),
   answerability: z.enum(["answerable", "insufficient_evidence", "no_answer"]),

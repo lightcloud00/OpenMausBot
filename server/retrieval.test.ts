@@ -412,6 +412,28 @@ describe("OpenMausRetriever", () => {
     });
   });
 
+  it("accepts index-age degradation only when current Mac source bytes still verify", async () => {
+    const req = request({ taskId: "index-age-degraded-task" });
+    const file = fixtureFile("Current source remains authoritative despite old index metadata");
+    const degraded = { ...evidence(req, file), index_stale: true };
+    const accepted = await new OpenMausRetriever({ sourceRetrieve: async () => degraded })
+      .retrieve("task-scoped", req);
+    expect(accepted).toMatchObject({
+      receipt: { accepted_hits: 1, skip_reason: null },
+    });
+    expect(accepted.context).toContain("Current source remains authoritative");
+
+    const staleRequest = request({ taskId: "index-age-stale-hash-task" });
+    const staleEvidence = { ...evidence(staleRequest, file), index_stale: true };
+    staleEvidence.hits[0]!.content_hash = `sha256:${"0".repeat(64)}`;
+    const staleHash = await new OpenMausRetriever({ sourceRetrieve: async () => staleEvidence })
+      .retrieve("task-scoped", staleRequest);
+    expect(staleHash).toMatchObject({
+      context: "",
+      receipt: { accepted_hits: 0, skip_reason: "no-verified-hits", windows_served: false },
+    });
+  });
+
   it("claims Windows service only for a digest-bound generation with a Mac-verified hit", async () => {
     const file = fixtureFile();
     const req = request();
