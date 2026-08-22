@@ -371,7 +371,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             typeof params.arguments?.tool === "string"
               ? params.arguments.tool
               : tool;
-          const denial = fullTaskScopedHardDeny(nestedGatewayTool, summary, { cwd: turn.cwd });
+          const denial = fullTaskScopedHardDeny(nestedGatewayTool, summary, {
+            // The app-server runs no-cwd turns from home (see spawn above),
+            // so relative destructive targets must be classified from that
+            // same effective directory rather than the harness process cwd.
+            cwd: turn.cwd ?? homedir(),
+          });
           if (denial) {
             emit({
               ...base(threadId, turnId),

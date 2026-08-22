@@ -496,6 +496,35 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ action: "decline" });
   });
 
+  it("declines a recursive home delete when a scoped turn omits cwd", async () => {
+    await create({ mode: "approval" });
+    const dump = join(scratch, "full-default-home-delete.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    process.env.FAKE_CODEX_APPROVAL_KIND = "gateway";
+    process.env.FAKE_CODEX_APPROVAL_PATH = "*";
+    process.env.FAKE_CODEX_APPROVAL_RECURSIVE = "1";
+
+    // Keep the harness cwd somewhere harmless and non-repository. Before the
+    // fix, the guard resolved `*` here even though the app-server itself was
+    // launched in homedir() and would have expanded it across the test home.
+    const harnessCwd = process.cwd();
+    try {
+      process.chdir(scratch);
+      await instance.adapter.sendTurn({
+        threadId: "t-full-default-home-delete",
+        turnToken: "turn-token-123456789012345678901234",
+        text: "delete everything here",
+        accessProfile: "full-task-scoped",
+        autoApprove: true,
+      });
+      await recorder.until((event) => event.type === "turn.completed");
+    } finally {
+      process.chdir(harnessCwd);
+    }
+
+    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ action: "decline" });
+  });
+
   it("keeps auto-approval independent from the full-task-scoped capability profile", async () => {
     await create({ mode: "approval", fullAuto: true });
     const dump = join(scratch, "full-manual.json");
