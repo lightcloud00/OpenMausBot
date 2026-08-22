@@ -80,10 +80,9 @@ describe("tasks", () => {
     const { store } = await freshStore();
     const bot = store.createBot();
     const before = structuredClone(bot);
-    // SAFETY: the test deliberately replaces the store's private persistence
-    // seam to prove rollback; it restores that exact method before returning.
-    const persistableStore = store as { saveBots: () => void };
-    const save = vi.spyOn(persistableStore, "saveBots").mockImplementationOnce(() => {
+    // The test instance is discarded after this case; replace its runtime
+    // persistence seam without widening the private Store type.
+    Reflect.set(store, "saveBots", () => {
       throw new Error("disk unavailable");
     });
 
@@ -92,7 +91,6 @@ describe("tasks", () => {
       model: "litellm-local:MiniMax-M3",
     })).toThrow("disk unavailable");
     expect(store.bot(bot.id)).toEqual(before);
-    save.mockRestore();
   });
 
   it("can create a detached routine task without changing the visible conversation", async () => {
