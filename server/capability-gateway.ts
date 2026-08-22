@@ -312,6 +312,13 @@ class StdioBackend implements BackendClient {
   private fail(error: Error): void {
     if (this.closed) return;
     this.closed = true;
+    const child = this.child;
+    if (child && child.exitCode === null && child.signalCode === null) {
+      // A broken stdin pipe does not imply the backend process exited. Reap
+      // the exact owned tree here because every later close path observes the
+      // closed flag and must remain idempotent.
+      killCliTree(child);
+    }
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(error);
@@ -321,9 +328,7 @@ class StdioBackend implements BackendClient {
 
   close(): void {
     if (this.closed) return;
-    const child = this.child;
     this.fail(new Error(`${this.name}: capability backend stopped`));
-    if (child) killCliTree(child);
   }
 }
 

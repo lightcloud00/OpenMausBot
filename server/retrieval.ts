@@ -239,7 +239,15 @@ export class OpenMausRetriever {
     if (!result.chunks.length) return "";
     const fenced = (text: string) => text.replace(/<\/?untrusted-retrieval/gi, "<\u200buntrusted-retrieval");
     const body = result.chunks.map((chunk, index) => {
-      const identity = [chunk.repositoryId, chunk.path, chunk.sourceSha, chunk.traceId].filter(Boolean).join(" | ");
+      let identity = "";
+      const appendIdentity = (metadata: string | undefined): void => {
+        if (!metadata) return;
+        identity += `${identity ? " | " : ""}${fenced(metadata)}`;
+      };
+      appendIdentity(chunk.repositoryId);
+      appendIdentity(chunk.path);
+      appendIdentity(chunk.sourceSha);
+      appendIdentity(chunk.traceId);
       return `[${index + 1}] ${chunk.kind}${identity ? ` (${identity})` : ""}\n${fenced(chunk.text)}`;
     }).join("\n\n");
     return `\n\n<untrusted-retrieval schema="${result.schema}" source-sha="${result.sourceSha}">\n${body}\n</untrusted-retrieval>`;
