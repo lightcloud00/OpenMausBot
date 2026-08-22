@@ -207,7 +207,12 @@ export function spawnCli(
       if (registered || child.exitCode !== null || child.signalCode !== null) return;
       const observed = await processIdentity(pid);
       if (observed.status !== "found") {
-        if (observed.status === "not-found" && Date.now() < registrationDeadline) {
+        // A freshly spawned Windows process can be visible to Get-Process
+        // before StartTime or Path is readable, which is an unavailable
+        // probe rather than not-found. Both states are transient during this
+        // bounded registration window; retry either instead of abandoning
+        // ownership after the first partial PowerShell result.
+        if (Date.now() < registrationDeadline) {
           setTimeout(() => void register(), 100).unref();
         }
         return;
