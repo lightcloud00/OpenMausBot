@@ -4,7 +4,7 @@
 // initialize/thread/turn handshake, then plays a scripted turn. Like the
 // real app-server, it never exits on its own — the driver kills it.
 //
-//   FAKE_CODEX_MODE   happy (default) | approval | file-approval | resume | stream | windows-command |
+//   FAKE_CODEX_MODE   happy (default) | approval | approval-closed | file-approval | resume | stream | windows-command |
 //                     logged-in-stdout | logged-out | unauthorized
 //   FAKE_CODEX_DUMP   path to write {argv, env, calls, decision} as JSON
 //   FAKE_CODEX_APPROVAL_COMMAND  override the approval-mode command fixture
@@ -174,10 +174,30 @@ process.stdin.on("data", (chunk) => {
             params: requestedFileApproval,
           });
           // turn continues from the approval response handler above
-        } else if (mode === "approval" || mode === "windows-command") {
+        } else if (mode === "approval" || mode === "approval-closed" || mode === "windows-command") {
           const approvalCommand = requestedApprovalCommand ?? (mode === "windows-command" ? command : "rm -rf scratch");
-          out({ jsonrpc: "2.0", id: 100, method: "execCommandApproval", params: { command: approvalCommand } });
-          // turn continues from the approval response handler above
+          const approvalRequest = {
+            jsonrpc: "2.0",
+            id: 100,
+            method: "execCommandApproval",
+            params: { command: approvalCommand },
+          };
+          if (mode === "approval-closed") {
+            // One protocol batch opens the ask and immediately settles the
+            // turn. The harness must consume both before claiming delivery.
+            process.stdout.write(
+              JSON.stringify(approvalRequest) + "\n" +
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  method: "turn/completed",
+                  params: { turn: { status: "completed" } },
+                }) +
+                "\n",
+            );
+          } else {
+            out(approvalRequest);
+            // turn continues from the approval response handler above
+          }
         } else {
           finishTurn();
         }

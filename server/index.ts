@@ -899,6 +899,11 @@ bus.subscribe((event: RuntimeEvent) => {
         void (async () => {
           try {
             if (!instance) throw new Error("provider unavailable");
+            // As with automatic denial, drain the current protocol batch
+            // before answering. request.opened + turn.completed may arrive in
+            // one chunk; logging approval before that completion is consumed
+            // would claim success for an ask the provider already closed.
+            await new Promise<void>((resolve) => setImmediate(resolve));
             const outcome = await instance.adapter.respondToRequest(event.threadId, requestId, { behavior: "allow" });
             if (outcome === "unavailable") throw new Error("the ask is no longer open");
             pushMessage({
@@ -921,26 +926,16 @@ bus.subscribe((event: RuntimeEvent) => {
               rule: verdict.rule,
               unattended: unattended || undefined,
             });
-          } catch {
-            // couldn't answer it for them — hand it back to the human
-            // rather than leaving the bot waiting on nobody
-            const card = pushMessage({
+          } catch (error) {
+            // A provider write is not an acknowledgement after the ask has
+            // closed. Record the failed delivery explicitly; never turn that
+            // uncertainty into either an approval claim or a stale card.
+            const deliveryError = error instanceof Error ? error.message : String(error);
+            pushMessage({
               role: "bot",
-              kind: "options",
-              card: {
-                title: "Approval needed",
-                subtitle: summary,
-                options: ["Allow", "Deny"],
-                requestId,
-                tool,
-                allowKey: event.approvalScope
-                  ? undefined
-                  : approvalKey(tool, summary, event.approvalScope),
-                held: "Auto mode couldn't answer this one.",
-                approvalScope: event.approvalScope,
-              },
+              kind: "activity",
+              tool: { name: `auto-approval delivery failed for ${tool}`, ok: false },
             });
-            askMessageByRequest.set(`${event.threadId}:${requestId}`, card.id);
             appendDecision(DATA_DIR, {
               threadId: event.threadId,
               requestId,
@@ -948,9 +943,10 @@ bus.subscribe((event: RuntimeEvent) => {
               botName: asker.name,
               tool,
               summary,
-              decision: "card-shown",
-              source: "auto-fallback",
-              rule: verdict.rule,
+              decision: "allow-delivery-failed",
+              source: verdict.source,
+              rule: `${verdict.rule ?? "guarded-autonomy"}; delivery_failed: ${deliveryError}`,
+              unattended: unattended || undefined,
             });
           }
         })();

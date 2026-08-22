@@ -6,11 +6,12 @@
 // not the behavior the rows describe:
 //
 //   1. a rule-matched auto-approval writes a row naming the rule
-//   2. a raw protected-value request writes an automatic denial row
-//   3. an undeliverable raw-value denial records failure, never success
-//   4. a destructive card and the human's answer write two rows
-//   5. safe webhook work preserves unattended provenance without carding
-//   6. GET /api/decisions pages newest-last with ?limit=
+//   2. an undeliverable automatic allow records failure, never success
+//   3. a raw protected-value request writes an automatic denial row
+//   4. an undeliverable raw-value denial records failure, never success
+//   5. a destructive card and the human's answer write two rows
+//   6. safe webhook work preserves unattended provenance without carding
+//   7. GET /api/decisions pages newest-last with ?limit=
 import { spawn, type ChildProcess } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -136,6 +137,14 @@ posixOnly("authorization decisions are logged", () => {
             },
             config: { cli: FAKE_CODEX, fullAuto: true },
           },
+          codexRace: {
+            driver: "codex",
+            environment: {
+              FAKE_CODEX_MODE: "approval-closed",
+              FAKE_CODEX_APPROVAL_COMMAND: "echo hi",
+            },
+            config: { cli: FAKE_CODEX, fullAuto: true },
+          },
           destructive: {
             driver: "grokAgent",
             environment: {
@@ -207,6 +216,29 @@ posixOnly("authorization decisions are logged", () => {
       expect(row!.botName).toBe("Granted");
       expect(row!.threadId).toBeTruthy();
       expect(row!.requestId).toBeTruthy();
+    },
+    60_000,
+  );
+
+  it(
+    "an ask closed in the same batch is never logged as auto-approved",
+    async () => {
+      const bot = await makePermissionBot({ name: "AllowRace", alwaysAllow: ["shell:echo"] }, "codexRace");
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "run it" })).status).toBe(202);
+
+      const failed = await waitForDecision(
+        (row) => row.decision === "allow-delivery-failed" && row.botId === bot.id,
+      );
+      const decisions = (await api("GET", "/api/decisions")).body.decisions as DecisionRow[];
+      expect(failed, "the failed allow delivery never reached the decision log").not.toBeNull();
+      expect(failed!.source).toBe("always-allow");
+      expect(failed!.rule).toContain("delivery_failed");
+      expect(
+        decisions.some(
+          (candidate: DecisionRow) => candidate.botId === bot.id && candidate.decision === "auto-approved",
+        ),
+      ).toBe(false);
+      expect(await waitForBotCard(bot.id, 1_000)).toBeNull();
     },
     60_000,
   );
