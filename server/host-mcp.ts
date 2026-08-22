@@ -13,14 +13,21 @@ import { writeFileAtomic } from "./atomic.ts";
 import { BUILTIN_CAPABILITY_TOOLS } from "./builtin-capability-tools.ts";
 
 export type HostMcpServer =
-  | { type: "builtin" }
+  | { type: "builtin"; family?: "host" | "fleet" }
   | { type: "stdio"; command: string; args: string[]; env: Record<string, string>; cwd?: string }
   | { type: "http"; url: string; headers: Record<string, string> };
+
+type CatalogSourceState = "loaded" | "missing" | "invalid";
 
 export interface HostMcpCatalog {
   servers: Record<string, HostMcpServer>;
   manifest: CapabilityProfileManifest;
-  sources: { claude: "loaded" | "missing" | "invalid"; codex: "loaded" | "missing" | "invalid" };
+  sources: {
+    claude: CatalogSourceState;
+    codex: CatalogSourceState;
+    opencode?: CatalogSourceState;
+    hermes?: CatalogSourceState;
+  };
 }
 
 const BLOCKED_SERVER = /(?:^|[-_.])cred(?:ential)?vault(?:$|[-_.])|credvault/i;
@@ -30,6 +37,12 @@ const FLEET_BRIDGE_CODEX_DUPLICATE = /^aos-fleet-bridge-codex(?:-\d+)?$/;
 const FLEET_BRIDGE_SCRIPT = /(?:^|[\\/])aos_fleet_bridge_mcp\.py$/;
 const OPENMAUS_SURFACE = "openmausbot";
 const BRIDGE_VALUE_FLAGS = new Set(["--surface", "--state-dir", "--ledger", "--ledger-timeout", "--inbox"]);
+const FLEET_BUILTIN_TOOLS = [
+  "search_capabilities",
+  "suggest_capabilities",
+  "select_capability",
+  "suggest_role_overlays",
+] as const;
 
 function safeName(value: unknown): string | null {
   return typeof value === "string" && NAME.test(value) && !BLOCKED_SERVER.test(value) ? value : null;
@@ -174,20 +187,91 @@ function selectFleetBridgeForOpenMaus(
   return candidates.sort((left, right) => left.args.length - right.args.length || left.command.localeCompare(right.command))[0];
 }
 
-function mergeCatalogs(
-  claude: Record<string, HostMcpServer>,
-  codex: Record<string, HostMcpServer>,
+/** OpenCode's JSON uses a command vector for local MCPs and a URL for remote
+ * MCPs. Values remain inside the gateway; the persisted profile keeps names
+ * only, exactly like the Claude and Codex loaders. */
+export function parseOpenCodeMcpServers(
+  raw: unknown,
+  env: NodeJS.ProcessEnv = process.env,
 ): Record<string, HostMcpServer> {
-  const merged = { ...claude };
-  for (const [name, server] of Object.entries(codex)) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const configured = (raw as Record<string, unknown>).mcp;
+  if (!configured || typeof configured !== "object" || Array.isArray(configured)) return {};
+  const servers: Record<string, HostMcpServer> = {};
+  for (const [rawName, value] of Object.entries(configured as Record<string, unknown>)) {
+    const name = safeName(rawName);
+    if (!name || !value || typeof value !== "object" || Array.isArray(value)) continue;
+    const row = value as Record<string, unknown>;
+    if (row.enabled === false) continue;
+    if ((row.type === "remote" || row.type === "http" || row.type === "sse") && typeof row.url === "string" && /^https?:\/\//.test(row.url)) {
+      servers[name] = { type: "http", url: row.url, headers: stringMap(row.headers) };
+      continue;
+    }
+    const vector = stringList(row.command);
+    if (!vector?.length || BLOCKED_SERVER.test(vector[0]!)) continue;
+    servers[name] = {
+      type: "stdio",
+      command: vector[0]!,
+      args: vector.slice(1),
+      env: namedEnvironment(row.environment ?? row.env, env),
+      ...(typeof row.cwd === "string" ? { cwd: row.cwd } : {}),
+    };
+  }
+  return servers;
+}
+
+/** Hermes YAML is projected to JSON by a bounded host-side reader before it
+ * reaches this parser. Only enabled, lazy-compatible server definitions are
+ * accepted; tool filters and descriptions remain owned by Hermes. */
+export function parseHermesMcpServers(
+  raw: unknown,
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, HostMcpServer> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const servers: Record<string, HostMcpServer> = {};
+  for (const [rawName, value] of Object.entries(raw as Record<string, unknown>)) {
+    const name = safeName(rawName);
+    if (!name || !value || typeof value !== "object" || Array.isArray(value)) continue;
+    const row = value as Record<string, unknown>;
+    if (row.enabled === false) continue;
+    if (typeof row.url === "string" && /^https?:\/\//.test(row.url)) {
+      servers[name] = { type: "http", url: row.url, headers: stringMap(row.headers) };
+      continue;
+    }
+    const args = stringList(row.args ?? []);
+    if (
+      typeof row.command !== "string" ||
+      !row.command ||
+      /\s/.test(row.command) ||
+      !args ||
+      BLOCKED_SERVER.test(row.command)
+    ) continue;
+    servers[name] = {
+      type: "stdio",
+      command: row.command,
+      args,
+      env: namedEnvironment(row.environment ?? row.env, env),
+      ...(typeof row.cwd === "string" ? { cwd: row.cwd } : {}),
+    };
+  }
+  return servers;
+}
+
+function mergeCatalog(
+  base: Record<string, HostMcpServer>,
+  incoming: Record<string, HostMcpServer>,
+  source: string,
+): Record<string, HostMcpServer> {
+  const merged = { ...base };
+  for (const [name, server] of Object.entries(incoming)) {
     if (!merged[name]) {
       merged[name] = server;
       continue;
     }
     if (JSON.stringify(merged[name]) === JSON.stringify(server)) continue;
-    let candidate = `${name}-codex`;
+    let candidate = `${name}-${source}`;
     let suffix = 2;
-    while (merged[candidate]) candidate = `${name}-codex-${suffix++}`;
+    while (merged[candidate]) candidate = `${name}-${source}-${suffix++}`;
     merged[candidate] = server;
   }
   return merged;
@@ -199,21 +283,50 @@ function mergeCatalogs(
 function fullTaskServers(
   claude: Record<string, HostMcpServer>,
   codex: Record<string, HostMcpServer>,
+  opencode: Record<string, HostMcpServer>,
+  hermes: Record<string, HostMcpServer>,
 ): Record<string, HostMcpServer> {
-  const merged = mergeCatalogs(claude, codex);
+  const merged = mergeCatalog(
+    mergeCatalog(mergeCatalog(claude, codex, "codex"), opencode, "opencode"),
+    hermes,
+    "hermes",
+  );
   for (const name of Object.keys(merged)) {
     if (FLEET_BRIDGE_CODEX_DUPLICATE.test(name)) delete merged[name];
   }
   const bridge = pinnedFleetBridge(merged[FLEET_BRIDGE_NAME]);
   if (bridge) merged[FLEET_BRIDGE_NAME] = bridge;
   else delete merged[FLEET_BRIDGE_NAME];
-  return { ...merged, "openmaus-host": { type: "builtin" } };
+  return {
+    ...merged,
+    "openmaus-host": { type: "builtin" },
+    "openmaus-fleet": { type: "builtin", family: "fleet" },
+  };
+}
+
+function readHermesMcpJson(userHome: string): string {
+  const activeProfile = readFileSync(join(userHome, ".hermes", "active_profile"), "utf8").trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/.test(activeProfile)) throw new Error("invalid Hermes profile name");
+  const config = join(userHome, ".hermes", "profiles", activeProfile, "config.yaml");
+  const projection = [
+    "import json,sys,yaml",
+    "value=yaml.safe_load(open(sys.argv[1], encoding='utf-8')) or {}",
+    "print(json.dumps(value.get('mcp_servers', {}), separators=(',', ':')))",
+  ].join(";");
+  return execFileSync("python3", ["-c", projection, config], {
+    encoding: "utf8",
+    timeout: 10_000,
+    env: { PATH: augmentedPath() },
+    stdio: ["ignore", "pipe", "ignore"],
+  });
 }
 
 export interface HostMcpCatalogOptions {
   home?: string;
   env?: NodeJS.ProcessEnv;
   runCodexList?: () => string;
+  readOpenCodeConfig?: () => string;
+  runHermesList?: () => string;
 }
 
 /** Load the host sources once, then derive two non-overlapping authority
@@ -227,8 +340,12 @@ export function loadHostMcpCatalogs(options: HostMcpCatalogOptions = {}): {
   const env = options.env ?? process.env;
   let claude: Record<string, HostMcpServer> = {};
   let codex: Record<string, HostMcpServer> = {};
+  let opencode: Record<string, HostMcpServer> = {};
+  let hermes: Record<string, HostMcpServer> = {};
   let claudeState: HostMcpCatalog["sources"]["claude"] = "missing";
   let codexState: HostMcpCatalog["sources"]["codex"] = "missing";
+  let opencodeState: CatalogSourceState = "missing";
+  let hermesState: CatalogSourceState = "missing";
   try {
     claude = parseClaudeMcpServers(JSON.parse(readFileSync(join(userHome, ".claude.json"), "utf8")), env);
     claudeState = "loaded";
@@ -249,15 +366,38 @@ export function loadHostMcpCatalogs(options: HostMcpCatalogOptions = {}): {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") codexState = "invalid";
   }
+  try {
+    const output = options.readOpenCodeConfig
+      ? options.readOpenCodeConfig()
+      : readFileSync(join(userHome, ".config", "opencode", "opencode.json"), "utf8");
+    opencode = parseOpenCodeMcpServers(JSON.parse(output), env);
+    opencodeState = "loaded";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") opencodeState = "invalid";
+  }
+  try {
+    const output = options.runHermesList ? options.runHermesList() : readHermesMcpJson(userHome);
+    hermes = parseHermesMcpServers(JSON.parse(output), env);
+    hermesState = "loaded";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") hermesState = "invalid";
+  }
   const bridge = selectFleetBridgeForOpenMaus(claude, codex);
   const observerServers: Record<string, HostMcpServer> = bridge ? { [FLEET_BRIDGE_NAME]: bridge } : {};
-  const fullServers = fullTaskServers(claude, codex);
+  const fullServers = fullTaskServers(claude, codex, opencode, hermes);
   const fullInventory = Object.entries(fullServers).flatMap(([name, server]) =>
     server.type === "builtin"
-      ? BUILTIN_CAPABILITY_TOOLS.map((tool) => `${name}:${tool.name}`)
+      ? server.family === "fleet"
+        ? FLEET_BUILTIN_TOOLS.map((tool) => `${name}:${tool}`)
+        : BUILTIN_CAPABILITY_TOOLS.map((tool) => `${name}:${tool.name}`)
       : [name],
   );
-  const sources = { claude: claudeState, codex: codexState };
+  const sources = {
+    claude: claudeState,
+    codex: codexState,
+    opencode: opencodeState,
+    hermes: hermesState,
+  };
   return {
     fullTask: {
       servers: fullServers,

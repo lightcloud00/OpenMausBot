@@ -5,6 +5,7 @@ import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { isIP } from "node:net";
+import { homedir } from "node:os";
 import { extname, join } from "node:path";
 
 import { z } from "zod";
@@ -146,6 +147,9 @@ import { agentGraphVerdict } from "./agent-graph-permissions.ts";
 import { buildAgentGraphDraft, type AgentGraphRouteCandidate } from "./agent-graph-planner.ts";
 import { canonicalJson, ObserverTaskPresenceAdapter } from "./observer-task-presence.ts";
 import { writeVerifiedAgentGraphObservation } from "./improvement-observations.ts";
+import { FleetCapabilityIndex } from "./fleet-capabilities.ts";
+import { GoalCommandAdapter } from "./goal-command.ts";
+import { ROLE_OVERLAYS, renderRoleOverlayInstructions } from "./role-overlays.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
 const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
@@ -177,8 +181,10 @@ const cfg = loadConfig();
 const { fullTask: hostMcpCatalog, observer: observerHostMcpCatalog } = loadHostMcpCatalogs();
 writeHostMcpManifest(DATA_DIR, hostMcpCatalog);
 writeHostMcpManifest(DATA_DIR, observerHostMcpCatalog);
-const capabilityGateway = new CapabilityGateway(hostMcpCatalog);
+const fleetCapabilityIndex = new FleetCapabilityIndex();
+const capabilityGateway = new CapabilityGateway(hostMcpCatalog, { fleetIndex: fleetCapabilityIndex });
 const observerCapabilityGateway = new CapabilityGateway(observerHostMcpCatalog);
+const goalCommands = new GoalCommandAdapter();
 const registry = new ProviderRegistry(BUILT_IN_DRIVERS);
 await registry.load(instanceConfigs(cfg));
 const bundledSkills = loadBundledSkills();
@@ -1769,13 +1775,14 @@ async function startTurn(
     replaysNatively: instance.driverKind === "grok",
   });
 
-      const persona = [
+  const persona = [
     `You are ${bot.name}, a personal bot in OpenMausBot.`,
     bot.title && `Role: ${bot.title}.`,
     bot.description && `About: ${bot.description}`,
   ]
     .filter(Boolean)
     .join(" ");
+  const roleOverlayInstructions = renderRoleOverlayInstructions(`${bot.title}\n${bot.description}\n${text}`);
 
   // busy flips immediately so the composer locks; the dispatch itself runs
   // in the background — box provisioning can take ~90s and must never
@@ -2062,12 +2069,13 @@ async function startTurn(
         system: fullTaskScoped
           ? opts?.graphPermissionClass
             ? renderAgentGraphScopedSystemPrompt(capabilityManifest, opts.graphPermissionClass)
-            : renderFullTaskScopedSystemPrompt(capabilityManifest, {
+            : `${persona}${roleOverlayInstructions} ${renderFullTaskScopedSystemPrompt(capabilityManifest, {
               retrievalContext,
               protectComputerInput: Boolean(computerKind),
               untrustedWebhook: opts?.automationSource === "webhook",
-            })
+            })}`
           : persona +
+          roleOverlayInstructions +
           (computerKind === "vm"
             ? localVmMode(cfg) === "per-bot"
               ? " You have your own isolated Cua sandbox: a Linux desktop in a container reserved for this bot. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and work carefully."
@@ -2554,6 +2562,7 @@ async function runGroupMemberTurn(
   const text = `${serializeRoomContext(group.threadId, userName)}\n\n(Reply to the conversation above as ${bot.name}.)${
     connectorContinuation ? `\n\n${connectorContinuation}` : ""
   }`;
+  const roleOverlayInstructions = renderRoleOverlayInstructions(`${bot.title}\n${bot.description}\n${text}`);
 
   // same workspace + memory as a 1:1 turn — the room is a different
   // conversation, not a different bot
@@ -2594,8 +2603,9 @@ async function runGroupMemberTurn(
   }
   const roomSystem =
     fullTaskScoped
-      ? renderFullTaskScopedSystemPrompt(capabilityManifest, { retrievalContext })
+      ? `${system}${roleOverlayInstructions}\n${renderFullTaskScopedSystemPrompt(capabilityManifest, { retrievalContext })}`
       : (workspace ? `${system}\n${memorySystemPrompt(bot.id).trim()}` : system) +
+        roleOverlayInstructions +
         renderSkillInstructions(selectedSkills);
 
   // run the turn and wait for it to settle, folding the reply text so a
@@ -3459,6 +3469,33 @@ const server = createServer(async (req, res) => {
           manifest: observerHostMcpCatalog.manifest,
           health: observerCapabilityGateway.stats(),
         },
+      });
+    }
+
+    if (method === "GET" && path === "/api/runtime/fleet-capabilities") {
+      try {
+        const rawLimit = Number(url.searchParams.get("limit") ?? 20);
+        const records = fleetCapabilityIndex.search({
+          query: url.searchParams.get("q") ?? "",
+          kind: url.searchParams.get("kind") ?? "",
+          surface: url.searchParams.get("surface") ?? "",
+          limit: Number.isFinite(rawLimit) ? rawLimit : 20,
+        });
+        return json(res, 200, { ...fleetCapabilityIndex.summary(), records });
+      } catch (error) {
+        return json(res, 503, { error: error instanceof Error ? error.message : "fleet capability index is unavailable" });
+      }
+    }
+
+    if (method === "GET" && path === "/api/runtime/role-overlays") {
+      return json(res, 200, {
+        policy: "guidance-only-no-added-authority",
+        roles: ROLE_OVERLAYS.map(({ id, label, summary, capabilityQueries }) => ({
+          id,
+          label,
+          summary,
+          capabilityQueries,
+        })),
       });
     }
 
@@ -4635,6 +4672,21 @@ const server = createServer(async (req, res) => {
       if (!text) return json(res, 400, { error: "text required" });
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
+      if (/^\/goal(?:\s|$)/i.test(text)) {
+        if (bot.busy) return json(res, 409, { error: "the bot is working — stop it before changing the shared goal" });
+        const task = store.taskByThread(bot.id, bot.threadId);
+        const outcome = await goalCommands.execute(text, {
+          botId: bot.id,
+          threadId: bot.threadId,
+          model: bot.modelSelection.model,
+          cwd: task?.cwd || bot.cwd || homedir(),
+        });
+        if (!outcome) return json(res, 400, { error: "invalid /goal command" });
+        store.titleTaskFromFirstMessage(bot.id, text, bot.threadId);
+        store.appendMessage(bot.threadId, { role: "user", kind: "text", text });
+        store.appendMessage(bot.threadId, { role: "bot", kind: "text", text: outcome.response });
+        return json(res, outcome.status, { ok: outcome.ok, command: "goal", status: outcome.record?.status ?? null });
+      }
       // Claude can accept the message inside its live turn. If the write
       // loses a race with turn settlement, or the engine cannot steer, the
       // existing server-side queue records it atomically for the next turn.
