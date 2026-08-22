@@ -1,4 +1,5 @@
-import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, safeStorage, screen, session, shell, systemPreferences, utilityProcess } from "electron";
+import { app, BrowserWindow, WebContentsView, clipboard, desktopCapturer, dialog, ipcMain, safeStorage, screen, session, shell, systemPreferences, utilityProcess } from "electron";
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
@@ -18,6 +19,8 @@ const { createDisplayMediaGuard, invokeDisplayMediaCallback, selectCaptureSource
   "./screen-preview.cjs",
 );
 const { STAGE_PREFIX: APPIMAGE_CUA_STAGE_PREFIX } = require("./cua-linux-bundle.cjs");
+const { desktopViewerUrl, sameDesktopViewerOrigin } = require("./desktop-viewer.cjs");
+const { createDesktopWorkspaceManager } = require("./desktop-workspace.cjs");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 127.0.0.1 explicitly — vite binds IPv4; a bare "localhost" here can
@@ -26,6 +29,12 @@ const DEV_URL = process.env.ELECTRON_START_URL ?? "http://127.0.0.1:5199";
 const DEFAULT_COMPOSIO_BROKER_URL = "https://openmausbot-composio.milindsoni201.workers.dev";
 let SERVER_PORT = 8799;
 const APP_ICON = path.join(__dirname, "resources/app-icon.png");
+let desktopViewerWindow = null;
+let desktopViewerOwner = null;
+let desktopViewerContextId = null;
+let desktopWorkspaceManager = null;
+let desktopWorkspaceOwner = null;
+let mainWindow = null;
 
 // GNOME groups the window with its installed desktop entry only when both
 // identities match. This must run before Electron becomes ready.
@@ -306,6 +315,169 @@ function respondToDisplayMediaRequest(callback, response) {
   }
 }
 
+function notifyDesktopViewer(open) {
+  if (!desktopViewerOwner?.isDestroyed()) {
+    desktopViewerOwner.send("desktop-viewer:state", {
+      open,
+      contextId: desktopViewerContextId,
+    });
+  }
+}
+
+function desktopViewerErrorPage(message, retryUrl) {
+  const escape = (value) =>
+    String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
+  return (
+    "data:text/html;charset=utf-8," +
+    encodeURIComponent(`<!doctype html><meta name="color-scheme" content="dark"><title>Desktop unavailable</title>
+      <body style="margin:0;display:grid;place-items:center;height:100vh;background:#070707;color:#f5f5f5;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif">
+        <main style="max-width:420px;padding:32px;text-align:center"><h2 style="margin:0 0 10px;font-size:18px">Couldn't open the live desktop</h2>
+        <p style="margin:0 0 20px;color:#a1a1aa;line-height:1.5">${escape(message)}</p>
+        <a href="${escape(retryUrl)}" target="_blank" rel="noreferrer" style="display:inline-block;border-radius:9px;background:#fff;color:#111;padding:9px 14px;text-decoration:none;font-weight:600">Open in browser</a></main>
+      </body>`)
+  );
+}
+
+function openDesktopViewer(owner, rawUrl, rawTitle, contextId) {
+  if (!owner || owner.isDestroyed()) throw new Error("The OpenMausBot window is unavailable");
+  const url = desktopViewerUrl(rawUrl);
+  const titleCandidate = Object.prototype.toString.call(rawTitle) === "[object String]" ? rawTitle.trim() : "";
+  const title = titleCandidate ? titleCandidate.slice(0, 80) : "Live desktop";
+
+  // Desktop URLs contain rotating access tokens. A newly minted URL replaces
+  // the old viewer instead of being retained anywhere after its window closes.
+  if (desktopViewerWindow && !desktopViewerWindow.isDestroyed()) desktopViewerWindow.close();
+  desktopViewerOwner = owner.webContents;
+  desktopViewerContextId =
+    Object.prototype.toString.call(contextId) === "[object String]" ? contextId.slice(0, 120) : null;
+
+  const viewer = new BrowserWindow({
+    width: 1220,
+    height: 820,
+    minWidth: 760,
+    minHeight: 520,
+    parent: owner,
+    modal: true,
+    show: false,
+    title,
+    icon: APP_ICON,
+    backgroundColor: "#070707",
+    autoHideMenuBar: true,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      // Keep provider cookies away from the app renderer and discard them on
+      // app exit. The secret-bearing URL is sufficient to authenticate.
+      partition: "openmausbot-desktop-viewer",
+    },
+  });
+  desktopViewerWindow = viewer;
+  const viewerOrigin = url.origin;
+
+  // VNC needs rendering, keyboard/mouse input and WebSockets — never host
+  // camera, microphone, geolocation, notifications, USB, or other privileged
+  // browser capabilities in this remote-content window.
+  viewer.webContents.session.setPermissionCheckHandler(() => false);
+  viewer.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+
+  viewer.on("ready-to-show", () => viewer.show());
+  viewer.on("closed", () => {
+    if (desktopViewerWindow !== viewer) return;
+    desktopViewerWindow = null;
+    notifyDesktopViewer(false);
+    desktopViewerOwner = null;
+    desktopViewerContextId = null;
+  });
+  viewer.on("page-title-updated", (event) => {
+    event.preventDefault();
+    viewer.setTitle(title);
+  });
+  viewer.webContents.setWindowOpenHandler(({ url: target }) => {
+    try {
+      const external = desktopViewerUrl(target);
+      void shell.openExternal(external.toString());
+    } catch {
+      // Ignore non-web and insecure URLs from the remote viewer.
+    }
+    return { action: "deny" };
+  });
+  viewer.webContents.on("will-navigate", (event, target) => {
+    if (sameDesktopViewerOrigin(target, viewerOrigin)) return;
+    event.preventDefault();
+    try {
+      void shell.openExternal(desktopViewerUrl(target).toString());
+    } catch {
+      // Keep privileged or malformed navigation out of the viewer.
+    }
+  });
+  viewer.webContents.on("did-fail-load", (_event, code, description, failedUrl, isMainFrame) => {
+    if (!isMainFrame || code === -3 || viewer.isDestroyed() || failedUrl.startsWith("data:")) return;
+    void viewer.loadURL(desktopViewerErrorPage(description || "The viewer did not respond.", url.toString()));
+  });
+
+  notifyDesktopViewer(true);
+  void viewer.loadURL(url.toString()).catch((error) => {
+    if (viewer.isDestroyed()) return;
+    void viewer.loadURL(desktopViewerErrorPage(error?.message ?? "The viewer did not respond.", url.toString()));
+  });
+  return true;
+}
+
+function ensureDesktopWorkspace(owner) {
+  if (!owner || owner.isDestroyed()) throw new Error("The OpenMausBot window is unavailable");
+  if (desktopWorkspaceManager) {
+    if (desktopWorkspaceOwner !== owner) {
+      throw new Error("The desktop workspace belongs to another app window");
+    }
+    return desktopWorkspaceManager;
+  }
+
+  desktopWorkspaceOwner = owner;
+  const manager = createDesktopWorkspaceManager({
+    owner,
+    createView: (options) => new WebContentsView(options),
+    partitionPrefix: `openmausbot-desktop-workspace-${randomUUID()}`,
+    notify: (state) => {
+      if (!owner.isDestroyed() && !owner.webContents.isDestroyed()) {
+        owner.webContents.send("desktop-workspace:state", state);
+      }
+    },
+  });
+  desktopWorkspaceManager = manager;
+
+  // Native child views outlive the renderer DOM unless we explicitly tear
+  // them down. Reloads, renderer crashes and owner destruction all close both
+  // panes without retaining their secret-bearing noVNC URLs.
+  owner.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) manager.closeAll();
+  });
+  owner.webContents.on("render-process-gone", () => manager.closeAll());
+  owner.once("closed", () => {
+    manager.closeAll();
+    if (desktopWorkspaceManager === manager) {
+      desktopWorkspaceManager = null;
+      desktopWorkspaceOwner = null;
+    }
+  });
+  return manager;
+}
+
+function desktopWorkspaceForEvent(event, create = false) {
+  const owner = mainWindow;
+  if (!owner || owner.isDestroyed() || event.sender !== owner.webContents) {
+    throw new Error("The desktop workspace is available only to the main app window");
+  }
+  if (desktopWorkspaceManager && desktopWorkspaceOwner !== owner) {
+    throw new Error("The desktop workspace belongs to another app window");
+  }
+  return create ? ensureDesktopWorkspace(owner) : desktopWorkspaceManager;
+}
+
 ipcMain.on("screen:preview-intent", (event) => {
   event.returnValue = displayMediaGuard.begin(event.senderFrame);
 });
@@ -338,6 +510,10 @@ function createWindow() {
       contextIsolation: true,
       preload: path.join(__dirname, "preload.cjs"),
     },
+  });
+  mainWindow = win;
+  win.once("closed", () => {
+    if (mainWindow === win) mainWindow = null;
   });
 
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -520,6 +696,36 @@ ipcMain.handle("desktop:open-external", async (_event, rawUrl) => {
   return true;
 });
 
+// The Box VNC viewer must be a top-level page for its token exchange. A
+// sandboxed modal BrowserWindow satisfies that requirement while keeping the
+// live desktop inside OpenMausBot instead of sending the person to a browser.
+ipcMain.handle("desktop-viewer:open", (event, rawUrl, title, contextId) => {
+  const owner = BrowserWindow.fromWebContents(event.sender);
+  return openDesktopViewer(owner, rawUrl, title, contextId);
+});
+
+// Two Local VM desktops share the existing app BrowserWindow. The renderer
+// supplies only layout and intent; URL validation, sandboxing, session
+// isolation and the one-interactive-pane invariant stay in the main process.
+ipcMain.handle("desktop-workspace:open", (event, input) =>
+  desktopWorkspaceForEvent(event, true).open(input),
+);
+ipcMain.handle("desktop-workspace:layout", (event, items) => {
+  const manager = desktopWorkspaceForEvent(event);
+  if (!manager) return false;
+  return manager.layout(items);
+});
+ipcMain.handle("desktop-workspace:set-interactive", (event, contextId) => {
+  const manager = desktopWorkspaceForEvent(event);
+  if (!manager) return contextId == null;
+  return manager.setInteractive(contextId);
+});
+ipcMain.handle("desktop-workspace:close", (event, contextId) => {
+  const manager = desktopWorkspaceForEvent(event);
+  if (!manager) return true;
+  return manager.close(contextId);
+});
+
 ipcMain.handle("perm:status", () => ({
   mic:
     nativeActions.appleMediaPermissions
@@ -543,6 +749,7 @@ ipcMain.handle("perm:open-settings", (_event, pane) => {
     mic: "Privacy_Microphone",
     screen: "Privacy_ScreenCapture",
     speech: "Privacy_SpeechRecognition",
+    accessibility: "Privacy_Accessibility",
   };
   // own-property lookup only — a renderer-supplied "__proto__"/"constructor"
   // would otherwise resolve up the prototype chain to a truthy object
@@ -608,6 +815,7 @@ const CREDENTIAL_PATCH = {
   boxToken: (value) => ({ box: { token: value } }),
   opencodeGoApiKey: (value) => ({ opencodeGo: { apiKey: value } }),
   ttsKey: (value) => ({ tts: { key: value } }),
+  openaiImageApiKey: (value) => ({ imageGen: { key: value } }),
 };
 
 ipcMain.handle("credential:set", async (_event, name, value) => {
