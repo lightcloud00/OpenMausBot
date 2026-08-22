@@ -263,7 +263,7 @@ export class TelemetryManager {
       ...this.healthState[kind],
       running: false,
       degraded: true,
-      lastError: summary(String(redactSecrets(message)), 300),
+      lastError: summary(String(this.sanitize(message)), 300),
     };
   }
 

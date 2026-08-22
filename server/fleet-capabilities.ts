@@ -140,7 +140,12 @@ export class FleetCapabilityIndex {
   }
 
   private catalog(): LoadedCatalog {
-    const info = statSync(this.path);
+    let info: ReturnType<typeof statSync>;
+    try {
+      info = statSync(this.path);
+    } catch {
+      throw new Error("fleet capability index is unavailable or oversized");
+    }
     if (!info.isFile() || info.size <= 0 || info.size > MAX_INDEX_BYTES) {
       throw new Error("fleet capability index is unavailable or oversized");
     }

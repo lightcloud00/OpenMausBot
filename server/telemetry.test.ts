@@ -209,6 +209,29 @@ describe("TelemetryManager", () => {
     manager.shutdown();
   });
 
+  it("redacts protected values from degraded sink health", () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-telemetry-health-secret-"));
+    dirs.push(dir);
+    const sinks = { sentry: fakeSink(), langfuse: fakeSink() };
+    const manager = new TelemetryManager({
+      dataDir: dir,
+      sinkPath: "/unused",
+      sourceSha: "b".repeat(40),
+      release: "dev",
+      spawnSink: (kind) => sinks[kind].child,
+    });
+    const canary = "post-boot-health-secret-493827";
+    process.env.POST_BOOT_TELEMETRY_TOKEN = canary;
+
+    sinks.sentry.child.stdout.write(
+      `${JSON.stringify({ kind: "error", message: `sink rejected ${canary}` })}\n`,
+    );
+
+    expect(manager.health().sentry.lastError).not.toContain(canary);
+    expect(manager.health().sentry.lastError).toContain("redacted");
+    manager.shutdown();
+  });
+
   it("keeps concurrent turns on the same thread isolated by exact turn identity", () => {
     const dir = mkdtempSync(join(tmpdir(), "omb-telemetry-concurrent-"));
     dirs.push(dir);

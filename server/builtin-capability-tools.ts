@@ -34,3 +34,47 @@ export const BUILTIN_CAPABILITY_TOOLS = [
     inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
   },
 ] as const;
+
+/** Cycle-free source of truth for the metadata-only fleet discovery surface. */
+export const FLEET_BUILTIN_TOOLS = [
+  {
+    name: "search_capabilities",
+    description: "Search the metadata-only fleet index for MCPs, skills, scripts, and other capabilities without loading their schemas or instructions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        kind: { type: "string" },
+        surface: { type: "string" },
+        limit: { type: "number", minimum: 1, maximum: 25 },
+      },
+    },
+  },
+  {
+    name: "suggest_capabilities",
+    description: "Suggest a small task-relevant set of fleet capability metadata and advisory role overlays.",
+    inputSchema: {
+      type: "object",
+      properties: { task: { type: "string" }, limit: { type: "number", minimum: 1, maximum: 25 } },
+      required: ["task"],
+    },
+  },
+  {
+    name: "select_capability",
+    description: "Select one exact fleet capability and return its safe lazy route, if this runtime can verify one.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+    },
+  },
+  {
+    name: "suggest_role_overlays",
+    description: "Suggest non-privileged portfolio specialist roles for the current task.",
+    inputSchema: {
+      type: "object",
+      properties: { task: { type: "string" }, limit: { type: "number", minimum: 1, maximum: 5 } },
+      required: ["task"],
+    },
+  },
+] as const;

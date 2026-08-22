@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createCapabilityProfileManifest } from "./access-profile.ts";
 import { CapabilityGateway, credentialBackendSpawnSpec } from "./capability-gateway.ts";
 import { FleetCapabilityIndex } from "./fleet-capabilities.ts";
-import type { HostMcpCatalog } from "./host-mcp.ts";
+import { loadHostMcpCatalog, type HostMcpCatalog } from "./host-mcp.ts";
 
 const FAKE = join(dirname(fileURLToPath(import.meta.url)), "testing", "fake-capability-mcp.ts");
 const FAKE_CREDENTIAL_BROKER = join(dirname(fileURLToPath(import.meta.url)), "testing", "fake-credential-broker.ts");
@@ -427,6 +427,27 @@ describe("CapabilityGateway", () => {
     const selected = await gateway.callTool(TOKEN, "openmaus-fleet", "select_capability", { id: "mcp:test" });
     expect(selected).toMatchObject({ status: "ready", route: { serverNames: ["test"] } });
     expect(gateway.stats().activeBackends).toEqual([]);
+  });
+
+  it("keeps host catalog and gateway built-in inventories identical and defined", async () => {
+    const hostCatalog = loadHostMcpCatalog({
+      home: "/does/not/exist",
+      runCodexList: () => "[]",
+      readOpenCodeConfig: () => '{"mcp":{}}',
+      runHermesList: () => "{}",
+    });
+    const gateway = new CapabilityGateway(hostCatalog);
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, { botId: "bot", threadId: "thread" });
+
+    const manifest = gateway.inventory(TOKEN).manifest;
+    const fleetTools = await gateway.listTools(TOKEN, "openmaus-fleet");
+    const listedInventory = fleetTools.tools.map((tool: { name: string }) => `openmaus-fleet:${tool.name}`).sort();
+
+    expect(manifest).toEqual(hostCatalog.manifest);
+    expect(manifest.toolInventory.filter((entry) => entry.startsWith("openmaus-fleet:"))).toEqual(listedInventory);
+    expect(manifest.toolInventory.some((entry) => entry.includes("undefined"))).toBe(false);
+    expect(fleetTools.tools.every((tool: { name?: unknown }) => typeof tool.name === "string" && tool.name.length > 0)).toBe(true);
   });
 
   it("rejects whole-repository deletion and scrubs exact canaries before host execution", async () => {

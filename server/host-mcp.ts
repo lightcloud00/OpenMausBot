@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createCapabilityProfileManifest, type CapabilityProfileManifest } from "./access-profile.ts";
 import { augmentedPath } from "./env-path.ts";
 import { writeFileAtomic } from "./atomic.ts";
-import { BUILTIN_CAPABILITY_TOOLS } from "./builtin-capability-tools.ts";
+import { BUILTIN_CAPABILITY_TOOLS, FLEET_BUILTIN_TOOLS } from "./builtin-capability-tools.ts";
 
 export type HostMcpServer =
   | { type: "builtin"; family?: "host" | "fleet" }
@@ -28,13 +28,6 @@ export interface HostMcpCatalog {
 
 const BLOCKED_SERVER = /(?:^|[-_.])cred(?:ential)?vault(?:$|[-_.])|credvault/i;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/;
-const FLEET_BUILTIN_TOOLS = [
-  "search_capabilities",
-  "suggest_capabilities",
-  "select_capability",
-  "suggest_role_overlays",
-] as const;
-
 function safeName(value: unknown): string | null {
   return typeof value === "string" && NAME.test(value) && !BLOCKED_SERVER.test(value) ? value : null;
 }
@@ -321,7 +314,7 @@ export function loadHostMcpCatalog(options: {
   const inventory = Object.entries(servers).flatMap(([name, server]) =>
     server.type === "builtin"
       ? server.family === "fleet"
-        ? FLEET_BUILTIN_TOOLS.map((tool) => `${name}:${tool}`)
+        ? FLEET_BUILTIN_TOOLS.map((tool) => `${name}:${tool.name}`)
         : BUILTIN_CAPABILITY_TOOLS.map((tool) => `${name}:${tool.name}`)
       : [name],
   );

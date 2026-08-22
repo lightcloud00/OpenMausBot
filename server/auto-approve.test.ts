@@ -220,11 +220,13 @@ describe("full-task-scoped hard denials", () => {
     symlinkSync(repo, link);
     try {
       expect(fullTaskScopedHardDeny("Bash", "rm -rf .", { cwd: repo })).toBe("catastrophic-destruction");
+      expect(fullTaskScopedHardDeny("Bash", "rm -rf *", { cwd: repo })).toBe("catastrophic-destruction");
       expect(fullTaskScopedHardDeny("Bash", `rm -rf '${repo}'`, { cwd: root })).toBe("catastrophic-destruction");
       expect(fullTaskScopedHardDeny("delete_directory", JSON.stringify({ path: link }), { cwd: root })).toBe("catastrophic-destruction");
       expect(fullTaskScopedHardDeny("filesystem_delete", JSON.stringify({ path: "/", recursive: true }), { cwd: root })).toBe("catastrophic-destruction");
       expect(fullTaskScopedHardDeny("filesystem_delete", JSON.stringify({ path: homedir(), recursive: true }), { cwd: root })).toBe("catastrophic-destruction");
       expect(fullTaskScopedHardDeny("Bash", "rm -rf build", { cwd: repo })).toBeNull();
+      expect(fullTaskScopedHardDeny("Bash", "rm -rf *", { cwd: subdir })).toBeNull();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

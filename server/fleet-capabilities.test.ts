@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -48,6 +48,28 @@ function fixture() {
 }
 
 describe("fleet capability metadata index", () => {
+  it("returns a bounded error when the configured index is missing", () => {
+    const root = mkdtempSync(join(tmpdir(), "omb-fleet-caps-missing-"));
+    try {
+      const missingPath = join(root, "missing", "capabilities.v1.json");
+      const index = new FleetCapabilityIndex(missingPath);
+      let thrown: unknown;
+
+      try {
+        index.summary();
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(Error);
+      const message = thrown instanceof Error ? thrown.message : String(thrown);
+      expect(message).toBe("fleet capability index is unavailable or oversized");
+      expect(message).not.toContain(missingPath);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("loads only bounded metadata for search and summary", () => {
     const index = new FleetCapabilityIndex(fixture());
     expect(index.summary()).toMatchObject({ recordCount: 3, policy: "metadata-only-and-task-lazy" });

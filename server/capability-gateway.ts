@@ -7,7 +7,7 @@ import { z } from "zod";
 
 import { createCapabilityProfileManifest } from "./access-profile.ts";
 import { fullTaskScopedHardDeny } from "./auto-approve.ts";
-import { BUILTIN_CAPABILITY_TOOLS } from "./builtin-capability-tools.ts";
+import { BUILTIN_CAPABILITY_TOOLS, FLEET_BUILTIN_TOOLS } from "./builtin-capability-tools.ts";
 import { augmentedPath } from "./env-path.ts";
 import type { FleetCapabilityIndex } from "./fleet-capabilities.ts";
 import type { HostMcpCatalog, HostMcpServer } from "./host-mcp.ts";
@@ -29,48 +29,6 @@ const REQUEST_TIMEOUT_MS = 60_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60_000;
 const MAX_TOOL_RESULT_BYTES = 256 * 1024;
 const MAX_INTERACTIVE_RESULT_BYTES = 8 * 1024 * 1024;
-const FLEET_BUILTIN_TOOLS = [
-  {
-    name: "search_capabilities",
-    description: "Search the metadata-only fleet index for MCPs, skills, scripts, and other capabilities without loading their schemas or instructions.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string" },
-        kind: { type: "string" },
-        surface: { type: "string" },
-        limit: { type: "number", minimum: 1, maximum: 25 },
-      },
-    },
-  },
-  {
-    name: "suggest_capabilities",
-    description: "Suggest a small task-relevant set of fleet capability metadata and advisory role overlays.",
-    inputSchema: {
-      type: "object",
-      properties: { task: { type: "string" }, limit: { type: "number", minimum: 1, maximum: 25 } },
-      required: ["task"],
-    },
-  },
-  {
-    name: "select_capability",
-    description: "Select one exact fleet capability and return its safe lazy route, if this runtime can verify one.",
-    inputSchema: {
-      type: "object",
-      properties: { id: { type: "string" } },
-      required: ["id"],
-    },
-  },
-  {
-    name: "suggest_role_overlays",
-    description: "Suggest non-privileged portfolio specialist roles for the current task.",
-    inputSchema: {
-      type: "object",
-      properties: { task: { type: "string" }, limit: { type: "number", minimum: 1, maximum: 5 } },
-      required: ["task"],
-    },
-  },
-] as const;
 const SAFE_ENV_NAMES = [
   "HOME",
   "USERPROFILE",
@@ -770,8 +728,8 @@ export class CapabilityGateway {
   }
 
   private async callBuiltin(token: string, serverName: string, tool: string, args: JsonObject): Promise<any> {
-    const turn = this.activeTurns.get(token);
     this.requireTurn(token);
+    const turn = this.activeTurns.get(token);
     const server = this.serverFor(token, serverName);
     if (server?.type !== "builtin") throw new Error("unknown built-in capability server");
     if (server.family === "fleet") {

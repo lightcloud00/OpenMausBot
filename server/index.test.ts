@@ -325,6 +325,40 @@ describe("harness HTTP API", () => {
     });
   });
 
+  it("bounds concurrent external capability turns per client", async () => {
+    const endpoint = JSON.parse(readFileSync(join(home, ".openmausbot", "runtime", "capability-gateway.json"), "utf8"));
+    const headers = {
+      authorization: `Bearer ${endpoint.authorization}`,
+      "content-type": "application/json",
+    };
+    const tokens: string[] = [];
+
+    try {
+      for (let index = 0; index < 8; index += 1) {
+        const opened = await fetch(`${BASE}/api/internal/capabilities/turns`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ client: "bounded-client", threadId: `bounded-client-${index}` }),
+        });
+        expect(opened.status).toBe(201);
+        tokens.push(((await opened.json()) as { turnToken: string }).turnToken);
+      }
+
+      const rejected = await fetch(`${BASE}/api/internal/capabilities/turns`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ client: "bounded-client", threadId: "bounded-client-overflow" }),
+      });
+      expect(rejected.status).toBe(429);
+      expect(await rejected.json()).toEqual({ error: "external capability turn limit reached for this client" });
+    } finally {
+      await Promise.all(tokens.map((token) => fetch(`${BASE}/api/internal/capabilities/turns/${token}`, {
+        method: "DELETE",
+        headers,
+      })));
+    }
+  });
+
   it("serves packaged UI assets and preserves API 404s", async () => {
     const root = await fetch(`${BASE}/`);
     expect(root.status).toBe(200);

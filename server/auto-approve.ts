@@ -335,8 +335,11 @@ function resolveCandidatePath(candidate: string, cwd?: string): string | null {
   // A glob expands children of its non-glob parent. Classify that parent so
   // broad targets such as /* and /Users/* cannot disappear from the guard,
   // while scoped targets such as build/* continue to resolve inside the cwd.
+  // A basename-only glob has no written parent, so its parent is the cwd.
   const glob = clean.search(/[*?{}[\]]/);
-  const target = glob === -1 ? clean : clean.slice(0, glob).replace(/[^/\\]*$/, "");
+  const target = glob === -1
+    ? clean
+    : clean.slice(0, glob).replace(/[^/\\]*$/, "") || ".";
   if (!target) return null;
   const base = cwd || process.cwd();
   const expanded = target
