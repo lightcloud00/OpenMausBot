@@ -21,6 +21,10 @@ export interface HostMcpCatalog {
 
 const BLOCKED_SERVER = /(?:^|[-_.])cred(?:ential)?vault(?:$|[-_.])|credvault/i;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/;
+const FLEET_BRIDGE_NAME = "aos-fleet-bridge";
+const FLEET_BRIDGE_CODEX_DUPLICATE = /^aos-fleet-bridge-codex(?:-\d+)?$/;
+const FLEET_BRIDGE_SCRIPT = /(?:^|[\\/])aos_fleet_bridge_mcp\.py$/;
+const OPENMAUS_SURFACE = "openmausbot";
 
 function safeName(value: unknown): string | null {
   return typeof value === "string" && NAME.test(value) && !BLOCKED_SERVER.test(value) ? value : null;
@@ -149,6 +153,29 @@ function mergeCatalogs(
   return merged;
 }
 
+/** Pin the imported bridge to OpenMausBot instead of the host CLI identity. */
+function pinFleetBridgeForOpenMaus(
+  servers: Record<string, HostMcpServer>,
+): Record<string, HostMcpServer> {
+  const server = servers[FLEET_BRIDGE_NAME];
+  const pinned = { ...servers };
+  for (const name of Object.keys(pinned)) {
+    if (FLEET_BRIDGE_CODEX_DUPLICATE.test(name)) delete pinned[name];
+  }
+  if (!server || server.type !== "stdio") return pinned;
+  const surfaceIndex = server.args.indexOf("--surface");
+  const scriptCount = server.args.filter((argument) => FLEET_BRIDGE_SCRIPT.test(argument)).length;
+  const surfaceCount = server.args.filter((argument) => argument === "--surface").length;
+  if (scriptCount !== 1 || surfaceCount !== 1 || surfaceIndex + 1 >= server.args.length) {
+    delete pinned[FLEET_BRIDGE_NAME];
+    return pinned;
+  }
+  const args = [...server.args];
+  args[surfaceIndex + 1] = OPENMAUS_SURFACE;
+  pinned[FLEET_BRIDGE_NAME] = { ...server, args };
+  return pinned;
+}
+
 export function loadHostMcpCatalog(options: {
   home?: string;
   env?: NodeJS.ProcessEnv;
@@ -181,7 +208,7 @@ export function loadHostMcpCatalog(options: {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") codexState = "invalid";
   }
   const servers: Record<string, HostMcpServer> = {
-    ...mergeCatalogs(claude, codex),
+    ...pinFleetBridgeForOpenMaus(mergeCatalogs(claude, codex)),
     // Provider-native shell/file tools are not available to Manus Desktop
     // or the Hermes route. Keep one app-owned core surface in the same
     // gateway so every full-task-scoped client receives the same baseline.

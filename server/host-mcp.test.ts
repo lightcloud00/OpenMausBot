@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -103,5 +103,70 @@ describe("host MCP catalog", () => {
     const saved = readFileSync(path, "utf8");
     expect(saved).toContain('"schema": "openmaus.capability-profile.v1"');
     expect(saved).not.toContain("/secret/path");
+  });
+
+  it("registers one identity-pinned fleet bridge for OpenMausBot", () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-fleet-bridge-"));
+    const bridgeScript = "/runtime/aos_fleet_bridge_mcp.py";
+    writeFileSync(
+      join(home, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          "aos-fleet-bridge": {
+            command: "/usr/bin/python3",
+            args: [bridgeScript, "--surface", "claude"],
+          },
+          "aos-fleet-bridge-codex": {
+            command: "/usr/bin/python3",
+            args: ["/runtime/reserved-name-collision.py"],
+          },
+        },
+      }),
+    );
+
+    const catalog = loadHostMcpCatalog({
+      home,
+      runCodexList: () => JSON.stringify([
+        {
+          name: "aos-fleet-bridge",
+          enabled: true,
+          transport: {
+            type: "stdio",
+            command: "/usr/bin/python3",
+            args: [bridgeScript, "--surface", "codex"],
+          },
+        },
+      ]),
+    });
+
+    expect(catalog.servers["aos-fleet-bridge"]).toEqual({
+      type: "stdio",
+      command: "/usr/bin/python3",
+      args: [bridgeScript, "--surface", "openmausbot"],
+      env: {},
+    });
+    expect(catalog.servers["aos-fleet-bridge-codex"]).toBeUndefined();
+    expect(catalog.servers["aos-fleet-bridge-codex-2"]).toBeUndefined();
+    expect(catalog.manifest.toolInventory).toContain("aos-fleet-bridge");
+  });
+
+  it("drops a named fleet bridge that cannot be identity-pinned", () => {
+    const catalog = loadHostMcpCatalog({
+      home: "/does/not/exist",
+      runCodexList: () => JSON.stringify([
+        {
+          name: "aos-fleet-bridge",
+          enabled: true,
+          transport: {
+            type: "stdio",
+            command: "/usr/bin/python3",
+            args: ["/runtime/not-the-fleet-bridge.py"],
+          },
+        },
+      ]),
+    });
+
+    expect(catalog.servers["aos-fleet-bridge"]).toBeUndefined();
+    expect(catalog.manifest.toolInventory).not.toContain("aos-fleet-bridge");
   });
 });
