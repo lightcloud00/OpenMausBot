@@ -40,6 +40,7 @@ export async function readStableAgentGraphFile(
   workspaceRoot: string,
   rawPath: string,
   maximumBytes = AGENT_GRAPH_MAX_FILE_BYTES,
+  hooks: { afterPathValidation?: () => void | Promise<void> } = {},
 ): Promise<StableAgentGraphFileRead> {
   if (
     typeof workspaceRoot !== "string" || !workspaceRoot.trim() ||
@@ -71,6 +72,16 @@ export async function readStableAgentGraphFile(
     }
   }
 
+  // Component checks alone are not enough: a writable parent can be renamed
+  // and replaced with a symlink between the final lstat above and open().
+  // Bind the canonical target on both sides of the descriptor read. The
+  // descriptor/path inode comparison below then rejects a parent restored to
+  // a different in-workspace file after an outside target was opened.
+  if (await realpath(candidate) !== candidate) {
+    throw new Error("agent graph evidence paths cannot traverse symlinks");
+  }
+  await hooks.afterPathValidation?.();
+
   const handle = await open(candidate, fsConstants.O_RDONLY | noFollowFlag());
   try {
     const before = await handle.stat();
@@ -80,10 +91,12 @@ export async function readStableAgentGraphFile(
     if (before.size > maximumBytes) throw new Error("agent graph evidence exceeds the bounded file size");
     const body = await handle.readFile();
     const after = await handle.stat();
+    const canonicalAfter = await realpath(candidate);
     const pathAfter = await lstat(candidate);
     const rootAfter = await lstat(root);
     if (
       !stableFile(before, after) || !stableFile(after, pathAfter) ||
+      canonicalAfter !== candidate ||
       !stableWorkspace(rootBefore, rootAfter) || await realpath(root) !== root ||
       body.byteLength !== after.size
     ) throw new Error("agent graph evidence changed while it was being read");

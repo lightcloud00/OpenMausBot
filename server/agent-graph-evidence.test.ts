@@ -1,4 +1,4 @@
-import { linkSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdtempSync, mkdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -47,5 +47,20 @@ describe("stable agent graph evidence reads", () => {
     writeFileSync(join(root, "single.txt"), "inside\n");
     linkSync(join(root, "single.txt"), join(root, "alias.txt"));
     await expect(readStableAgentGraphFile(root, "single.txt")).rejects.toThrow(/single-link/);
+  });
+
+  it.runIf(process.platform !== "win32")("rejects a parent swapped to an outside symlink after validation", async () => {
+    const root = workspace();
+    const outside = mkdtempSync(join(tmpdir(), "omb-agent-evidence-race-outside-"));
+    temporary.push(outside);
+    writeFileSync(join(root, "src", "result.txt"), "inside\n");
+    writeFileSync(join(outside, "result.txt"), "outside\n");
+
+    await expect(readStableAgentGraphFile(root, "src/result.txt", undefined, {
+      afterPathValidation: () => {
+        renameSync(join(root, "src"), join(root, "src-before-swap"));
+        symlinkSync(outside, join(root, "src"));
+      },
+    })).rejects.toThrow(/changed while it was being read/);
   });
 });
