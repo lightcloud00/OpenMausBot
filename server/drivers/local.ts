@@ -264,6 +264,7 @@ export const LocalDriver: ProviderDriver<LocalConfig> = {
             emit({
               ...base(turn.threadId, turnId),
               type: "turn.completed",
+              turnToken: undefined,
               ok: true,
               stopReason: null,
               cost: null,
@@ -273,6 +274,7 @@ export const LocalDriver: ProviderDriver<LocalConfig> = {
             emit({
               ...base(turn.threadId, turnId),
               type: "turn.completed",
+              turnToken: undefined,
               ok: true,
               stopReason: null,
               cost: null,
@@ -286,6 +288,7 @@ export const LocalDriver: ProviderDriver<LocalConfig> = {
           emit({
             ...base(turn.threadId, turnId),
             type: "turn.completed",
+            turnToken: undefined,
             ok: false,
             stopReason: aborted ? "interrupted" : "error",
             cost: null,

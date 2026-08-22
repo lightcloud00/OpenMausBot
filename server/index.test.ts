@@ -435,7 +435,10 @@ describe("harness HTTP API", () => {
       const retrieval = await fetch(`${BASE}/api/internal/capabilities/retrieval`, {
         method: "POST",
         headers: { ...headers, "x-openmaus-turn-token": turnToken },
-        body: JSON.stringify({ query: "inspect this workspace", cwd: home }),
+        body: JSON.stringify({
+          query: "inspect this workspace",
+          cwd: join(home, ".openmausbot", "workspaces", bot.id),
+        }),
       });
       expect(retrieval.status).toBe(200);
       expect((await retrieval.json() as { result: { schema: string } }).result.schema).toBe("openmaus.retrieval-context.v1");
@@ -709,6 +712,7 @@ describe("harness HTTP API", () => {
     const created = await api("POST", "/api/bots");
     expect(created.status).toBe(201);
     const bot = created.body.bot;
+    expect(bot.retrievalProfile).toBe("off");
 
     const patched = await api("PATCH", `/api/bots/${bot.id}`, { name: "Renamed", pinned: true });
     expect(patched.status).toBe(200);
@@ -730,6 +734,12 @@ describe("harness HTTP API", () => {
     expect((await api("PATCH", `/api/bots/${bot.id}`, { composio: "yes" })).status).toBe(400);
     const gated = await api("PATCH", `/api/bots/${bot.id}`, { composio: false });
     expect(gated.status).toBe(200);
+
+    expect((await api("PATCH", `/api/bots/${bot.id}`, { retrievalProfile: "full-task-scoped" })).status).toBe(400);
+    const retrievalEnabled = await api("PATCH", `/api/bots/${bot.id}`, { retrievalProfile: "task-scoped" });
+    expect(retrievalEnabled.status).toBe(200);
+    expect(retrievalEnabled.body.bot.retrievalProfile).toBe("task-scoped");
+    expect((await api("PATCH", `/api/bots/${bot.id}`, { retrievalProfile: "off" })).body.bot.retrievalProfile).toBe("off");
 
     // sidebar sections: assign, round-trip, trim, clear — and the field
     // drops off the record entirely once cleared rather than lingering
@@ -871,6 +881,7 @@ describe("harness HTTP API", () => {
         { notifications: "yes" },
         { voice: null },
         { speakReplies: 1 },
+        { retrievalProfile: "task-scoped" },
       ]) {
         expect((await api("PATCH", `/api/bots/${bot.id}/profile`, invalid)).status).toBe(400);
       }

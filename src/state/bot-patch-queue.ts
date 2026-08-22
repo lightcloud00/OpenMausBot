@@ -25,6 +25,7 @@ export type BotUpdatePatch = Partial<
     | "chiefOfStaff"
     | "approvePeerComms"
     | "composio"
+    | "retrievalProfile"
     | "modelSelection"
   >
 > & {

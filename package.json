@@ -37,6 +37,7 @@
     "test:updater": "node --test electron/updater-coordinator.node-test.mjs",
     "test:desktop-viewer": "node --test electron/desktop-viewer.node-test.mjs",
     "bench:observation": "node --experimental-strip-types scripts/bench-observation.ts",
+    "migrate:retrieval-profile": "node --experimental-strip-types scripts/migrate-retrieval-profile.ts",
     "test:watch": "vitest",
     "test:cua": "pnpm build:cua && node scripts/smoke-cua.mjs",
     "test:cua-container": "node scripts/smoke-cua-container.mjs",

@@ -653,6 +653,12 @@ export class CapabilityGateway {
     return this.activeTurns.get(token)?.graphPermissionClass;
   }
 
+  turnContext(token: string): Readonly<Pick<ActiveTurn, "botId" | "threadId" | "cwd">> {
+    this.requireTurn(token);
+    const turn = this.activeTurns.get(token)!;
+    return { botId: turn.botId, threadId: turn.threadId, cwd: turn.cwd };
+  }
+
   private requireTurn(token: string): void {
     if (!this.ownsTurn(token)) throw new Error("capability request rejected: turn is no longer active");
     const turn = this.activeTurns.get(token)!;

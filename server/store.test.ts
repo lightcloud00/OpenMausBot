@@ -27,6 +27,7 @@ describe("Store", () => {
     expect(messages[1].kind).toBe("options");
     expect(messages[1].card?.options.length).toBeGreaterThan(1);
     expect(bot.modelSelection).toEqual(selection());
+    expect(bot.retrievalProfile).toBe("off");
   });
 
   it("createBot with seedMessages:false starts with an empty transcript", () => {
@@ -73,6 +74,20 @@ describe("Store", () => {
     const reloaded = new Store(selection);
     expect(reloaded.bot(observer.id)?.accessProfile).toBe("observer-router");
     expect(reloaded.bot(invalid.id)?.accessProfile).toBeUndefined();
+  });
+
+  it("persists task-scoped retrieval independently and treats absent legacy state as off", () => {
+    const store = new Store(selection);
+    const enabled = store.createBot();
+    const legacy = store.createBot();
+    store.patchBot(enabled.id, { retrievalProfile: "task-scoped" });
+    const raw: BotRecord[] = JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"));
+    delete raw.find((bot) => bot.id === legacy.id)!.retrievalProfile;
+    writeFileSync(join(DATA_DIR, "bots.json"), JSON.stringify(raw));
+
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(enabled.id)?.retrievalProfile).toBe("task-scoped");
+    expect(reloaded.bot(legacy.id)?.retrievalProfile ?? "off").toBe("off");
   });
 
   it("rotates colors across created bots", () => {
