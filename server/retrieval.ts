@@ -9,6 +9,7 @@ import { z } from "zod";
 import type { RetrievalProfile } from "../shared/retrieval-profile.ts";
 import { PROVIDER_CREDENTIAL_ENV, WORKSPACE_CREDENTIAL_ENV } from "./config.ts";
 import { augmentedPath } from "./env-path.ts";
+import { execCli } from "./procs.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { parseJson, type JsonValue } from "./schema.ts";
 
@@ -301,7 +302,11 @@ function defaultSourceRetrieve(request: OpenMausRetrievalRequest): Promise<JsonV
     request.truth,
   ];
   return new Promise((resolvePromise, rejectPromise) => {
-    execFile(
+    // Use the same no-shell resolver as the native agent drivers. Windows
+    // cannot execute a Node shebang script (or an npm .cmd shim) directly,
+    // while execCli resolves both to their real node entrypoint without
+    // exposing the query or evidence contract to cmd.exe.
+    execCli(
       router,
       args,
       {

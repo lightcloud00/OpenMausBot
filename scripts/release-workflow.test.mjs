@@ -1,7 +1,10 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 
-const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
+// Git's Windows checkout converts the workflow to CRLF. The gate is YAML and
+// shell source, so test its logical lines rather than the host checkout style.
+const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8")
+  .replace(/\r\n?/g, "\n");
 const sha = "0123456789abcdef0123456789abcdef01234567";
 
 const extractGate = () => {

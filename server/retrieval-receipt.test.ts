@@ -67,8 +67,13 @@ describe("retrieval receipt persistence", () => {
     const serialized = JSON.stringify(readback);
     expect(serialized).not.toContain("fenced evidence é");
     expect(serialized).not.toMatch(/"(?:query|snippet|excerpt)"\s*:/i);
-    expect(statSync(directPath!).mode & 0o777).toBe(0o600);
-    expect(statSync(join(dataDir, "retrieval-receipts")).mode & 0o777).toBe(0o700);
+    // NTFS permissions are represented by ACLs; Node reports synthetic 0666
+    // mode bits there even after chmod. Keep the exact owner-only regression
+    // on platforms whose filesystems expose POSIX modes.
+    if (process.platform !== "win32") {
+      expect(statSync(directPath!).mode & 0o777).toBe(0o600);
+      expect(statSync(join(dataDir, "retrieval-receipts")).mode & 0o777).toBe(0o700);
+    }
   });
 
   it("fails open when the receipt directory cannot be created", () => {
