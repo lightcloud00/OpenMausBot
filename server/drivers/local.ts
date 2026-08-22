@@ -179,6 +179,29 @@ export const LocalDriver: ProviderDriver<LocalConfig> = {
       if (!reader) throw new Error(`${host.label} returned no response body`);
       const decoder = new TextDecoder();
       let buffer = "";
+      const consume = (line: string) => {
+        if (!line.startsWith("data:")) return;
+        const data = line.slice(5).trim();
+        if (!data || data === "[DONE]") return;
+        let decoded: unknown;
+        try {
+          decoded = JSON.parse(data);
+        } catch {
+          return;
+        }
+        const parsed = streamChunkSchema.safeParse(decoded);
+        if (!parsed.success) return;
+        const chunk = parsed.data;
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (delta) {
+          text += delta;
+          onDelta(delta);
+        }
+        if (chunk.usage) usage = {
+          input: chunk.usage.prompt_tokens ?? 0,
+          output: chunk.usage.completion_tokens ?? 0,
+        };
+      };
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -188,29 +211,11 @@ export const LocalDriver: ProviderDriver<LocalConfig> = {
           const line = buffer.slice(0, newline).trim();
           buffer = buffer.slice(newline + 1);
           newline = buffer.indexOf("\n");
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (!data || data === "[DONE]") continue;
-          let decoded: unknown;
-          try {
-            decoded = JSON.parse(data);
-          } catch {
-            continue;
-          }
-          const parsed = streamChunkSchema.safeParse(decoded);
-          if (!parsed.success) continue;
-          const chunk = parsed.data;
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) {
-            text += delta;
-            onDelta(delta);
-          }
-          if (chunk.usage) usage = {
-            input: chunk.usage.prompt_tokens ?? 0,
-            output: chunk.usage.completion_tokens ?? 0,
-          };
+          consume(line);
         }
       }
+      buffer += decoder.decode();
+      consume(buffer.trim());
       return { text, usage };
     };
 

@@ -260,6 +260,64 @@ describe("host MCP catalog", () => {
     expect(catalog.manifest.profile).toBe("observer-router");
   });
 
+  it("removes every source-qualified fleet bridge duplicate from the full-task catalog", () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-fleet-bridge-sources-"));
+    const bridgeScript = "/runtime/aos_fleet_bridge_mcp.py";
+    writeFileSync(join(home, ".claude.json"), JSON.stringify({
+      mcpServers: {
+        "aos-fleet-bridge": {
+          command: "/usr/bin/python3",
+          args: [bridgeScript, "--surface", "claude"],
+        },
+        "aos-fleet-bridge-opencode": {
+          command: "/usr/bin/python3",
+          args: ["/runtime/reserved-opencode-collision.py"],
+        },
+        "aos-fleet-bridge-hermes": {
+          command: "/usr/bin/python3",
+          args: ["/runtime/reserved-hermes-collision.py"],
+        },
+      },
+    }));
+    const catalog = loadHostMcpCatalogs({
+      home,
+      runCodexList: () => JSON.stringify([{
+        name: "aos-fleet-bridge",
+        enabled: true,
+        transport: {
+          type: "stdio",
+          command: "/usr/bin/python3",
+          args: [bridgeScript, "--surface", "codex"],
+        },
+      }]),
+      readOpenCodeConfig: () => JSON.stringify({
+        mcp: {
+          "aos-fleet-bridge": {
+            type: "local",
+            command: ["/usr/bin/python3", bridgeScript, "--surface", "opencode"],
+            enabled: true,
+          },
+        },
+      }),
+      runHermesList: () => JSON.stringify({
+        "aos-fleet-bridge": {
+          command: "/usr/bin/python3",
+          args: [bridgeScript, "--surface", "hermes"],
+          enabled: true,
+        },
+      }),
+    }).fullTask;
+
+    expect(Object.keys(catalog.servers).filter((name) => name.startsWith("aos-fleet-bridge")))
+      .toEqual(["aos-fleet-bridge"]);
+    expect(catalog.servers["aos-fleet-bridge"]).toEqual({
+      type: "stdio",
+      command: "/usr/bin/python3",
+      args: [bridgeScript, "--surface", "openmausbot"],
+      env: {},
+    });
+  });
+
   it("drops a named fleet bridge that cannot be identity-pinned", () => {
     const catalog = loadHostMcpCatalog({
       home: "/does/not/exist",

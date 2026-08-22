@@ -375,6 +375,12 @@ export class TelemetryManager {
         event.ok ? "completed" : cancelled ? "cancelled" : "failed",
         event.stopReason ?? undefined,
       );
+    } else if (event.type === "session.exited") {
+      this.finishTurn(
+        active.correlationId,
+        "failed",
+        event.reason ?? "provider session exited before terminal turn evidence",
+      );
     }
   }
 

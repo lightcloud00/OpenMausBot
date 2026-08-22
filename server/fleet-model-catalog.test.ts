@@ -221,8 +221,10 @@ describe("parseFleetModelCatalog", () => {
   });
 
   it("rejects divergent schemas, extra credential fields, secret-looking values, and duplicate ids", () => {
-    const divergent = Object.assign(baseCatalog(), { schema: "openmausbot-models.v1" });
-    expect(() => parseFleetModelCatalog(JSON.stringify(divergent))).toThrow("schema");
+    const divergent = Object.assign(baseCatalog(), { schema_version: "openmausbot-models/v2" });
+    expect(() => parseFleetModelCatalog(JSON.stringify(divergent))).toThrow("schema_version");
+    const unknownKey = Object.assign(baseCatalog(), { schema: "openmausbot-models.v1" });
+    expect(() => parseFleetModelCatalog(JSON.stringify(unknownKey))).toThrow("schema");
 
     const withKey = Object.assign(baseCatalog(), { api_key: "should-never-be-here" });
     expect(() => parseFleetModelCatalog(JSON.stringify(withKey))).toThrow("api_key");

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { constants as fsConstants, lstatSync, realpathSync, type Stats } from "node:fs";
-import { appendFile, lstat, mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstatSync, realpathSync, type Stats } from "node:fs";
+import { appendFile, lstat, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, win32 as winPath } from "node:path";
 import { z } from "zod";
@@ -13,9 +13,9 @@ import {
 } from "./access-profile.ts";
 import {
   AGENT_GRAPH_MAX_FILE_BYTES,
-  agentGraphNoFollowFlag,
   readStableAgentGraphFile,
 } from "./agent-graph-evidence.ts";
+import { writeAnchoredFile } from "./anchored-file.ts";
 import { agentGraphPathWithinWorkspace, agentGraphWritePathAllowed } from "./agent-graph-permissions.ts";
 import { fullTaskScopedHardDeny } from "./auto-approve.ts";
 import { BUILTIN_CAPABILITY_TOOLS } from "./builtin-capability-tools.ts";
@@ -462,6 +462,9 @@ interface GraphFilePreimage {
   size: number;
   mtimeMs: number;
   ctimeMs: number;
+  parentPath: string;
+  parentDev: number;
+  parentIno: number;
 }
 
 interface GraphAbsentPreimage {
@@ -518,7 +521,13 @@ function requireGraphWorkspace(identity: GraphWorkspaceIdentity | undefined): vo
   }
 }
 
-function graphFilePreimage(info: Stats, sha256: string, writable = true): GraphFilePreimage {
+function graphFilePreimage(
+  info: Stats,
+  sha256: string,
+  writable: boolean,
+  parentPath: string,
+  parentInfo: Stats,
+): GraphFilePreimage {
   return {
     kind: "file",
     sha256,
@@ -529,16 +538,10 @@ function graphFilePreimage(info: Stats, sha256: string, writable = true): GraphF
     size: info.size,
     mtimeMs: info.mtimeMs,
     ctimeMs: info.ctimeMs,
+    parentPath,
+    parentDev: parentInfo.dev,
+    parentIno: parentInfo.ino,
   };
-}
-
-function sameGraphFileIdentity(left: GraphFilePreimage, right: Stats): boolean {
-  return left.dev === right.dev && left.ino === right.ino && right.isFile() && right.nlink === 1;
-}
-
-function graphFileStable(left: Stats, right: Stats): boolean {
-  return left.dev === right.dev && left.ino === right.ino && left.nlink === 1 && right.nlink === 1 &&
-    left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
 }
 
 interface BackendSlot {
@@ -556,6 +559,8 @@ export interface CapabilityGatewayOptions {
   credentialBroker?: CredentialBrokerOptions;
   observerPresence?: ObserverTaskPresenceOptions;
   fleetIndex?: FleetCapabilityIndex;
+  /** Deterministic race seam; production leaves this unset. */
+  beforeGraphAnchoredWrite?: () => void | Promise<void>;
 }
 
 function builtinTools(server: Extract<HostMcpServer, { type: "builtin" }>) {
@@ -577,6 +582,7 @@ export class CapabilityGateway {
   private readonly observerOnly: boolean;
   private readonly observerPresence: ObserverTaskPresenceAdapter | null;
   private readonly fleetIndex?: FleetCapabilityIndex;
+  private readonly beforeGraphAnchoredWrite?: () => void | Promise<void>;
 
   constructor(
     catalog: HostMcpCatalog,
@@ -592,6 +598,7 @@ export class CapabilityGateway {
       ? new ObserverTaskPresenceAdapter(options.observerPresence)
       : null;
     this.fleetIndex = options.fleetIndex;
+    this.beforeGraphAnchoredWrite = options.beforeGraphAnchoredWrite;
     this.protectedValues = protectedEnvironmentValues();
     this.protectServerValues(catalog.servers);
   }
@@ -1077,7 +1084,13 @@ export class CapabilityGateway {
         body = stable.body;
         const utf8 = body.toString("utf8");
         const fullUtf8Returned = body.byteLength <= maxBytes && !body.includes(0) && Buffer.from(utf8, "utf8").equals(body);
-        turn.graphReadPreimages.set(path, graphFilePreimage(stable.info, stable.sha256, fullUtf8Returned));
+        turn.graphReadPreimages.set(path, graphFilePreimage(
+          stable.info,
+          stable.sha256,
+          fullUtf8Returned,
+          stable.parentPath,
+          stable.parentInfo,
+        ));
       } else {
         body = await readFile(path);
       }
@@ -1110,87 +1123,53 @@ export class CapabilityGateway {
         if (bytes.byteLength > AGENT_GRAPH_MAX_FILE_BYTES) {
           throw new Error("agent graph filesystem write exceeds the bounded file size");
         }
-        let finalInfo: Stats;
-        if (preimage.kind === "file") {
-          const handle = await open(path, fsConstants.O_RDWR | agentGraphNoFollowFlag());
-          try {
-            const before = await handle.stat();
-            if (!sameGraphFileIdentity(preimage, before)) {
-              throw new Error("agent graph filesystem write rejected file identity or hard-link drift");
-            }
-            if (before.size > AGENT_GRAPH_MAX_FILE_BYTES) {
-              throw new Error("agent graph filesystem write preimage exceeds the bounded file size");
-            }
-            const currentBody = await handle.readFile();
-            const afterRead = await handle.stat();
-            if (!graphFileStable(before, afterRead) || contentSha256(currentBody) !== expected) {
-              throw new Error("agent graph filesystem write rejected owner drift since the approved read");
-            }
-            const pathInfo = await lstat(path);
-            if (!sameGraphFileIdentity(preimage, pathInfo)) {
-              throw new Error("agent graph filesystem write rejected a final-path swap");
-            }
-            await handle.truncate(0);
-            for (let offset = 0; offset < bytes.byteLength;) {
-              const written = await handle.write(bytes, offset, bytes.byteLength - offset, offset);
-              if (written.bytesWritten <= 0) throw new Error("agent graph filesystem write made no progress");
-              offset += written.bytesWritten;
-            }
-            await handle.truncate(bytes.byteLength);
-            await handle.sync();
-            finalInfo = await handle.stat();
-            if (!sameGraphFileIdentity(preimage, finalInfo)) {
-              throw new Error("agent graph filesystem write target changed during the write");
-            }
-          } finally {
-            await handle.close();
-          }
-        } else {
-          const parentPath = dirname(path);
-          if (preimage.parentPath !== parentPath) {
-            throw new Error("agent graph filesystem creation parent changed since stat");
-          }
-          const parentBefore = await lstat(parentPath);
-          if (!parentBefore.isDirectory() || parentBefore.isSymbolicLink() ||
-              parentBefore.dev !== preimage.parentDev || parentBefore.ino !== preimage.parentIno) {
-            throw new Error("agent graph filesystem creation rejected parent drift since stat");
-          }
-          const handle = await open(
+        const parentPath = dirname(path);
+        if (preimage.parentPath !== parentPath) {
+          throw new Error("agent graph filesystem write parent changed since the approved read");
+        }
+        const parentBefore = await lstat(parentPath);
+        if (!parentBefore.isDirectory() || parentBefore.isSymbolicLink() ||
+            parentBefore.dev !== preimage.parentDev || parentBefore.ino !== preimage.parentIno) {
+          throw new Error("agent graph filesystem write rejected parent drift since the approved read");
+        }
+        let written;
+        try {
+          written = await writeAnchoredFile({
             path,
-            fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | agentGraphNoFollowFlag(),
-            0o600,
-          );
-          try {
-            const opened = await handle.stat();
-            const pathInfo = await lstat(path);
-            const parentAfterOpen = await lstat(parentPath);
-            if (!opened.isFile() || opened.nlink !== 1 || pathInfo.dev !== opened.dev || pathInfo.ino !== opened.ino ||
-                !parentAfterOpen.isDirectory() || parentAfterOpen.isSymbolicLink() ||
-                parentAfterOpen.dev !== preimage.parentDev || parentAfterOpen.ino !== preimage.parentIno) {
-              throw new Error("agent graph filesystem creation rejected a final-path or parent swap");
-            }
-            for (let offset = 0; offset < bytes.byteLength;) {
-              const written = await handle.write(bytes, offset, bytes.byteLength - offset, offset);
-              if (written.bytesWritten <= 0) throw new Error("agent graph filesystem write made no progress");
-              offset += written.bytesWritten;
-            }
-            await handle.truncate(bytes.byteLength);
-            await handle.sync();
-            finalInfo = await handle.stat();
-            if (!finalInfo.isFile() || finalInfo.nlink !== 1 || finalInfo.dev !== opened.dev || finalInfo.ino !== opened.ino) {
-              throw new Error("agent graph filesystem creation target changed during the write");
-            }
-          } finally {
-            await handle.close();
+            parent: { dev: preimage.parentDev, ino: preimage.parentIno },
+            mode: preimage.kind === "file" ? "replace" : "create",
+            content: bytes,
+            maximumBytes: AGENT_GRAPH_MAX_FILE_BYTES,
+            ...(preimage.kind === "file" ? {
+              expectedFile: {
+                dev: preimage.dev,
+                ino: preimage.ino,
+                nlink: preimage.nlink,
+                size: preimage.size,
+                mtimeMs: preimage.mtimeMs,
+                ctimeMs: preimage.ctimeMs,
+                sha256: preimage.sha256,
+              },
+            } : {}),
+          }, { beforeSpawn: this.beforeGraphAnchoredWrite });
+        } catch (error) {
+          if (preimage.kind === "file" && /identity|content changed/.test((error as Error).message)) {
+            throw new Error("agent graph filesystem write rejected owner drift since the approved read");
           }
+          throw error;
         }
         const sha256 = contentSha256(args.content);
         const finalPathInfo = await lstat(path);
         if (!finalPathInfo.isFile() || finalPathInfo.nlink !== 1 ||
-            finalPathInfo.dev !== finalInfo.dev || finalPathInfo.ino !== finalInfo.ino) {
+            finalPathInfo.dev !== written.dev || finalPathInfo.ino !== written.ino) {
           throw new Error("agent graph filesystem write rejected a post-write path swap");
         }
-        turn.graphReadPreimages.set(path, graphFilePreimage(finalInfo, sha256));
+        const parentAfter = await lstat(parentPath);
+        if (!parentAfter.isDirectory() || parentAfter.isSymbolicLink() ||
+            parentAfter.dev !== preimage.parentDev || parentAfter.ino !== preimage.parentIno) {
+          throw new Error("agent graph filesystem write rejected a post-write parent swap");
+        }
+        turn.graphReadPreimages.set(path, graphFilePreimage(finalPathInfo, sha256, true, parentPath, parentAfter));
         return { path, bytes: Buffer.byteLength(args.content), appended: false, sha256 };
       }
       await mkdir(dirname(path), { recursive: true });

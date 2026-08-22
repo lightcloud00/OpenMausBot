@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureDirs } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { ClaudeDriver, permissionSocketPath } from "./claude.ts";
+import { ClaudeDriver, claudeBareAuthenticationSettings, permissionSocketPath } from "./claude.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", "fake-claude-cli.ts");
@@ -391,6 +391,22 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(seen.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(seen.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
     expect(seen.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+  });
+
+  it("builds the Claude bare-mode helper without POSIX commands on Windows", () => {
+    const settings = JSON.parse(claudeBareAuthenticationSettings("openmaus/claude-api", {
+      platform: "win32",
+      executable: "C:\\Program Files\\OpenMausBot\\OpenMausBot Helper.exe",
+      helperPath: "C:\\Program Files\\OpenMausBot\\server\\claude-api-key-helper.js",
+      electron: true,
+    }));
+    expect(settings.apiKeyHelper).toBe(
+      "set ELECTRON_RUN_AS_NODE=1&& \"\"C:\\Program Files\\OpenMausBot\\OpenMausBot Helper.exe\" " +
+      "\"C:\\Program Files\\OpenMausBot\\server\\claude-api-key-helper.js\" \"openmaus/claude-api\"\"",
+    );
+    expect(settings.apiKeyHelper).not.toContain("/usr/bin/env");
+    expect(() => claudeBareAuthenticationSettings("openmaus/bad%PATH%", { platform: "win32" }))
+      .toThrow(/alias is invalid/);
   });
 
   it("uses instance credentials when launching an injected local model", async () => {

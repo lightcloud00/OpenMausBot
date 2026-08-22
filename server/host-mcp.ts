@@ -34,7 +34,7 @@ export interface HostMcpCatalog {
 const BLOCKED_SERVER = /(?:^|[-_.])cred(?:ential)?vault(?:$|[-_.])|credvault/i;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/;
 const FLEET_BRIDGE_NAME = "aos-fleet-bridge";
-const FLEET_BRIDGE_CODEX_DUPLICATE = /^aos-fleet-bridge-codex(?:-\d+)?$/;
+const FLEET_BRIDGE_SOURCE_DUPLICATE = /^aos-fleet-bridge-(?:codex|opencode|hermes)(?:-\d+)?$/;
 const FLEET_BRIDGE_SCRIPT = /(?:^|[\\/])aos_fleet_bridge_mcp\.py$/;
 const OPENMAUS_SURFACE = "openmausbot";
 const BRIDGE_VALUE_FLAGS = new Set(["--surface", "--state-dir", "--ledger", "--ledger-timeout", "--inbox"]);
@@ -158,7 +158,7 @@ function pinnedFleetBridge(server: HostMcpServer | undefined): Extract<HostMcpSe
   for (let index = 1; index < args.length; index += 2) {
     const flag = args[index];
     const value = args[index + 1];
-    if (!BRIDGE_VALUE_FLAGS.has(flag) || seen.has(flag) || typeof value !== "string" || !value.trim()) return null;
+    if (!BRIDGE_VALUE_FLAGS.has(flag) || seen.has(flag) || typeof value !== "string" || !value.trim() || value.startsWith("-")) return null;
     seen.add(flag);
   }
   if (!seen.has("--surface")) return null;
@@ -287,7 +287,7 @@ function fullTaskServers(
     "hermes",
   );
   for (const name of Object.keys(merged)) {
-    if (FLEET_BRIDGE_CODEX_DUPLICATE.test(name)) delete merged[name];
+    if (FLEET_BRIDGE_SOURCE_DUPLICATE.test(name)) delete merged[name];
   }
   const bridge = pinnedFleetBridge(merged[FLEET_BRIDGE_NAME]);
   if (bridge) merged[FLEET_BRIDGE_NAME] = bridge;

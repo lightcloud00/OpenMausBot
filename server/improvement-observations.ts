@@ -3,18 +3,17 @@ import {
   closeSync,
   constants as fsConstants,
   fstatSync,
-  fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   realpathSync,
-  writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { agentGraphNoFollowFlag } from "./agent-graph-evidence.ts";
+import { AnchoredFileError, writeAnchoredFileSync } from "./anchored-file.ts";
 import type { AgentGraphRunReceipt } from "./agent-graphs.ts";
 import { redactSecretsInText } from "./redact.ts";
 
@@ -28,7 +27,7 @@ function stableSingleLinkFile(left: ReturnType<typeof fstatSync>, right: ReturnT
 
 export function writeVerifiedAgentGraphObservation(
   receipt: AgentGraphRunReceipt,
-  options: { directory?: string } = {},
+  options: { directory?: string; beforeAnchoredWrite?: () => void } = {},
 ): string | null {
   if (
     receipt.status !== "completed" || receipt.verification_status !== "verified" ||
@@ -86,28 +85,24 @@ export function writeVerifiedAgentGraphObservation(
   const serialized = JSON.stringify(observation, null, 2) + "\n";
   let fd: number | null = null;
   try {
-    fd = openSync(
+    const written = writeAnchoredFileSync({
       path,
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | agentGraphNoFollowFlag(),
-      0o600,
-    );
-    const before = fstatSync(fd);
-    if (!before.isFile() || before.nlink !== 1) {
-      throw new Error("new improvement observation is not a single-link regular file");
-    }
-    writeFileSync(fd, serialized, { encoding: "utf8" });
-    fsyncSync(fd);
-    const after = fstatSync(fd);
+      parent: { dev: directoryInfo.dev, ino: directoryInfo.ino },
+      mode: "create",
+      content: serialized,
+      maximumBytes: 2 * 1024 * 1024,
+    }, { beforeSpawn: options.beforeAnchoredWrite });
     const pathAfter = lstatSync(path);
     const directoryAfter = lstatSync(canonicalDirectory);
-    if (!stableSingleLinkFile(after, pathAfter) || after.dev !== before.dev || after.ino !== before.ino ||
-        after.size !== Buffer.byteLength(serialized, "utf8") || !directoryAfter.isDirectory() ||
+    if (!pathAfter.isFile() || pathAfter.isSymbolicLink() || pathAfter.nlink !== 1 ||
+        pathAfter.dev !== written.dev || pathAfter.ino !== written.ino ||
+        pathAfter.size !== Buffer.byteLength(serialized, "utf8") || !directoryAfter.isDirectory() ||
         directoryAfter.isSymbolicLink() || directoryAfter.dev !== directoryInfo.dev || directoryAfter.ino !== directoryInfo.ino) {
       throw new Error("improvement observation path or directory changed while it was being written");
     }
     return path;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    if (!(error instanceof AnchoredFileError) || error.code !== "EEXIST") throw error;
     const pathBefore = lstatSync(path);
     if (!pathBefore.isFile() || pathBefore.isSymbolicLink() || pathBefore.nlink !== 1 ||
         pathBefore.size > 2 * 1024 * 1024) {

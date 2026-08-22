@@ -74,7 +74,7 @@ it("checks the trusted frame and server-owned graph manifest before any approval
   const currentGraph = source.indexOf("const currentResponse = await fetch", handler);
   const semanticManifest = source.indexOf("graphApprovalDetail(currentPayload, id, graphHash)", handler);
   const dialog = source.indexOf("dialog.showMessageBox", handler);
-  const approvalPost = source.indexOf("const response = await fetch", currentGraph + 1);
+  const approvalPost = source.indexOf("return signedAgentGraphRequest(action, path, body)", currentGraph + 1);
   for (const position of [handler, mainFrame, trustedOrigin, currentGraph, semanticManifest, dialog, approvalPost]) {
     expect(position).toBeGreaterThanOrEqual(0);
   }

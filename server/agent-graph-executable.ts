@@ -8,10 +8,12 @@ import {
   openSync,
   readSync,
   realpathSync,
+  type Stats,
 } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 
 import { findCliCandidates } from "./env-path.ts";
+import { agentGraphNoFollowFlag } from "./agent-graph-evidence.ts";
 import { resolveCli } from "./procs.ts";
 
 const MAX_EXECUTABLE_BYTES = 512 * 1024 * 1024;
@@ -32,6 +34,16 @@ interface FileIdentity {
 
 const identityCache = new Map<string, FileIdentity>();
 
+function assertExecutableFile(info: Stats): void {
+  if (!info.isFile()) throw new Error("graph provider executable target must be a regular file");
+  if (info.size < 1 || info.size > MAX_EXECUTABLE_BYTES) {
+    throw new Error("graph provider executable is outside the bounded size limit");
+  }
+  if (process.platform !== "win32" && (info.mode & 0o111) === 0) {
+    throw new Error("graph provider executable is not executable");
+  }
+}
+
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (value && typeof value === "object") {
@@ -47,19 +59,22 @@ function fileIdentity(path: string): FileIdentity {
   const link = lstatSync(absolute);
   const realPath = realpathSync(absolute);
   const targetLink = lstatSync(realPath);
-  if (!targetLink.isFile() || targetLink.isSymbolicLink()) throw new Error("graph provider executable target must be a regular file");
-  if (targetLink.size < 1 || targetLink.size > MAX_EXECUTABLE_BYTES) throw new Error("graph provider executable is outside the bounded size limit");
-  if (process.platform !== "win32" && (targetLink.mode & 0o111) === 0) throw new Error("graph provider executable is not executable");
+  if (targetLink.isSymbolicLink()) throw new Error("graph provider executable target must be a regular file");
+  assertExecutableFile(targetLink);
   const signature = [
     absolute, realPath, link.dev, link.ino, link.size, link.mtimeMs, link.ctimeMs,
     targetLink.dev, targetLink.ino, targetLink.size, targetLink.mode, targetLink.mtimeMs, targetLink.ctimeMs,
   ].join("\0");
   const cached = targetLink.size > 16 * 1024 * 1024 ? identityCache.get(signature) : undefined;
   if (cached) return cached;
-  const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
-  const fd = openSync(realPath, fsConstants.O_RDONLY | noFollow);
+  const fd = openSync(realPath, fsConstants.O_RDONLY | agentGraphNoFollowFlag());
   try {
     const before = fstatSync(fd);
+    assertExecutableFile(before);
+    if (
+      before.dev !== targetLink.dev || before.ino !== targetLink.ino || before.size !== targetLink.size ||
+      before.mode !== targetLink.mode || before.mtimeMs !== targetLink.mtimeMs || before.ctimeMs !== targetLink.ctimeMs
+    ) throw new Error("graph provider executable changed before its identity was captured");
     const digest = createHash("sha256");
     const buffer = Buffer.allocUnsafe(HASH_CHUNK_BYTES);
     let total = 0;

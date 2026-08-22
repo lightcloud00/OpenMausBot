@@ -1,5 +1,4 @@
 import {
-  chmodSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -17,6 +16,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   AgentGraphManager,
+  type AgentGraphManagerOptions,
   type AgentGraphNodeInput,
   type AgentGraphRoute,
   type AgentGraphRunReceipt,
@@ -123,7 +123,10 @@ function eventFor(
   return event(started.threadId, ok, denials, started.instanceId, started.turnId);
 }
 
-function harness(states: Record<string, "ready" | "busy" | "missing"> = { "bot-a": "ready", "bot-b": "ready", "bot-c": "ready" }) {
+function harness(
+  states: Record<string, "ready" | "busy" | "missing"> = { "bot-a": "ready", "bot-b": "ready", "bot-c": "ready" },
+  storage: Pick<AgentGraphManagerOptions, "writeState" | "writeReceipt"> = {},
+) {
   const root = directory();
   const started: Array<{ botId: string; instanceId: string; workspaceRoot: string; threadId: string; turnId: string; prompt: string }> = [];
   const interrupted: string[] = [];
@@ -141,6 +144,7 @@ function harness(states: Record<string, "ready" | "busy" | "missing"> = { "bot-a
       manager.handleRuntimeEvent(startedEvent(threadId, route.instanceId, turnId));
     },
     interruptTurn: async (_route, threadId) => { interrupted.push(threadId); },
+    ...storage,
   });
   return { manager, file: join(root, "graphs.json"), started, interrupted };
 }
@@ -904,35 +908,35 @@ describe("approval-bound agent graphs", () => {
   });
 
   it("rolls runtime and cancellation mutations back when the durable store is unavailable", async () => {
-    const { manager, file, started, interrupted } = harness();
+    let failWrites = false;
+    const writeState: NonNullable<AgentGraphManagerOptions["writeState"]> = (path, data, options = {}) => {
+      if (failWrites) throw new Error("injected graph store failure");
+      writeFileSync(path, data, { encoding: "utf8", mode: options.mode });
+    };
+    const { manager, file, started, interrupted } = harness(undefined, { writeState });
     const graph = manager.preview({ objective: "Transactional runtime state", nodes: nodes() });
     await manager.approve(graph.id, graph.graphHash);
     await vi.waitFor(() => expect(started).toHaveLength(1));
     const durableRunning = readFileSync(file, "utf8");
-    const root = dirname(file);
+    failWrites = true;
+    const result = manager.handleRuntimeEvent(event("thread-1"));
+    // A rolled-back event is not durable admission for downstream folds.
+    expect(result).toBeNull();
+    expect(manager.get(graph.id)?.nodes[0]?.status).toBe("running");
+    expect(readFileSync(file, "utf8")).toBe(durableRunning);
 
-    chmodSync(root, 0o500);
-    try {
-      const result = manager.handleRuntimeEvent(event("thread-1"));
-      // A rolled-back event is not durable admission for downstream folds.
-      expect(result).toBeNull();
-      expect(manager.get(graph.id)?.nodes[0]?.status).toBe("running");
-      expect(readFileSync(file, "utf8")).toBe(durableRunning);
-
-      await expect(manager.cancel(graph.id)).rejects.toThrow();
-      expect(interrupted).toEqual(["thread-1"]);
-      expect(manager.get(graph.id)?.status).toBe("running");
-      expect(manager.get(graph.id)?.nodes[0]?.cancellationRequestedAt).toBeUndefined();
-      expect(readFileSync(file, "utf8")).toBe(durableRunning);
-    } finally {
-      chmodSync(root, 0o700);
-    }
+    await expect(manager.cancel(graph.id)).rejects.toThrow();
+    expect(interrupted).toEqual(["thread-1"]);
+    expect(manager.get(graph.id)?.status).toBe("running");
+    expect(manager.get(graph.id)?.nodes[0]?.cancellationRequestedAt).toBeUndefined();
+    expect(readFileSync(file, "utf8")).toBe(durableRunning);
   });
 
   it("still revokes an exact active turn when an unrelated receipt sink degraded health", async () => {
     const root = directory();
     const receiptsDir = join(root, "receipts");
     const interrupted: Array<{ threadId: string; turnId?: string }> = [];
+    let failReceipts = false;
     let manager!: AgentGraphManager;
     manager = new AgentGraphManager({
       file: join(root, "graphs.json"),
@@ -943,6 +947,10 @@ describe("approval-bound agent graphs", () => {
         manager.handleRuntimeEvent(startedEvent(threadId, route.instanceId));
       },
       interruptTurn: async (_route, threadId, turnId) => { interrupted.push({ threadId, ...(turnId ? { turnId } : {}) }); },
+      writeReceipt: (path, data, options = {}) => {
+        if (failReceipts) throw new Error("injected graph receipt sink failure");
+        writeFileSync(path, data, { encoding: "utf8", mode: options.mode });
+      },
     });
     const verifyOnly = (route: AgentGraphRoute) => [{ ...nodes([route])[2]!, dependsOn: [] }];
     const terminal = manager.preview({ objective: "Receipt sink failure seed", nodes: verifyOnly(routeA) });
@@ -956,14 +964,10 @@ describe("approval-bound agent graphs", () => {
       expect(manager.get(active.id)?.nodes[0]?.turnId).toBe("turn-sink-bot-b");
     });
 
-    chmodSync(receiptsDir, 0o500);
-    try {
-      manager.handleRuntimeEvent(event("sink-bot-a"));
-      expect(manager.get(terminal.id)?.status).toBe("completed");
-      expect(manager.storageHealth().state).toBe("degraded");
-    } finally {
-      chmodSync(receiptsDir, 0o700);
-    }
+    failReceipts = true;
+    manager.handleRuntimeEvent(event("sink-bot-a"));
+    expect(manager.get(terminal.id)?.status).toBe("completed");
+    expect(manager.storageHealth().state).toBe("degraded");
 
     const cancelled = await manager.cancel(active.id);
     expect(cancelled.status).toBe("running");
@@ -979,6 +983,7 @@ describe("approval-bound agent graphs", () => {
     const drainGate = new Promise<void>((resolve) => { releaseDrain = resolve; });
     let created = 0;
     let started = 0;
+    let failWrites = false;
     const manager = new AgentGraphManager({
       file,
       routeState: () => "ready",
@@ -988,23 +993,23 @@ describe("approval-bound agent graphs", () => {
       },
       createTask: () => { created += 1; return { threadId: "must-not-dispatch" }; },
       startTurn: async () => { started += 1; },
+      writeState: (path, data, options = {}) => {
+        if (failWrites) throw new Error("injected graph store failure");
+        writeFileSync(path, data, { encoding: "utf8", mode: options.mode });
+      },
     });
     const graph = manager.preview({ objective: "Transactional drain", nodes: nodes() });
     await manager.approve(graph.id, graph.graphHash);
     await vi.waitFor(() => expect(refreshCalls).toBe(2));
     const durableApproved = readFileSync(file, "utf8");
 
-    chmodSync(root, 0o500);
-    try {
-      releaseDrain();
-      await vi.waitFor(() => expect(manager.storageHealth().state).toBe("degraded"));
-      expect(created).toBe(0);
-      expect(started).toBe(0);
-      expect(manager.get(graph.id)?.status).toBe("approved");
-      expect(readFileSync(file, "utf8")).toBe(durableApproved);
-    } finally {
-      chmodSync(root, 0o700);
-    }
+    failWrites = true;
+    releaseDrain();
+    await vi.waitFor(() => expect(manager.storageHealth().state).toBe("degraded"));
+    expect(created).toBe(0);
+    expect(started).toBe(0);
+    expect(manager.get(graph.id)?.status).toBe("approved");
+    expect(readFileSync(file, "utf8")).toBe(durableApproved);
   });
 
   it("rolls back injected dispatch, terminal, and exact turn binding write failures", async () => {

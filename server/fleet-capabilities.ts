@@ -61,7 +61,7 @@ const DEFAULT_INDEX = join(
 const MAX_INDEX_BYTES = 32 * 1024 * 1024;
 const MAX_RESULTS = 25;
 const SAFE_KIND = /^[a-z][a-z0-9._-]{0,63}$/i;
-const SENSITIVE_PATH = /(?:^|\/)(?:\.ssh|\.aws|\.gnupg|\.credvault|Keychains?|Cookies?|Passwords?)(?:\/|$)/i;
+const SENSITIVE_PATH = /(?:^|[\\/])(?:\.ssh|\.aws|\.gnupg|\.credvault|Keychains?|Cookies?|Passwords?)(?:[\\/]|$)/i;
 
 interface RawCapabilityRecord {
   id?: unknown;
@@ -100,6 +100,8 @@ export interface FleetCapabilityMetadata {
 
 interface LoadedCatalog {
   path: string;
+  ino: number;
+  ctimeMs: number;
   mtimeMs: number;
   size: number;
   schema: string;
@@ -165,8 +167,9 @@ function selectedPath(record: RawCapabilityRecord): string | null {
   const candidate = [record.command_path, record.source_path].find(
     (value): value is string => typeof value === "string" && value.trim().length > 0,
   );
-  if (!candidate || !isAbsolute(candidate) || candidate.includes("\0") || SENSITIVE_PATH.test(candidate)) return null;
+  if (!candidate || !isAbsolute(candidate) || candidate.includes("\0")) return null;
   const path = resolve(candidate);
+  if (SENSITIVE_PATH.test(path)) return null;
   try {
     const info = statSync(path);
     return info.isFile() ? path : null;
@@ -193,7 +196,8 @@ export class FleetCapabilityIndex {
     if (!info.isFile() || info.size <= 0 || info.size > MAX_INDEX_BYTES) {
       throw new Error("fleet capability index is unavailable or oversized");
     }
-    if (this.loaded && this.loaded.mtimeMs === info.mtimeMs && this.loaded.size === info.size) return this.loaded;
+    if (this.loaded && this.loaded.ino === info.ino && this.loaded.ctimeMs === info.ctimeMs &&
+      this.loaded.mtimeMs === info.mtimeMs && this.loaded.size === info.size) return this.loaded;
     const rawBytes = readFileSync(this.path);
     const parsed = JSON.parse(rawBytes.toString("utf8")) as RawCapabilityCatalog;
     if (parsed.schema !== "capabilities.v1" || !Array.isArray(parsed.records)) {
@@ -207,6 +211,8 @@ export class FleetCapabilityIndex {
     });
     this.loaded = {
       path: this.path,
+      ino: info.ino,
+      ctimeMs: info.ctimeMs,
       mtimeMs: info.mtimeMs,
       size: info.size,
       schema: "capabilities.v1",

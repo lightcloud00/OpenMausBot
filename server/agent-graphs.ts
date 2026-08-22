@@ -89,6 +89,8 @@ export interface AgentGraphManagerOptions {
   maxFileBytes?: number;
   /** Deterministic fault injection for the primary graph store. */
   writeState?: typeof writeFileAtomic;
+  /** Deterministic fault injection for terminal and verified receipt storage. */
+  writeReceipt?: typeof writeFileAtomic;
   /** Deterministic read-race injection; production reads the no-follow fd. */
   readState?: (fd: number) => string;
   now?: () => number;
@@ -616,6 +618,7 @@ export class AgentGraphManager {
   private readonly receiptsDir: string;
   private readonly maxFileBytes: number;
   private readonly writeState: typeof writeFileAtomic;
+  private readonly writeReceipt: typeof writeFileAtomic;
   private readonly options: AgentGraphManagerOptions;
   private graphs: AgentGraph[] = [];
   private draining = false;
@@ -631,6 +634,7 @@ export class AgentGraphManager {
     this.receiptsDir = options.receiptsDir ?? join(options.file ? dirname(options.file) : DATA_DIR, "agent-graph-receipts");
     this.maxFileBytes = options.maxFileBytes ?? MAX_FILE_BYTES;
     this.writeState = options.writeState ?? writeFileAtomic;
+    this.writeReceipt = options.writeReceipt ?? writeFileAtomic;
     if (!Number.isSafeInteger(this.maxFileBytes) || this.maxFileBytes < 1_024) {
       throw new Error("agent graph storage bound must be an integer of at least 1024 bytes");
     }
@@ -1656,7 +1660,7 @@ export class AgentGraphManager {
   }
 
   private persistReceipt(receipt: AgentGraphRunReceipt): void {
-    writeFileAtomic(
+    this.writeReceipt(
       join(this.receiptsDir, `${receipt.graph_id}.json`),
       JSON.stringify(receipt, null, 2) + "\n",
       { mode: 0o600 },

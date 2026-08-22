@@ -570,15 +570,24 @@ export function autoVerdict(
   },
 ): AutoVerdict {
   const fullTaskScoped = bot.accessProfile === "full-task-scoped";
+  const analysis = fullTaskScoped ? analyzeSafetyText(`${tool}\n${summary}`) : null;
   // the guards outrank the grants, so an "always allow" can never widen
   // into them
   const destructiveRules = fullTaskScoped ? CATASTROPHIC : DESTRUCTIVE;
   const sensitiveRules = fullTaskScoped ? CREDENTIAL_VALUE_DISCLOSURE : SENSITIVE;
-  const match = fullTaskScoped ? matchSafety : matchFirst;
-  const opaqueExecution = fullTaskScoped && analyzeSafetyText(`${tool}\n${summary}`).opaqueExecution;
+  const match = fullTaskScoped
+    ? (rules: RegExp[], _text: string) => {
+      for (const variant of analysis!.variants) {
+        const matched = matchFirst(rules, variant);
+        if (matched) return matched;
+      }
+      return null;
+    }
+    : matchFirst;
+  const opaqueExecution = analysis?.opaqueExecution === true;
   const destructive = opaqueExecution
     ? "opaque-execution-indirection"
-    : fullTaskScoped && targetsCatastrophicFilesystem(tool, summary, context?.cwd)
+    : fullTaskScoped && targetsCatastrophicFilesystem(tool, summary, context?.cwd, analysis!.variants)
       ? "catastrophic-filesystem-target"
       : match(destructiveRules, summary) ?? match(destructiveRules, tool);
   const sensitive = destructive ? null : match(sensitiveRules, summary) ?? match(sensitiveRules, tool);

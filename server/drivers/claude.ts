@@ -22,6 +22,7 @@ import {
   stripUnsafeGraphEnvironment,
 } from "../graph-safe-environment.ts";
 import { brokerSocketPath, describeSpawnFailure, execCli, killCliTree, spawnCli, terminateCliTree } from "../procs.ts";
+import { windowsCmdCommand } from "../windows-cmd.ts";
 
 import type {
   DriverCreateInput,
@@ -201,14 +202,32 @@ function shellWord(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-function bareAuthenticationSettings(alias: string): string {
-  const command = [
-    "/usr/bin/env",
-    ...(process.versions.electron ? ["ELECTRON_RUN_AS_NODE=1"] : []),
-    process.execPath,
-    API_KEY_HELPER_PATH,
-    alias,
-  ].map(shellWord).join(" ");
+export function claudeBareAuthenticationSettings(
+  aliasInput: string,
+  options: {
+    platform?: NodeJS.Platform;
+    executable?: string;
+    helperPath?: string;
+    electron?: boolean;
+  } = {},
+): string {
+  const alias = aliasInput.trim();
+  if (
+    !/^[A-Za-z0-9_.\/-]{1,200}$/.test(alias) ||
+    alias.split("/").some((part) => !part || part === "." || part === "..")
+  ) throw new Error("Claude API credential alias is invalid");
+  const platform = options.platform ?? process.platform;
+  const executable = options.executable ?? process.execPath;
+  const helperPath = options.helperPath ?? API_KEY_HELPER_PATH;
+  const electron = options.electron ?? Boolean(process.versions.electron);
+  const invocation = [executable, helperPath, alias];
+  const command = platform === "win32"
+    ? `${electron ? "set ELECTRON_RUN_AS_NODE=1&& " : ""}${windowsCmdCommand(invocation)}`
+    : [
+      "/usr/bin/env",
+      ...(electron ? ["ELECTRON_RUN_AS_NODE=1"] : []),
+      ...invocation,
+    ].map(shellWord).join(" ");
   return JSON.stringify({ apiKeyHelper: command });
 }
 
@@ -612,7 +631,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           FULL_TASK_SCOPED_CLAUDE_TOOLS,
         );
         if (bareCredentialAlias) {
-          args.push("--bare", "--settings", bareAuthenticationSettings(bareCredentialAlias));
+          args.push("--bare", "--settings", claudeBareAuthenticationSettings(bareCredentialAlias));
         } else {
           // Claude 2.1.237 safe mode suppresses even --strict-mcp-config's
           // explicit MCP server. Bare mode, meanwhile, cannot use the host's

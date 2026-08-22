@@ -650,17 +650,19 @@ describe("harness HTTP API", () => {
       selectable: true,
     }));
 
-    writeFileSync(fleetCatalogPath, "not-json");
-    const failed = await api("POST", "/api/model-catalog/refresh");
-    expect(failed.status).toBe(200);
-    expect(failed.body.catalog.source.state).toBe("invalid");
-    const failedHermes = failed.body.instances.find((instance: { instanceId: string }) => instance.instanceId === "hermes");
-    expect(failedHermes.models.options).toContainEqual(expect.objectContaining({
-      canonicalId: "fixture-fleet-model",
-      selectable: false,
-    }));
-
-    writeFileSync(fleetCatalogPath, JSON.stringify(fleetCatalogFixture()));
+    try {
+      writeFileSync(fleetCatalogPath, "not-json");
+      const failed = await api("POST", "/api/model-catalog/refresh");
+      expect(failed.status).toBe(200);
+      expect(failed.body.catalog.source.state).toBe("invalid");
+      const failedHermes = failed.body.instances.find((instance: { instanceId: string }) => instance.instanceId === "hermes");
+      expect(failedHermes.models.options).toContainEqual(expect.objectContaining({
+        canonicalId: "fixture-fleet-model",
+        selectable: false,
+      }));
+    } finally {
+      writeFileSync(fleetCatalogPath, JSON.stringify(fleetCatalogFixture()));
+    }
     expect((await api("POST", "/api/model-catalog/refresh")).body.catalog.source.state).toBe("ready");
   });
 

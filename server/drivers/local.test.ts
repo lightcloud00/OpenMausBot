@@ -12,6 +12,7 @@ let instance: ProviderInstance | null = null;
 let recorder: EventRecorder | null = null;
 const requests: Array<{ url: string; body: JsonValue | null }> = [];
 const chatRequestSchema = z.object({ model: z.string() }).passthrough();
+let finalFrameWithoutNewline = false;
 
 async function fakeHost(): Promise<string> {
   server = createServer((request, response) => {
@@ -31,7 +32,12 @@ async function fakeHost(): Promise<string> {
       if (request.url === "/v1/chat/completions") {
         response.writeHead(200, { "content-type": "text/event-stream" });
         response.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "hello" } }] })}\n\n`);
-        response.end("data: [DONE]\n\n");
+        response.end(finalFrameWithoutNewline
+          ? `data: ${JSON.stringify({
+            choices: [{ delta: { content: " tail" } }],
+            usage: { prompt_tokens: 7, completion_tokens: 2 },
+          })}`
+          : "data: [DONE]\n\n");
         return;
       }
       response.writeHead(404).end();
@@ -53,6 +59,7 @@ afterEach(async () => {
   await new Promise<void>((resolve) => server ? server.close(() => resolve()) : resolve());
   server = null;
   requests.length = 0;
+  finalFrameWithoutNewline = false;
 });
 
 describe("fleet local selectors", () => {
@@ -84,5 +91,32 @@ describe("fleet local selectors", () => {
     const chatRequest = requests.find((request) => request.url === "/v1/chat/completions");
     expect(chatRequestSchema.parse(chatRequest?.body).model).toBe("qwen3.8:27b-mlx");
     expect(recorder.events).toContainEqual(expect.objectContaining({ type: "item.completed", text: "hello" }));
+  });
+
+  it("consumes a final SSE delta and usage frame without a trailing newline", async () => {
+    finalFrameWithoutNewline = true;
+    instance = await LocalDriver.create({
+      instanceId: "localMac",
+      displayName: "Mac M5 models",
+      environment: {},
+      enabled: true,
+      config: { host: "custom", url: await fakeHost(), fleetHost: "mac" },
+    });
+    recorder = recordEvents(instance.adapter);
+    await instance.adapter.sendTurn({
+      threadId: "local-final-frame",
+      text: "hi",
+      model: "ollama-mac/qwen3.8:27b-mlx",
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(recorder.events).toContainEqual(expect.objectContaining({
+      type: "item.completed",
+      text: "hello tail",
+    }));
+    expect(recorder.events).toContainEqual(expect.objectContaining({
+      type: "thread.token-usage.updated",
+      input: 7,
+      output: 2,
+    }));
   });
 });

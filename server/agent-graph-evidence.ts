@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants, type Stats } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 export const AGENT_GRAPH_MAX_FILE_BYTES = 1024 * 1024;
 
@@ -11,6 +11,8 @@ export interface StableAgentGraphFileRead {
   body: Buffer;
   sha256: string;
   info: Stats;
+  parentPath: string;
+  parentInfo: Stats;
 }
 
 export function agentGraphNoFollowFlag(
@@ -106,6 +108,11 @@ export async function readStableAgentGraphFile(
   if (!lexicalTarget || lexicalTarget.dev !== canonicalTarget.dev || lexicalTarget.ino !== canonicalTarget.ino) {
     throw new Error("agent graph evidence changed during canonicalization");
   }
+  const parentPath = dirname(candidate);
+  const parentBefore = await lstat(parentPath);
+  if (!parentBefore.isDirectory() || parentBefore.isSymbolicLink()) {
+    throw new Error("agent graph evidence parent must be a real directory");
+  }
 
   // Component checks alone are not enough: a writable parent can be renamed
   // and replaced with a symlink between the final lstat above and open().
@@ -125,10 +132,12 @@ export async function readStableAgentGraphFile(
     const after = await handle.stat();
     const canonicalAfter = await realpath(candidate);
     const pathAfter = await lstat(candidate);
+    const parentAfter = await lstat(parentPath);
     const rootAfter = await lstat(root);
     if (
       !stableFile(canonicalTarget, before) || !stableFile(before, after) || !stableFile(after, pathAfter) ||
       !sameCanonicalPath(canonicalAfter, candidate) ||
+      !stableWorkspace(parentBefore, parentAfter) || !sameCanonicalPath(await realpath(parentPath), parentPath) ||
       !stableWorkspace(rootBefore, rootAfter) || !sameCanonicalPath(await realpath(root), root) ||
       body.byteLength !== after.size
     ) throw new Error("agent graph evidence changed while it was being read");
@@ -138,6 +147,8 @@ export async function readStableAgentGraphFile(
       body,
       sha256: `sha256:${createHash("sha256").update(body).digest("hex")}`,
       info: after,
+      parentPath,
+      parentInfo: parentAfter,
     };
   } finally {
     await handle.close();

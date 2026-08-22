@@ -69,6 +69,8 @@ const PresenceCoreSchema = z.object({
 
 const SurfacePresenceSchema = PresenceCoreSchema.extend({
   receipt_hash: z.string().regex(SHA256),
+  // Legacy v1 wire name. This is an unkeyed canonical checksum that binds the
+  // declared host id to the receipt; it is not a signature or proof of origin.
   host_signature: z.object({
     algorithm: z.literal("sha256-host-bound-v1"),
     host_id: z.string().regex(/^host-[0-9a-f]{24}$/),
@@ -115,24 +117,25 @@ export function verifySurfacePresence(value: unknown): SurfacePresence {
   }
   const {
     receipt_hash: receiptHash,
-    host_signature: hostSignature,
+    host_signature: hostChecksum,
     ...unsignedCore
   } = presence;
   if (sha256(canonicalJson(unsignedCore)) !== receiptHash) {
     throw new Error("surface presence receipt hash mismatch");
   }
-  const signatureCore = {
-    host_id: hostSignature.host_id,
+  const hostBoundCore = {
+    host_id: hostChecksum.host_id,
     receipt_hash: receiptHash,
     presence_id: presence.presence_id,
   };
-  if (sha256(canonicalJson(signatureCore)) !== hostSignature.value) {
-    throw new Error("surface presence host signature mismatch");
+  if (sha256(canonicalJson(hostBoundCore)) !== hostChecksum.value) {
+    throw new Error("surface presence host-bound checksum mismatch");
   }
   return presence;
 }
 
-export function signSurfacePresenceForTest(
+/** Build a canonical, integrity-checked v1 fixture. No origin authentication is implied. */
+export function sealSurfacePresenceForTest(
   core: z.input<typeof PresenceCoreSchema>,
   hostId: string,
 ): SurfacePresence {
@@ -278,7 +281,8 @@ async function presenceFiles(rootInput: string): Promise<string[]> {
       return;
     }
     for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-      if (files.length >= MAX_PRESENCE_FILES || entry.isSymbolicLink()) break;
+      if (files.length >= MAX_PRESENCE_FILES) break;
+      if (entry.isSymbolicLink()) continue;
       const path = join(directory, entry.name);
       if (entry.isDirectory()) await walk(path, depth + 1);
       else if (entry.isFile() && entry.name.endsWith(".json")) files.push(path);
@@ -319,7 +323,7 @@ export class ObserverTaskPresenceAdapter {
     return [
       {
         name: "presence_list",
-        description: "List valid, signed, non-expired surface_presence.v1 leases without prompts or transcripts.",
+        description: "List canonical, integrity-checked, non-expired surface_presence.v1 leases without prompts or transcripts; origin is not authenticated.",
         inputSchema: {
           type: "object",
           properties: {
@@ -333,7 +337,7 @@ export class ObserverTaskPresenceAdapter {
       },
       {
         name: "presence_status",
-        description: "Read verification and expiry status for one signed presence id.",
+        description: "Read integrity and expiry status for one presence id; origin is not authenticated.",
         inputSchema: {
           type: "object",
           properties: { presence_id: { type: "string", pattern: "^presence-[0-9a-f]{24}$" } },
@@ -425,6 +429,8 @@ export class ObserverTaskPresenceAdapter {
       ttl_seconds: presence.ttl_seconds,
       receipt_hash: presence.receipt_hash,
       host_id: presence.host_signature.host_id,
+      integrity_verified: true,
+      origin_authenticated: false,
       state,
       instruction_authority: false,
     };

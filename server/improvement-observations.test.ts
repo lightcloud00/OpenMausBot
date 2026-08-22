@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -54,7 +54,7 @@ describe("verified graph observations", () => {
     expect(writeVerifiedAgentGraphObservation(receipt("completed"), { directory })).toBeNull();
     const verified = receipt("completed", true);
     const path = writeVerifiedAgentGraphObservation(verified, { directory });
-    expect(path).toMatch(new RegExp(`${directory}/observation-[a-f0-9]{32}\\.json$`));
+    expect(basename(path!)).toMatch(/^observation-[a-f0-9]{32}\.json$/);
     const observation = JSON.parse(readFileSync(path!, "utf8"));
     expect(observation).toMatchObject({
       schema: "improvement_observation.v1",
@@ -79,5 +79,20 @@ describe("verified graph observations", () => {
     expect(readdirSync(directory)).toEqual([basename(path!)]);
     writeFileSync(path!, "{}\n");
     expect(() => writeVerifiedAgentGraphObservation(verified, { directory })).toThrow(/different content/);
+  });
+
+  it("creates no observation when the approved directory path is replaced before the anchored write", () => {
+    const directory = mkdtempSync(join(tmpdir(), "omb-observations-race-"));
+    const displaced = `${directory}-before-swap`;
+    temporary.push(directory, displaced);
+    expect(() => writeVerifiedAgentGraphObservation(receipt("completed", true), {
+      directory,
+      beforeAnchoredWrite: () => {
+        renameSync(directory, displaced);
+        mkdirSync(directory);
+      },
+    })).toThrow(/parent identity changed/);
+    expect(readdirSync(directory)).toEqual([]);
+    expect(readdirSync(displaced)).toEqual([]);
   });
 });

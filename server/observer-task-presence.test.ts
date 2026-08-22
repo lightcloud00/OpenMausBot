@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   canonicalJson,
   ObserverTaskPresenceAdapter,
-  signSurfacePresenceForTest,
+  sealSurfacePresenceForTest,
   verifySurfacePresence,
 } from "./observer-task-presence.ts";
 
@@ -36,7 +36,7 @@ function presence(input: {
   heartbeat?: string;
 }) {
   const heartbeat = input.heartbeat ?? "2026-08-22T11:59:00.000Z";
-  return signSurfacePresenceForTest({
+  return sealSurfacePresenceForTest({
     schema: "surface_presence.v1",
     presence_id: input.presenceId ?? "presence-0123456789abcdef01234567",
     session_id: "session-abc",
@@ -63,15 +63,15 @@ afterEach(() => {
   for (const path of temporary.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
-describe("signed observer task presence", () => {
-  it("verifies the canonical receipt and host-bound signature", () => {
+describe("integrity-checked observer task presence", () => {
+  it("verifies the canonical receipt and host-bound checksum without claiming origin authentication", () => {
     const signed = presence({});
     expect(verifySurfacePresence(signed)).toEqual(signed);
     expect(() => verifySurfacePresence({ ...signed, phase: "blocked" })).toThrow(/receipt hash mismatch/);
     expect(() => verifySurfacePresence({
       ...signed,
       host_signature: { ...signed.host_signature, value: `sha256:${"0".repeat(64)}` },
-    })).toThrow(/host signature mismatch/);
+    })).toThrow(/host-bound checksum mismatch/);
   });
 
   it("lists only active verified leases and suppresses duplicates and conflicts", async () => {
@@ -106,6 +106,8 @@ describe("signed observer task presence", () => {
     expect(result.rows).toEqual([expect.objectContaining({
       presence_id: healthy.presence_id,
       state: "active",
+      integrity_verified: true,
+      origin_authenticated: false,
       instruction_authority: false,
     })]);
     expect(result.diagnostics).toEqual({
@@ -325,7 +327,17 @@ describe("signed observer task presence", () => {
     writeFileSync(feed, JSON.stringify(base));
     const adapter = new ObserverTaskPresenceAdapter({ proposalFeedPath: feed, now: () => NOW });
     expect(await adapter.callTool("improvement_proposals", {})).toMatchObject({ state: "unsafe-withheld", proposals: [] });
-    writeFileSync(feed, JSON.stringify({ ...base, automatic_mutation: true }));
+    const evidenced = sealedProposal({
+      ...proposal,
+      content_hash: undefined,
+      evidence: [`sha256:${"a".repeat(64)}`],
+    });
+    writeFileSync(feed, JSON.stringify({
+      ...base,
+      automatic_mutation: true,
+      proposals: [evidenced],
+      feed_hash: hashJson([evidenced]),
+    }));
     expect(await adapter.callTool("improvement_proposals", {})).toMatchObject({ state: "unsafe-withheld", proposals: [] });
   });
 
@@ -360,9 +372,11 @@ describe("signed observer task presence", () => {
     const tampered = new ObserverTaskPresenceAdapter({ proposalFeedPath: source, now: () => NOW });
     expect(await tampered.callTool("improvement_proposals", {})).toMatchObject({ state: "invalid-withheld", proposals: [] });
 
-    symlinkSync(source, link);
-    const linked = new ObserverTaskPresenceAdapter({ proposalFeedPath: link, now: () => NOW });
-    expect(await linked.callTool("improvement_proposals", {})).toMatchObject({ state: "unsafe-withheld", proposals: [] });
+    if (process.platform !== "win32") {
+      symlinkSync(source, link);
+      const linked = new ObserverTaskPresenceAdapter({ proposalFeedPath: link, now: () => NOW });
+      expect(await linked.callTool("improvement_proposals", {})).toMatchObject({ state: "unsafe-withheld", proposals: [] });
+    }
 
     writeFileSync(oversized, "x".repeat(1024 * 1024 + 1));
     const large = new ObserverTaskPresenceAdapter({ proposalFeedPath: oversized, now: () => NOW });

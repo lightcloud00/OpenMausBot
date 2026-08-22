@@ -621,6 +621,46 @@ describe("CapabilityGateway", () => {
     expect(readFileSync(join(displacedInodeWorkspace, "sentinel.txt"), "utf8")).toBe("inode-original");
   });
 
+  it("creates no file when an approved parent is replaced at the anchored-write boundary", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "omb-graph-parent-race-")));
+    temporary.push(root);
+    const cwd = join(root, "workspace");
+    const parent = join(cwd, "parent");
+    const displacedParent = join(cwd, "parent-before-race");
+    mkdirSync(parent, { recursive: true });
+    const hostCatalog: HostMcpCatalog = {
+      servers: { "openmaus-host": { type: "builtin" } },
+      manifest: createCapabilityProfileManifest(),
+      sources: { claude: "missing", codex: "missing" },
+    };
+    let swap = false;
+    const gateway = new CapabilityGateway(hostCatalog, {
+      beforeGraphAnchoredWrite: () => {
+        if (!swap) return;
+        swap = false;
+        renameSync(parent, displacedParent);
+        mkdirSync(parent);
+      },
+    });
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, {
+      botId: "graph",
+      threadId: "parent-race",
+      cwd,
+      graphPermissionClass: "workspace-write",
+    });
+
+    const absent = await gateway.callTool(TOKEN, "openmaus-host", "filesystem_stat", { path: "parent/new.txt" });
+    swap = true;
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_write", {
+      path: "parent/new.txt",
+      content: "must-not-land",
+      expectedSha256: absent.sha256,
+    })).rejects.toThrow(/parent identity changed/);
+    expect(() => readFileSync(join(parent, "new.txt"))).toThrow();
+    expect(() => readFileSync(join(displacedParent, "new.txt"))).toThrow();
+  });
+
   it("rejects a sparse oversized graph file before allocating a read preimage", async () => {
     const cwd = realpathSync(mkdtempSync(join(tmpdir(), "omb-graph-size-")));
     temporary.push(cwd);

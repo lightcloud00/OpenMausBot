@@ -7,7 +7,11 @@ const canonical = (value) => {
   const visit = (item) => {
     if (Array.isArray(item)) return item.map(visit);
     if (!item || typeof item !== "object") return item;
-    return Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)).map(([key, nested]) => [key, visit(nested)]));
+    return Object.fromEntries(
+      Object.entries(item)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([key, nested]) => [key, visit(nested)]),
+    );
   };
   return JSON.stringify(visit(value));
 };

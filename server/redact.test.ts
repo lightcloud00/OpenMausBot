@@ -145,6 +145,7 @@ describe("redactSecretsInText", () => {
     const cookie = "session=private-cookie-value; csrf=also-private";
     const cookieOut = redactSecretsInText(`Cookie: ${cookie}`);
     expect(cookieOut).not.toContain("private-cookie-value");
+    expect(cookieOut).not.toContain("also-private");
     expect(cookieOut).toContain("redacted");
 
     const dsnOut = redactSecretsInText("postgres://service:database-password@example.test/app");

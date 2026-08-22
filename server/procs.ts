@@ -59,7 +59,7 @@ export async function processIdentity(pid: number): Promise<ProcessIdentityProbe
         "[pscustomobject]@{ CreationDate = $p.StartTime.ToUniversalTime().ToString('o'); ExecutablePath = $path; Name = $p.ProcessName } | ConvertTo-Json -Compress",
       ].join("; ");
       const value = JSON.parse((await execText("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-        timeout: 2_000,
+        timeout: 5_000,
         windowsHide: true,
       })).trim()) as { CreationDate?: string; ExecutablePath?: string; Name?: string };
       if (!value.CreationDate) return { status: "unavailable" };
@@ -313,9 +313,11 @@ export function terminateCliTree(child: ChildProcess, graceMs = 2_000): Promise<
       if (escalation) clearTimeout(escalation);
       if (deadline) clearTimeout(deadline);
       child.off("close", onClose);
-      unregisterOwnedProcess(pid);
       if (error) reject(error);
-      else resolve();
+      else {
+        unregisterOwnedProcess(pid);
+        resolve();
+      }
     };
     const onClose = () => finish();
     child.once("close", onClose);

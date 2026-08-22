@@ -19,4 +19,18 @@ describe("Claude bare-mode API key helper", () => {
       ELECTRON_RUN_AS_NODE: "1",
     });
   });
+
+  it("drops every variable outside the helper allowlist", () => {
+    expect(claudeApiKeyHelperChildEnv({
+      PATH: "/safe/bin",
+      HOME: "/safe/home",
+      LANG: "en_US.UTF-8",
+      SHELL: "/bin/zsh",
+      UNRELATED_VARIABLE: "drop-me",
+    })).toEqual({
+      PATH: "/safe/bin",
+      HOME: "/safe/home",
+      ELECTRON_RUN_AS_NODE: "1",
+    });
+  });
 });

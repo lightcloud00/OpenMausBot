@@ -320,6 +320,37 @@ describe("TelemetryManager", () => {
     manager.shutdown();
   });
 
+  it("settles retained turn state when a provider session exits without turn completion", () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-telemetry-session-exit-"));
+    dirs.push(dir);
+    const sinks = { sentry: fakeSink(), langfuse: fakeSink() };
+    const manager = new TelemetryManager({
+      dataDir: dir,
+      sinkPath: "/unused",
+      sourceSha: "d".repeat(40),
+      release: "dev",
+      spawnSink: (kind) => sinks[kind].child,
+    });
+    manager.registerTurn({
+      botId: "cogs",
+      botName: "Cogs",
+      threadId: "thread-1",
+      engine: "codex",
+      model: "test",
+      prompt: "bounded prompt",
+    }, "turn-1");
+    manager.handleRuntimeEvent(event("session.exited", { reason: "provider stopped" }));
+    expect(sinks.langfuse.lines).toHaveLength(1);
+    expect(JSON.parse(sinks.langfuse.lines[0]!)).toMatchObject({
+      kind: "trace",
+      outcome: "failed",
+      errorSummary: "provider stopped",
+    });
+    manager.handleRuntimeEvent(event("session.exited", { reason: "duplicate exit" }));
+    expect(sinks.langfuse.lines).toHaveLength(1);
+    manager.shutdown();
+  });
+
   it("bounds and sanitizes renderer diagnostics before sending them to Sentry", () => {
     const dir = mkdtempSync(join(tmpdir(), "omb-telemetry-renderer-"));
     dirs.push(dir);

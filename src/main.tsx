@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import { redactRendererErrorText } from "./lib/renderer-error-redaction";
 import { applySkin, readSkin } from "./lib/skins";
 import "./styles.css";
 
@@ -32,8 +33,8 @@ function reportRendererError(value: unknown, context: RendererErrorContext) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       name: error.name,
-      message: error.message,
-      stack: error.stack,
+      message: redactRendererErrorText(error.message),
+      stack: redactRendererErrorText(error.stack),
       diagnostics: {
         source: context.source,
         page: safeRendererLocation(window.location.href),
