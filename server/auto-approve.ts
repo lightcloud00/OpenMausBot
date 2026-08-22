@@ -39,12 +39,20 @@ const REMOTE_DELETE_REQUEST = /(?:^|[\s"'(])DELETE\s+(?:https?:\/\/|\/)[^\s"'`]+
 const CUA_TOOL = /(?:^|__|[./_-])(?:computer|cua|browser|chrome|playwright)(?:[./_-]|$)|^(?:click|tap|type|press[_-]?key)$/i;
 const IRREVERSIBLE_CUA_NOUN = "(?:(?:user\\s+)?account|workspace|project|repository|organization|database)";
 const IRREVERSIBLE_CUA_RESULT = "(?:deletion|removal|closure|termination)";
+// The destructive phrase must end here (or name the confirmation control).
+// Without this, benign UI/docs text such as "account settings" or
+// "repository removal documentation" inherits a destructive prefix.
+const IRREVERSIBLE_CUA_COMPLETION =
+  `(?=` +
+  `\\s*(?:$|[.!?,;:)\\]}'"])` +
+  `|\\s+(?:(?:and|then)\\s+confirm(?:\\s+(?:button|link))?|(?:button|link))\\s*(?:$|[.!?,;:)\\]}'"])` +
+  `)`;
 const CUA_IRREVERSIBLE_ACTION = new RegExp(
   `\\b(?:` +
     `(?:permanently\\s+)?(?:delete|remove|close|erase|terminate|destroy|purge|wipe)\\s+(?:(?:the|this|my|your)\\s+)?${IRREVERSIBLE_CUA_NOUN}` +
     `|(?:permanent\\s+)?${IRREVERSIBLE_CUA_NOUN}\\s+${IRREVERSIBLE_CUA_RESULT}` +
     `|${IRREVERSIBLE_CUA_RESULT}\\s+of\\s+(?:(?:the|this|my|your)\\s+)?${IRREVERSIBLE_CUA_NOUN}` +
-    `)\\b`,
+    `)${IRREVERSIBLE_CUA_COMPLETION}`,
   "i",
 );
 
@@ -373,7 +381,11 @@ export function looksSensitive(text: string): boolean {
 }
 
 export function looksDestructive(text: string): boolean {
-  return matchFirst(DESTRUCTIVE, text) !== null || matchRemoteDeleteCommand("Bash", text) !== null;
+  return (
+    matchFirst(DESTRUCTIVE, text) !== null ||
+    matchParsedCommandDestruction("Bash", text) !== null ||
+    matchRemoteDeleteCommand("Bash", text) !== null
+  );
 }
 
 /** The key an "Always allow" remembers.
@@ -429,14 +441,40 @@ function matchRemoteDeleteCommand(tool: string, summary: string): string | null 
   for (const segment of summary.split(/&&|\|\||[;|\n]/).map((part) => part.trim()).filter(Boolean)) {
     const effective = effectiveCommand(segment);
     if (!effective) continue;
-    if (/^(?:curl|wget)$/.test(effective.program) && /(?:^|\s)(?:-X|--request|--method)(?:=|\s*)DELETE\b/i.test(segment)) {
-      return "remote-http-delete";
+    const args = effective.words.slice(effective.programIndex + 1).map(cleanCommandWord);
+    if (/^(?:curl|wget)$/.test(effective.program)) {
+      const hasDeleteMethod = args.some((word, index) =>
+        /^(?:-X|--request|--method)=?DELETE$/i.test(word) ||
+        (/^(?:-X|--request|--method)$/i.test(word) && args[index + 1]?.toUpperCase() === "DELETE"),
+      );
+      if (hasDeleteMethod) return "remote-http-delete";
     }
     if (/^(?:http|https|xh)$/.test(effective.program)) {
-      const args = effective.words
-        .slice(effective.programIndex + 1)
-        .map(cleanCommandWord);
       if (args.some((word) => word.toUpperCase() === "DELETE")) return "remote-http-delete";
+    }
+  }
+  return null;
+}
+
+/** Quote-clean checks for destructive command forms whose raw spelling may
+ * hide flags from the literal regex layer. Exact local deletion remains
+ * routine; only recursive/glob deletion and remote bucket destruction card. */
+function matchParsedCommandDestruction(tool: string, summary: string): string | null {
+  if (!COMMAND_TOOLS.has(bareToolName(tool))) return null;
+  for (const segment of summary.split(/&&|\|\||[;|\n]/).map((part) => part.trim()).filter(Boolean)) {
+    const effective = effectiveCommand(segment);
+    if (!effective) continue;
+    const args = effective.words.slice(effective.programIndex + 1).map(cleanCommandWord);
+    if (effective.program === "rm") {
+      if (args.some((word) => /^-[^-]*r/i.test(word) || word === "--recursive")) return "parsed-rm-recursive";
+      if (args.some((word) => /[*?\[]/.test(word))) return "parsed-rm-glob";
+    }
+    if (
+      effective.program === "aws" &&
+      ((args[0] === "s3" && args[1] === "rm" && args.includes("--recursive")) ||
+        (args[0] === "s3api" && /^delete-[\w-]+$/i.test(args[1] ?? "")))
+    ) {
+      return "parsed-aws-destruction";
     }
   }
   return null;
@@ -630,6 +668,7 @@ export function autoVerdict(
   const destructive =
     matchFirst(DESTRUCTIVE, summary) ??
     matchFirst(DESTRUCTIVE, tool) ??
+    matchParsedCommandDestruction(tool, summary) ??
     matchRemoteDeleteCommand(tool, summary) ??
     matchRemoteDestructive(tool, summary) ??
     matchIrreversibleCua(tool, summary) ??

@@ -51,7 +51,10 @@ describe("looksDestructive", () => {
     "gh api --method=DELETE repos/acme/prod",
     "gh api -XDELETE repos/acme/prod",
     "curl -X DELETE https://api.github.com/repos/acme/prod",
+    '"curl.exe" -X "DELETE" https://api.github.com/repos/acme/prod',
+    '"rm" "-rf" "build"',
     "aws s3 rm s3://prod --recursive",
+    'aws s3 rm s3://prod "--recursive"',
     "aws s3api delete-bucket --bucket prod",
     "git branch -d old-branch",
     "git reset --hard HEAD~5",
@@ -246,6 +249,8 @@ describe("autoDecision", () => {
       ["Bash", "gh api -XDELETE repos/acme/prod"],
       ["Bash", "git update-ref -d refs/heads/main"],
       ["Bash", "curl -X DELETE https://api.github.com/repos/acme/prod"],
+      ["Bash", '"curl.exe" -X "DELETE" https://api.github.com/repos/acme/prod'],
+      ["Bash", '"rm" "-rf" "build"'],
       ["Bash", "http DELETE https://api.github.com/repos/acme/prod"],
       ["Bash", "https DELETE https://api.github.com/repos/acme/prod"],
       ["Bash", "xh DELETE https://api.github.com/repos/acme/prod"],
@@ -263,6 +268,7 @@ describe("autoDecision", () => {
       ["mcp__http__request", '{"requestMethod":"DELETE","path":"/repos/acme/prod"}'],
       ["mcp__github__delete_file", "src/obsolete.ts"],
       ["Bash", "aws s3 rm s3://prod --recursive"],
+      ["Bash", 'aws s3 rm s3://prod "--recursive"'],
       ["Bash", "aws s3api delete-bucket --bucket prod"],
     ]) {
       expect(autoVerdict({}, tool, command, scoped()), `${tool}: ${command}`).toMatchObject({
@@ -524,6 +530,19 @@ describe("autoDecision", () => {
       "http POST https://api.github.com/repos/acme/prod note=DELETE",
     ]) {
       expect(autoVerdict({}, "Bash", command, scoped()), command).toMatchObject({
+        behavior: "allow",
+        source: "guarded-autonomy",
+      });
+    }
+    for (const summary of [
+      "Close account settings panel",
+      "Close workspace sidebar",
+      "Remove project from favorites",
+      "Delete repository filter",
+      "Show account deletion policy",
+      "Open repository removal documentation",
+    ]) {
+      expect(autoVerdict({}, "mcp__computer__click", summary, scoped()), summary).toMatchObject({
         behavior: "allow",
         source: "guarded-autonomy",
       });
