@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 
 import type { RetrievalProfile } from "../shared/retrieval-profile.ts";
@@ -19,6 +19,7 @@ export const RETRIEVAL_DEDUPE_MS = 5 * 60_000;
 export const RETRIEVAL_CIRCUIT_BREAKER_MS = 60_000;
 const MAX_SOURCE_BYTES = 16 * 1024 * 1024;
 const MAX_QUERY_BYTES = 8_000;
+const REPOSITORY_ORIGIN_TIMEOUT_MS = 500;
 
 export interface OpenMausRetrievalRequest {
   schema: "openmaus.retrieval-request.v1";
@@ -48,6 +49,22 @@ export interface OpenMausRetrievalReceipt {
     threadId: string;
     taskId: string;
   };
+  /** Filled only after the native adapter accepts or rejects this exact
+   * turn. The digest binds the receipt to the retrieval block passed in the
+   * system context without persisting that block, its excerpts, or query. */
+  native_dispatch_proof: {
+    status: "accepted" | "failed";
+    botId: string;
+    threadId: string;
+    taskId: string;
+    instanceId: string;
+    driverKind: string;
+    model: string;
+    turnId: string | null;
+    contextBytes: number;
+    contextSha256: string;
+    failureStage: "before-adapter" | "adapter-rejected" | null;
+  } | null;
 }
 
 export interface OpenMausRetrievalOutcome {
@@ -59,6 +76,14 @@ export interface OpenMausRetrieverOptions {
   sourceRetrieve?: (request: OpenMausRetrievalRequest) => Promise<JsonValue>;
   sourceTimeoutMs?: number;
   circuitBreakerMs?: number;
+  /** Server-owned persistence root for exact-identity prior-turn material.
+   * Evidence cannot nominate or widen this boundary. */
+  trustedPriorTurnRoot?: string;
+  /** Server-owned Fleet snapshot base. `null` disables snapshot aliases. */
+  trustedSnapshotRoot?: string | null;
+  /** Test seam for the bounded local origin read; its returned value is still
+   * parsed and validated before it can select a snapshot namespace. */
+  readRepositoryOrigin?: (workspaceRoot: string) => Promise<string | null>;
   readSource?: (path: string) => Promise<Buffer>;
   statSource?: (path: string) => Promise<{ isFile(): boolean; size: number }>;
   realpathSource?: (path: string) => Promise<string>;
@@ -79,8 +104,8 @@ const retrievalSourceTruthSchema = z.object({
   verification_scope: z.literal("current_source_bytes"),
   repository_root: z.string(),
   source_roots: z.array(z.string()).min(1),
-  kind: z.enum(["prior-turn", "prior_turn", "source"]).optional(),
-  source_type: z.enum(["prior-turn", "prior_turn", "source"]).optional(),
+  kind: z.enum(["prior-turn", "prior_turn", "journal", "transcript", "conversation", "source"]).optional(),
+  source_type: z.enum(["prior-turn", "prior_turn", "journal", "transcript", "conversation", "source"]).optional(),
   botId: z.string().optional(),
   bot_id: z.string().optional(),
   threadId: z.string().optional(),
@@ -107,8 +132,8 @@ export const retrievalEvidenceHitSchema = z.object({
   snippet: z.string().min(1),
   source_truth: retrievalSourceTruthSchema,
   current_source_verification: currentSourceVerificationSchema,
-  kind: z.enum(["prior-turn", "prior_turn", "source"]).optional(),
-  source_type: z.enum(["prior-turn", "prior_turn", "source"]).optional(),
+  kind: z.enum(["prior-turn", "prior_turn", "journal", "transcript", "conversation", "source"]).optional(),
+  source_type: z.enum(["prior-turn", "prior_turn", "journal", "transcript", "conversation", "source"]).optional(),
   botId: z.string().optional(),
   bot_id: z.string().optional(),
   threadId: z.string().optional(),
@@ -123,6 +148,9 @@ const retrievalEvidenceRequestSchema = z.object({
   cwd: z.string(),
   surface: z.literal("openmausbot"),
   session: z.string(),
+  botId: z.string(),
+  threadId: z.string(),
+  taskId: z.string(),
   truth: z.literal("working_set"),
   active_only: z.literal(true),
   hit_limit: z.literal(5),
@@ -131,7 +159,7 @@ const retrievalEvidenceRequestSchema = z.object({
 const retrievalEvidenceSchema = z.object({
   schema: z.literal("retrieval.evidence.v1"),
   request: retrievalEvidenceRequestSchema,
-  current_source_verified: z.literal(true),
+  current_source_verified: z.boolean(),
   instruction_authority: z.literal(false),
   content_trust: z.literal("untrusted_retrieval_evidence"),
   persistent_process_started: z.literal(false),
@@ -141,8 +169,9 @@ const retrievalEvidenceSchema = z.object({
   answerability: z.enum(["answerable", "insufficient_evidence", "no_answer"]),
   hits: z.array(retrievalEvidenceHitSchema).max(RETRIEVAL_HIT_LIMIT),
   windows_served: z.boolean().optional(),
-  windows_active_generation: z.string().optional(),
-  manifest_digest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
+  windows_active_generation: z.string().nullable().optional(),
+  local_manifest_digest: z.string().regex(/^sha256:[a-f0-9]{64}$/).nullable().optional(),
+  manifest_digest: z.string().regex(/^sha256:[a-f0-9]{64}$/).nullable().optional(),
   fallback: z.string().nullable().optional(),
 }).loose();
 
@@ -151,6 +180,19 @@ type RetrievalSourceTruth = z.output<typeof retrievalSourceTruthSchema>;
 
 function sha256(value: Buffer | string): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function normalizedFleetText(value: string): string {
+  const lines = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  return `${lines.map((line) => line.trimEnd()).join("\n").trim()}\n`;
+}
+
+function fleetContentHash(value: string): string {
+  return sha256(normalizedFleetText(value));
+}
+
+function normalizedSnippet(value: string): string {
+  return value.replace(/\s+/gu, " ").trim();
 }
 
 function clipUtf8(value: string, maxBytes: number): string {
@@ -244,6 +286,12 @@ function defaultSourceRetrieve(request: OpenMausRetrievalRequest): Promise<JsonV
     request.surface,
     "--session",
     retrievalSession(request),
+    "--bot-id",
+    request.botId,
+    "--thread-id",
+    request.threadId,
+    "--task-id",
+    request.taskId,
     "--active-only",
     "--limit",
     String(request.limit),
@@ -279,6 +327,91 @@ function isWithin(root: string, candidate: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+interface WorkspaceBoundary {
+  root: string;
+  isGitRepository: boolean;
+}
+
+function nearestWorkspaceBoundary(cwd: string): WorkspaceBoundary {
+  const exactCwd = resolve(cwd);
+  let candidate = exactCwd;
+  while (true) {
+    if (existsSync(join(candidate, ".git"))) return { root: candidate, isGitRepository: true };
+    const parent = dirname(candidate);
+    if (parent === candidate) return { root: exactCwd, isGitRepository: false };
+    candidate = parent;
+  }
+}
+
+interface RepositoryIdentity {
+  owner: string;
+  name: string;
+}
+
+function parseRepositoryIdentity(origin: string | null): RepositoryIdentity | null {
+  if (!origin || /[\r\n\0]/u.test(origin)) return null;
+  const value = origin.trim();
+  let repositoryPath: string;
+  try {
+    if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(value)) {
+      const url = new URL(value);
+      if (!["git:", "http:", "https:", "ssh:"].includes(url.protocol) || !url.hostname) return null;
+      repositoryPath = url.pathname;
+    } else {
+      const scp = value.match(/^(?:[^@/:\s]+@)?[^/:\s]+:(?<path>[^\s]+)$/u);
+      if (!scp?.groups?.path) return null;
+      repositoryPath = scp.groups.path;
+    }
+  } catch {
+    return null;
+  }
+  const segments = repositoryPath.replace(/^\/+|\/+$/gu, "").split("/");
+  if (segments.length < 2) return null;
+  const owner = segments.at(-2)!;
+  const name = segments.at(-1)!.replace(/\.git$/iu, "");
+  const validSegment = (segment: string): boolean =>
+    segment.length <= 100 && /^[a-z0-9][a-z0-9._-]*$/iu.test(segment) && segment !== "." && segment !== "..";
+  return validSegment(owner) && validSegment(name) ? { owner, name } : null;
+}
+
+function defaultReadRepositoryOrigin(workspaceRoot: string): Promise<string | null> {
+  return new Promise((resolvePromise) => {
+    execFile(
+      "git",
+      ["-C", workspaceRoot, "config", "--local", "--get", "remote.origin.url"],
+      {
+        encoding: "utf8",
+        env: retrievalEnvironment(),
+        timeout: REPOSITORY_ORIGIN_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+        maxBuffer: 4_096,
+        windowsHide: true,
+      },
+      (error, stdout) => resolvePromise(error ? null : stdout.trim() || null),
+    );
+  });
+}
+
+async function boundedRepositoryIdentity(
+  workspaceRoot: string,
+  readOrigin: (workspaceRoot: string) => Promise<string | null>,
+): Promise<RepositoryIdentity | null> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const origin = await Promise.race([
+      readOrigin(workspaceRoot),
+      new Promise<null>((resolvePromise) => {
+        timer = setTimeout(() => resolvePromise(null), REPOSITORY_ORIGIN_TIMEOUT_MS);
+      }),
+    ]);
+    return parseRepositoryIdentity(origin);
+  } catch {
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function pathWithinRoots(
   path: string,
   roots: string[],
@@ -298,27 +431,77 @@ async function pathWithinRoots(
   }
 }
 
+async function pathWithinSnapshotNamespace(
+  path: string,
+  snapshotRoot: string,
+  identity: RepositoryIdentity,
+  realpathSource: (path: string) => Promise<string>,
+): Promise<boolean> {
+  const repositorySlug = `${identity.owner}__${identity.name}`;
+  const repositorySnapshots = resolve(snapshotRoot, repositorySlug);
+  const candidate = resolve(path);
+  const rel = relative(repositorySnapshots, candidate);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return false;
+  const generation = rel.split(/[/\\]/u)[0];
+  if (!generation || !/^[a-f0-9]{40,64}$/u.test(generation)) return false;
+  const generationRoot = join(repositorySnapshots, generation);
+  try {
+    const [realSnapshotRoot, realRepositorySnapshots, realGenerationRoot, realCandidate] = await Promise.all([
+      realpathSource(resolve(snapshotRoot)),
+      realpathSource(repositorySnapshots),
+      realpathSource(generationRoot),
+      realpathSource(candidate),
+    ]);
+    const repositoryRelative = relative(realSnapshotRoot, realRepositorySnapshots);
+    const generationRelative = relative(realRepositorySnapshots, realGenerationRoot);
+    return !repositoryRelative.includes("/") && !repositoryRelative.includes("\\") &&
+      repositoryRelative.toLowerCase() === repositorySlug.toLowerCase() &&
+      generationRelative === generation &&
+      isWithin(realGenerationRoot, realCandidate);
+  } catch {
+    return false;
+  }
+}
+
+function isPriorTurnHit(
+  hit: RetrievalEvidenceHit,
+  sourceTruth: RetrievalSourceTruth,
+  canonicalPath: string,
+): boolean {
+  const priorTurnKinds = new Set(["prior-turn", "prior_turn", "journal", "transcript", "conversation"]);
+  const declaredKinds = [hit.kind, hit.source_type, sourceTruth.kind, sourceTruth.source_type];
+  return declaredKinds.some((kind) => kind !== undefined && priorTurnKinds.has(kind)) ||
+    /(?:^|[/\\])(?:turns(?:-[^/\\]+)?\.ndjson|messages-[^/\\]+\.json|journal(?:-[^/\\]+)?\.(?:jsonl?|ndjson|md)|transcript(?:-[^/\\]+)?\.(?:jsonl?|ndjson|md)|conversation(?:-[^/\\]+)?\.(?:jsonl?|ndjson))$/i.test(canonicalPath);
+}
+
 function priorTurnIdentityMatches(
   hit: RetrievalEvidenceHit,
   sourceTruth: RetrievalSourceTruth,
   canonicalPath: string,
   request: OpenMausRetrievalRequest,
 ): boolean {
-  const kind = hit.kind ?? hit.source_type ?? sourceTruth.kind ?? sourceTruth.source_type;
-  const botId = hit.botId ?? hit.bot_id ?? sourceTruth.botId ?? sourceTruth.bot_id;
-  const threadId = hit.threadId ?? hit.thread_id ?? sourceTruth.threadId ?? sourceTruth.thread_id;
-  const taskId = hit.taskId ?? hit.task_id ?? sourceTruth.taskId ?? sourceTruth.task_id;
-  const hasScopedIdentity = botId !== undefined || threadId !== undefined || taskId !== undefined;
-  const isPriorTurn = kind === "prior-turn" || kind === "prior_turn";
-  const isPriorTurnPath = /(?:^|[/\\])(?:turns\.ndjson|messages-[^/\\]+\.json)$/i.test(canonicalPath);
-  if (!isPriorTurn && !isPriorTurnPath && !hasScopedIdentity) return true;
-  return botId === request.botId && threadId === request.threadId && taskId === request.taskId;
+  const botIds = [hit.botId, hit.bot_id, sourceTruth.botId, sourceTruth.bot_id]
+    .filter((value): value is string => value !== undefined);
+  const threadIds = [hit.threadId, hit.thread_id, sourceTruth.threadId, sourceTruth.thread_id]
+    .filter((value): value is string => value !== undefined);
+  const taskIds = [hit.taskId, hit.task_id, sourceTruth.taskId, sourceTruth.task_id]
+    .filter((value): value is string => value !== undefined);
+  const hasScopedIdentity = botIds.length > 0 || threadIds.length > 0 || taskIds.length > 0;
+  if (!isPriorTurnHit(hit, sourceTruth, canonicalPath) && !hasScopedIdentity) return true;
+  return botIds.length > 0 && botIds.every((value) => value === request.botId) &&
+    threadIds.length > 0 && threadIds.every((value) => value === request.threadId) &&
+    taskIds.length > 0 && taskIds.every((value) => value === request.taskId);
 }
 
 async function acceptHit(
   hit: RetrievalEvidenceHit,
   request: OpenMausRetrievalRequest,
-  options: Required<Pick<OpenMausRetrieverOptions, "readSource" | "statSource" | "realpathSource">>,
+  options: Required<Pick<OpenMausRetrieverOptions, "readSource" | "statSource" | "realpathSource">> & {
+    workspaceRoot: string;
+    trustedPriorTurnRoot: string | null;
+    trustedSnapshotRoot: string | null;
+    repositoryIdentity: RepositoryIdentity | null;
+  },
 ): Promise<AcceptedHit | null> {
   const canonicalPath = hit.canonical_path;
   const contentHash = hit.content_hash.toLowerCase();
@@ -334,6 +517,22 @@ async function acceptHit(
   }
   if (!await pathWithinRoots(canonicalPath, sourceTruth.source_roots, options.realpathSource)) return null;
   if (!await pathWithinRoots(canonicalPath, [sourceTruth.repository_root], options.realpathSource)) return null;
+  const serverOwnedRoots = [
+    options.workspaceRoot,
+    ...(isPriorTurnHit(hit, sourceTruth, canonicalPath) && options.trustedPriorTurnRoot
+      ? [options.trustedPriorTurnRoot]
+      : []),
+  ];
+  const isWithinServerRoots = await pathWithinRoots(canonicalPath, serverOwnedRoots, options.realpathSource);
+  const isSameRepositorySnapshot = !isPriorTurnHit(hit, sourceTruth, canonicalPath) &&
+    options.trustedSnapshotRoot !== null && options.repositoryIdentity !== null &&
+    await pathWithinSnapshotNamespace(
+      canonicalPath,
+      options.trustedSnapshotRoot,
+      options.repositoryIdentity,
+      options.realpathSource,
+    );
+  if (!isWithinServerRoots && !isSameRepositorySnapshot) return null;
   if (
     verification.verified !== true ||
     verification.canonical_path !== canonicalPath ||
@@ -349,9 +548,11 @@ async function acceptHit(
     const current = await options.readSource(canonicalPath);
     if (current.length > MAX_SOURCE_BYTES) return null;
     if (await options.realpathSource(canonicalPath) !== realPathBefore) return null;
-    if (sha256(current) !== contentHash) return null;
     const currentText = current.toString("utf8");
-    if (!currentText.includes(snippet)) return null;
+    if (fleetContentHash(currentText) !== contentHash) return null;
+    const currentSnippetText = normalizedSnippet(currentText);
+    const expectedSnippet = normalizedSnippet(snippet);
+    if (!expectedSnippet || !currentSnippetText.includes(expectedSnippet)) return null;
   } catch {
     return null;
   }
@@ -399,6 +600,7 @@ function baseReceipt(request: OpenMausRetrievalRequest): OpenMausRetrievalReceip
       threadId: request.threadId,
       taskId: request.taskId,
     },
+    native_dispatch_proof: null,
   };
 }
 
@@ -409,6 +611,9 @@ export class OpenMausRetriever {
   private readonly readSource: (path: string) => Promise<Buffer>;
   private readonly statSource: (path: string) => Promise<{ isFile(): boolean; size: number }>;
   private readonly realpathSource: (path: string) => Promise<string>;
+  private readonly trustedPriorTurnRoot: string | null;
+  private readonly trustedSnapshotRoot: string | null;
+  private readonly readRepositoryOrigin: (workspaceRoot: string) => Promise<string | null>;
   private readonly now: () => number;
   private readonly recent = new Map<string, number>();
   private readonly inFlight = new Set<string>();
@@ -421,6 +626,11 @@ export class OpenMausRetriever {
     this.readSource = options.readSource ?? readFile;
     this.statSource = options.statSource ?? stat;
     this.realpathSource = options.realpathSource ?? realpath;
+    this.trustedPriorTurnRoot = options.trustedPriorTurnRoot ? resolve(options.trustedPriorTurnRoot) : null;
+    this.trustedSnapshotRoot = options.trustedSnapshotRoot === null
+      ? null
+      : resolve(options.trustedSnapshotRoot ?? join(homedir(), ".local", "share", "aos-codebase-memory", "snapshots"));
+    this.readRepositoryOrigin = options.readRepositoryOrigin ?? defaultReadRepositoryOrigin;
     this.now = options.now ?? Date.now;
   }
 
@@ -463,55 +673,79 @@ export class OpenMausRetriever {
 
     this.inFlight.add(key);
     this.recent.set(key, now);
+    const workspaceBoundary = nearestWorkspaceBoundary(request.cwd);
+    const repositoryIdentityPromise = workspaceBoundary.isGitRepository
+      ? boundedRepositoryIdentity(workspaceBoundary.root, this.readRepositoryOrigin)
+      : Promise.resolve(null);
     let timer: NodeJS.Timeout | undefined;
     try {
-      const raw = await Promise.race([
-        this.sourceRetrieve(request),
+      const attempt = (async (): Promise<OpenMausRetrievalOutcome> => {
+        // Keep late source reads isolated from the fail-open timeout receipt.
+        const attemptReceipt = baseReceipt(request);
+        const raw = await this.sourceRetrieve(request);
+        const parsed = retrievalEvidenceSchema.safeParse(raw);
+        if (!parsed.success) {
+          attemptReceipt.skip_reason = "invalid-evidence";
+          return { context: "", receipt: attemptReceipt };
+        }
+        const evidence = parsed.data;
+        const evidenceRequest = evidence.request;
+        if (
+          evidenceRequest.query !== request.query ||
+          resolve(evidenceRequest.cwd) !== request.cwd ||
+          evidenceRequest.session !== retrievalSession(request) ||
+          evidenceRequest.botId !== request.botId ||
+          evidenceRequest.threadId !== request.threadId ||
+          evidenceRequest.taskId !== request.taskId
+        ) {
+          attemptReceipt.skip_reason = "invalid-evidence";
+          return { context: "", receipt: attemptReceipt };
+        }
+        if (evidence.hits.length > 0 && evidence.current_source_verified !== true) {
+          attemptReceipt.skip_reason = "invalid-evidence";
+          return { context: "", receipt: attemptReceipt };
+        }
+        if (evidence.answerability !== "answerable") {
+          attemptReceipt.skip_reason = evidence.answerability;
+          return { context: "", receipt: attemptReceipt };
+        }
+
+        const candidates = evidence.hits.slice(0, RETRIEVAL_HIT_LIMIT);
+        const repositoryIdentity = await repositoryIdentityPromise;
+        const verified = (await Promise.all(
+          candidates.map((hit) => acceptHit(hit, request, {
+            readSource: this.readSource,
+            statSource: this.statSource,
+            realpathSource: this.realpathSource,
+            workspaceRoot: workspaceBoundary.root,
+            trustedPriorTurnRoot: this.trustedPriorTurnRoot,
+            trustedSnapshotRoot: this.trustedSnapshotRoot,
+            repositoryIdentity,
+          })),
+        )).filter((hit): hit is AcceptedHit => hit !== null);
+        const context = formatContext(verified, request);
+        attemptReceipt.accepted_hits = verified.length;
+        const claimedGeneration = evidence.windows_active_generation;
+        const windowsGeneration = claimedGeneration && /^sha256:[a-f0-9]{64}$/.test(claimedGeneration)
+          ? claimedGeneration
+          : null;
+        attemptReceipt.windows_served = evidence.windows_served === true && verified.length > 0 && windowsGeneration !== null;
+        attemptReceipt.generation_identity = attemptReceipt.windows_served
+          ? windowsGeneration
+          : evidence.local_manifest_digest ?? evidence.manifest_digest ?? null;
+        attemptReceipt.fallback_path = evidence.fallback ? clipUtf8(sanitize(evidence.fallback), 256) : null;
+        if (!context) attemptReceipt.skip_reason = "no-verified-hits";
+        return { context, receipt: attemptReceipt };
+      })();
+      const outcome = await Promise.race([
+        attempt,
         new Promise<never>((_resolve, reject) => {
           timer = setTimeout(() => reject(new Error("retrieval timed out")), this.sourceTimeoutMs);
           timer.unref?.();
         }),
       ]);
       this.circuitOpenUntil = 0;
-      const parsed = retrievalEvidenceSchema.safeParse(raw);
-      if (!parsed.success) {
-        receipt.skip_reason = "invalid-evidence";
-        return { context: "", receipt };
-      }
-      const evidence = parsed.data;
-      const evidenceRequest = evidence.request;
-      if (
-        evidenceRequest.query !== request.query ||
-        resolve(evidenceRequest.cwd) !== request.cwd ||
-        evidenceRequest.session !== retrievalSession(request)
-      ) {
-        receipt.skip_reason = "invalid-evidence";
-        return { context: "", receipt };
-      }
-      if (evidence.answerability !== "answerable") {
-        receipt.skip_reason = evidence.answerability;
-        return { context: "", receipt };
-      }
-
-      const candidates = evidence.hits.slice(0, RETRIEVAL_HIT_LIMIT);
-      const verified = (await Promise.all(
-        candidates.map((hit) => acceptHit(hit, request, {
-          readSource: this.readSource,
-          statSource: this.statSource,
-          realpathSource: this.realpathSource,
-        })),
-      )).filter((hit): hit is AcceptedHit => hit !== null);
-      const context = formatContext(verified, request);
-      receipt.accepted_hits = verified.length;
-      const claimedGeneration = evidence.windows_active_generation;
-      const windowsGeneration = claimedGeneration && /^sha256:[a-f0-9]{64}$/.test(claimedGeneration)
-        ? claimedGeneration
-        : null;
-      receipt.windows_served = evidence.windows_served === true && verified.length > 0 && windowsGeneration !== null;
-      receipt.generation_identity = receipt.windows_served ? windowsGeneration : evidence.manifest_digest ?? null;
-      receipt.fallback_path = evidence.fallback ? clipUtf8(sanitize(evidence.fallback), 256) : null;
-      if (!context) receipt.skip_reason = "no-verified-hits";
-      return { context, receipt };
+      return outcome;
     } catch {
       this.circuitOpenUntil = this.now() + this.circuitBreakerMs;
       receipt.skip_reason = "retrieval-unavailable";

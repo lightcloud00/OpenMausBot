@@ -98,8 +98,8 @@ import { readCuaConnection } from "./local-computer.ts";
 import { LocalVmIdleTimer } from "./local-vm-idle.ts";
 import { LocalVmLease, LocalVmLeasePool } from "./local-vm-lease.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
-import { createRetrievalRequest, OpenMausRetriever } from "./retrieval.ts";
-import { recordRetrievalReceipt } from "./retrieval-receipt.ts";
+import { createRetrievalRequest, OpenMausRetriever, type OpenMausRetrievalReceipt } from "./retrieval.ts";
+import { finalizeRetrievalReceipt, recordRetrievalReceipt } from "./retrieval-receipt.ts";
 import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
 import { fetchGithubTeam, fetchLibraryTeam, fetchTeamCatalog } from "./team-library.ts";
@@ -259,7 +259,7 @@ let bootSelection = { instanceId: "", model: "" };
 const store = new Store(() => bootSelection);
 bootSelection = await defaultSelection();
 store.seedIfEmpty();
-const retriever = new OpenMausRetriever();
+const retriever = new OpenMausRetriever({ trustedPriorTurnRoot: DATA_DIR });
 
 /** A bot as a client may see it: no provider session bookkeeping.
  *
@@ -1405,8 +1405,11 @@ async function startTurn(
   turnUsage.delete(threadId);
 
   void (async () => {
+    let retrievalContext = "";
+    let retrievalReceipt: OpenMausRetrievalReceipt | null = null;
+    let adapterDispatchAttempted = false;
+    let retrievalReceiptFinalized = false;
     try {
-      let retrievalContext = "";
       const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
       const selectedSkills = selectBundledSkills(
         text,
@@ -1456,7 +1459,7 @@ async function startTurn(
           }),
         );
         retrievalContext = outcome.context;
-        recordRetrievalReceipt(DATA_DIR, outcome.receipt);
+        retrievalReceipt = outcome.receipt;
       }
       // dweb is opt-in: without an explicit daemon URL, do not advertise
       // tools that would fail on every call or spawn an unnecessary proxy.
@@ -1637,7 +1640,8 @@ async function startTurn(
       // (activeVpsThreads was already claimed above, before the provision or
       // reuse await, so the backend guards saw this turn the whole time.)
       watchdog.watch(threadId, bot.id);
-      await instance.adapter.sendTurn({
+      adapterDispatchAttempted = true;
+      const turnStart = await instance.adapter.sendTurn({
         threadId,
         text: turnText,
         model,
@@ -1683,6 +1687,17 @@ async function startTurn(
         integrations,
         cwd,
       });
+      if (retrievalReceipt) {
+        retrievalReceiptFinalized = true;
+        recordRetrievalReceipt(DATA_DIR, finalizeRetrievalReceipt(retrievalReceipt, {
+          status: "accepted",
+          instanceId,
+          driverKind: instance.driverKind,
+          model,
+          turnId: turnStart.turnId,
+          context: retrievalContext,
+        }));
+      }
       // dispatched: the rewind is spent, and the old cursors are dead
       if (rewound) store.patchBot(bot.id, { rewound: false, resumeCursors: {} });
       // and this engine now owns the thread's most recent turn
@@ -1699,6 +1714,17 @@ async function startTurn(
       if (activeVpsThreads.get(bot.id) === threadId) activeVpsThreads.delete(bot.id);
       watchdog.settle(threadId);
       turnUsage.delete(threadId);
+      if (retrievalReceipt && !retrievalReceiptFinalized) {
+        retrievalReceiptFinalized = true;
+        recordRetrievalReceipt(DATA_DIR, finalizeRetrievalReceipt(retrievalReceipt, {
+          status: "failed",
+          failureStage: adapterDispatchAttempted ? "adapter-rejected" : "before-adapter",
+          instanceId,
+          driverKind: instance.driverKind,
+          model,
+          context: retrievalContext,
+        }));
+      }
       const message = e instanceof Error ? e.message : String(e);
       store.appendMessage(threadId, {
         role: "bot",
@@ -1929,6 +1955,7 @@ async function runGroupMemberTurn(
     .reverse()
     .find((message) => message.role === "user" && message.kind === "text" && message.text)?.text ?? "";
   let retrievalContext = "";
+  let retrievalReceipt: OpenMausRetrievalReceipt | null = null;
   if (bot.retrievalProfile === "task-scoped") {
     const outcome = await retriever.retrieve(
       bot.retrievalProfile,
@@ -1941,8 +1968,9 @@ async function runGroupMemberTurn(
       }),
     );
     retrievalContext = outcome.context;
-    recordRetrievalReceipt(DATA_DIR, outcome.receipt);
+    retrievalReceipt = outcome.receipt;
   }
+  const turnSelection = memberTurnSelection(bot.modelSelection);
   const roomSystem =
     (workspace ? `${system}\n${memorySystemPrompt(bot.id).trim()}` : system) +
     renderSkillInstructions(selectedSkills) +
@@ -1989,9 +2017,30 @@ async function runGroupMemberTurn(
         system: roomSystem,
         cwd,
         integrations,
-        ...memberTurnSelection(bot.modelSelection),
+        ...turnSelection,
+      })
+      .then((turnStart) => {
+        if (!retrievalReceipt) return;
+        recordRetrievalReceipt(DATA_DIR, finalizeRetrievalReceipt(retrievalReceipt, {
+          status: "accepted",
+          instanceId: instance.instanceId,
+          driverKind: instance.driverKind,
+          model: turnSelection.model,
+          turnId: turnStart.turnId,
+          context: retrievalContext,
+        }));
       })
       .catch((err) => {
+        if (retrievalReceipt) {
+          recordRetrievalReceipt(DATA_DIR, finalizeRetrievalReceipt(retrievalReceipt, {
+            status: "failed",
+            failureStage: "adapter-rejected",
+            instanceId: instance.instanceId,
+            driverKind: instance.driverKind,
+            model: turnSelection.model,
+            context: retrievalContext,
+          }));
+        }
         store.appendMessage(group.threadId, {
           role: "bot",
           kind: "activity",
