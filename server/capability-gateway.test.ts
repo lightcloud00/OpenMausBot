@@ -1,4 +1,18 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -379,6 +393,290 @@ describe("CapabilityGateway", () => {
     expect(shell).toMatchObject({ exitCode: 0 });
     await gateway.callTool(TOKEN, "openmaus-host", "filesystem_delete", { path: "fixture.txt" });
     expect(() => readFileSync(join(cwd, "fixture.txt"))).toThrow();
+  });
+
+  it("hard-enforces an agent graph permission class and symlink-safe workspace boundary", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "omb-graph-gateway-")));
+    temporary.push(root);
+    const cwd = join(root, "workspace");
+    const outside = join(root, "outside");
+    mkdirSync(cwd);
+    mkdirSync(outside);
+    writeFileSync(join(cwd, "inside.txt"), "inside");
+    mkdirSync(join(cwd, ".git"));
+    writeFileSync(join(cwd, ".git", "config"), "[core]\n");
+    writeFileSync(join(outside, "outside.txt"), "outside");
+    symlinkSync(outside, join(cwd, "escape"));
+    symlinkSync(join(outside, "missing"), join(cwd, "dangling"));
+    const hostCatalog: HostMcpCatalog = {
+      servers: { "openmaus-host": { type: "builtin" } },
+      manifest: createCapabilityProfileManifest({ toolInventory: ["openmaus-host:shell_execute"] }),
+      sources: { claude: "missing", codex: "missing" },
+    };
+    const gateway = new CapabilityGateway(hostCatalog);
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, { botId: "graph", threadId: "read", cwd, graphPermissionClass: "read" });
+
+    const graphTools = await gateway.listTools(TOKEN, "openmaus-host");
+    expect(graphTools.tools.map((tool: { name: string }) => tool.name)).toEqual(["filesystem_read", "filesystem_stat"]);
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_read", { path: "inside.txt" }))
+      .resolves.toMatchObject({ content: "inside" });
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "shell_execute", { command: "pwd" }))
+      .rejects.toThrow(/separate OS sandbox/);
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_read", { path: "escape/outside.txt" }))
+      .rejects.toThrow(/outside the approved workspace/);
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_write", { path: "dangling/new.txt", content: "no" }))
+      .rejects.toThrow(/outside the approved workspace/);
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_write", { path: "new.txt", content: "no" }))
+      .rejects.toThrow(/outside the approved permission class/);
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_delete", { path: "inside.txt" }))
+      .rejects.toThrow(/cannot delete/);
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "shell_execute", { command: "cat ../outside/outside.txt" }))
+      .rejects.toThrow(/separate OS sandbox/);
+
+    gateway.beginTurn(TOKEN_TWO, { botId: "graph", threadId: "write", cwd, graphPermissionClass: "workspace-write" });
+    await expect(gateway.callTool(TOKEN_TWO, "openmaus-host", "filesystem_write", { path: "new.txt", content: "yes" }))
+      .rejects.toThrow(/exact preimage/);
+    const preimage = await gateway.callTool(TOKEN_TWO, "openmaus-host", "filesystem_read", { path: "inside.txt" });
+    writeFileSync(join(cwd, "inside.txt"), "owner changed");
+    await expect(gateway.callTool(TOKEN_TWO, "openmaus-host", "filesystem_write", {
+      path: "inside.txt", content: "graph", expectedSha256: preimage.sha256,
+    })).rejects.toThrow(/owner drift/);
+    const refreshed = await gateway.callTool(TOKEN_TWO, "openmaus-host", "filesystem_read", { path: "inside.txt" });
+    await expect(gateway.callTool(TOKEN_TWO, "openmaus-host", "filesystem_write", {
+      path: "inside.txt", content: "graph", expectedSha256: refreshed.sha256,
+    })).resolves.toMatchObject({ bytes: 5 });
+    const missing = await gateway.callTool(TOKEN_TWO, "openmaus-host", "filesystem_stat", { path: "new.txt" });
+    expect(missing).toMatchObject({ exists: false, sha256: "absent" });
+    await expect(gateway.callTool(TOKEN_TWO, "openmaus-host", "filesystem_write", {
+      path: "new.txt", content: "yes", expectedSha256: missing.sha256,
+    }))
+      .resolves.toMatchObject({ bytes: 3 });
+    expect(readFileSync(join(cwd, "new.txt"), "utf8")).toBe("yes");
+    await expect(gateway.callTool(TOKEN_TWO, "openmaus-host", "filesystem_write", {
+      path: ".git/config", content: "[core]\nhooksPath=/tmp/hooks\n", expectedSha256: `sha256:${"a".repeat(64)}`,
+    })).rejects.toThrow(/repository control metadata/);
+
+    const worktree = join(root, "linked-worktree");
+    mkdirSync(worktree);
+    writeFileSync(join(worktree, ".git"), "gitdir: ../admin\n");
+    gateway.beginTurn(TOKEN, { botId: "graph", threadId: "worktree", cwd: worktree, graphPermissionClass: "workspace-write" });
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_write", {
+      path: ".git", content: "gitdir: /tmp/outside\n", expectedSha256: `sha256:${"a".repeat(64)}`,
+    })).rejects.toThrow(/repository control metadata/);
+  });
+
+  it("binds graph writes to single-link preimages and rejects link or parent replacement", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "omb-graph-identity-")));
+    temporary.push(root);
+    const cwd = join(root, "workspace");
+    const outside = join(root, "outside");
+    mkdirSync(cwd);
+    mkdirSync(outside);
+    const hostCatalog: HostMcpCatalog = {
+      servers: { "openmaus-host": { type: "builtin" } },
+      manifest: createCapabilityProfileManifest(),
+      sources: { claude: "missing", codex: "missing" },
+    };
+    const gateway = new CapabilityGateway(hostCatalog);
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, {
+      botId: "graph",
+      threadId: "identity",
+      cwd,
+      graphPermissionClass: "workspace-write",
+    });
+
+    writeFileSync(join(cwd, "single.txt"), "before");
+    const single = await gateway.callTool(TOKEN, "openmaus-host", "filesystem_read", { path: "single.txt" });
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_write", {
+      path: "single.txt",
+      content: "after",
+      expectedSha256: single.sha256,
+    })).resolves.toMatchObject({ bytes: 5 });
+    expect(readFileSync(join(cwd, "single.txt"), "utf8")).toBe("after");
+    expect(statSync(join(cwd, "single.txt")).nlink).toBe(1);
+
+    const outsideHardLink = join(outside, "hard-link-source.txt");
+    writeFileSync(outsideHardLink, "outside-hard-link");
+    linkSync(outsideHardLink, join(cwd, "hard-link.txt"));
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_read", { path: "hard-link.txt" }))
+      .rejects.toThrow(/outside the approved workspace|single-link/);
+    expect(readFileSync(outsideHardLink, "utf8")).toBe("outside-hard-link");
+
+    const outsideSwap = join(outside, "swap-target.txt");
+    writeFileSync(outsideSwap, "outside-swap");
+    writeFileSync(join(cwd, "swap.txt"), "inside-swap");
+    const swap = await gateway.callTool(TOKEN, "openmaus-host", "filesystem_read", { path: "swap.txt" });
+    rmSync(join(cwd, "swap.txt"));
+    symlinkSync(outsideSwap, join(cwd, "swap.txt"));
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_write", {
+      path: "swap.txt",
+      content: "must-not-land",
+      expectedSha256: swap.sha256,
+    })).rejects.toThrow(/outside the approved workspace|unsafe path|final-path|ELOOP/);
+    expect(readFileSync(outsideSwap, "utf8")).toBe("outside-swap");
+
+    const parent = join(cwd, "parent");
+    const displacedParent = join(cwd, "parent-before-swap");
+    mkdirSync(parent);
+    const absent = await gateway.callTool(TOKEN, "openmaus-host", "filesystem_stat", { path: "parent/new.txt" });
+    expect(absent).toMatchObject({ exists: false, sha256: "absent" });
+    renameSync(parent, displacedParent);
+    mkdirSync(parent);
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_write", {
+      path: "parent/new.txt",
+      content: "must-not-land",
+      expectedSha256: absent.sha256,
+    })).rejects.toThrow(/parent drift/);
+    expect(() => statSync(join(parent, "new.txt"))).toThrow();
+    expect(() => statSync(join(displacedParent, "new.txt"))).toThrow();
+  });
+
+  it("revokes every graph capability when the approved workspace root identity changes", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "omb-graph-root-identity-")));
+    temporary.push(root);
+    const outside = join(root, "outside");
+    const symlinkWorkspace = join(root, "symlink-workspace");
+    const displacedSymlinkWorkspace = join(root, "symlink-workspace-before-swap");
+    mkdirSync(outside);
+    mkdirSync(symlinkWorkspace);
+    writeFileSync(join(symlinkWorkspace, "sentinel.txt"), "inside-original");
+    writeFileSync(join(outside, "sentinel.txt"), "outside-untouched");
+    const hostCatalog: HostMcpCatalog = {
+      servers: { "openmaus-host": { type: "builtin" } },
+      manifest: createCapabilityProfileManifest(),
+      sources: { claude: "missing", codex: "missing" },
+    };
+    const gateway = new CapabilityGateway(hostCatalog, { listAliases: async () => ["graph-must-not-see"] });
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, {
+      botId: "graph",
+      threadId: "root-symlink-swap",
+      cwd: symlinkWorkspace,
+      graphPermissionClass: "workspace-write",
+    });
+
+    await expect(gateway.aliases(TOKEN)).rejects.toThrow(/graph profile does not expose credential aliases/);
+    await expect(
+      gateway.selectCredentialAlias(TOKEN, "openmaus-host", "graph-must-not-see", "GRAPH_SECRET"),
+    ).rejects.toThrow(/graph profile does not allow credential selection/);
+
+    renameSync(symlinkWorkspace, displacedSymlinkWorkspace);
+    symlinkSync(outside, symlinkWorkspace);
+    expect(() => gateway.inventory(TOKEN)).toThrow(/workspace root identity changed/);
+    await expect(gateway.listTools(TOKEN, "openmaus-host")).rejects.toThrow(/workspace root identity changed/);
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_read", { path: "sentinel.txt" }))
+      .rejects.toThrow(/workspace root identity changed/);
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_write", {
+      path: "sentinel.txt",
+      content: "must-not-land",
+      expectedSha256: `sha256:${"a".repeat(64)}`,
+    })).rejects.toThrow(/workspace root identity changed/);
+    expect(readFileSync(join(outside, "sentinel.txt"), "utf8")).toBe("outside-untouched");
+    expect(readFileSync(join(displacedSymlinkWorkspace, "sentinel.txt"), "utf8")).toBe("inside-original");
+
+    const inodeWorkspace = join(root, "inode-workspace");
+    const displacedInodeWorkspace = join(root, "inode-workspace-before-swap");
+    mkdirSync(inodeWorkspace);
+    writeFileSync(join(inodeWorkspace, "sentinel.txt"), "inode-original");
+    gateway.beginTurn(TOKEN_TWO, {
+      botId: "graph",
+      threadId: "root-inode-swap",
+      cwd: inodeWorkspace,
+      graphPermissionClass: "workspace-write",
+    });
+    renameSync(inodeWorkspace, displacedInodeWorkspace);
+    mkdirSync(inodeWorkspace);
+    writeFileSync(join(inodeWorkspace, "sentinel.txt"), "replacement-untouched");
+
+    expect(() => gateway.inventory(TOKEN_TWO)).toThrow(/workspace root identity changed/);
+    await expect(gateway.listTools(TOKEN_TWO, "openmaus-host")).rejects.toThrow(/workspace root identity changed/);
+    await expect(gateway.callTool(TOKEN_TWO, "openmaus-host", "filesystem_read", { path: "sentinel.txt" }))
+      .rejects.toThrow(/workspace root identity changed/);
+    await expect(gateway.callTool(TOKEN_TWO, "openmaus-host", "filesystem_write", {
+      path: "sentinel.txt",
+      content: "must-not-land",
+      expectedSha256: `sha256:${"b".repeat(64)}`,
+    })).rejects.toThrow(/workspace root identity changed/);
+    expect(readFileSync(join(inodeWorkspace, "sentinel.txt"), "utf8")).toBe("replacement-untouched");
+    expect(readFileSync(join(displacedInodeWorkspace, "sentinel.txt"), "utf8")).toBe("inode-original");
+  });
+
+  it("rejects a sparse oversized graph file before allocating a read preimage", async () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "omb-graph-size-")));
+    temporary.push(cwd);
+    const path = join(cwd, "sparse.bin");
+    const size = 1024 * 1024 + 1;
+    writeFileSync(path, "");
+    truncateSync(path, size);
+    const hostCatalog: HostMcpCatalog = {
+      servers: { "openmaus-host": { type: "builtin" } },
+      manifest: createCapabilityProfileManifest(),
+      sources: { claude: "missing", codex: "missing" },
+    };
+    const gateway = new CapabilityGateway(hostCatalog);
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, {
+      botId: "graph",
+      threadId: "bounded-read",
+      cwd,
+      graphPermissionClass: "workspace-write",
+    });
+
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_read", { path: "sparse.bin" }))
+      .rejects.toThrow(/bounded file size/);
+    const sparseSha256 = `sha256:${createHash("sha256").update(Buffer.alloc(size)).digest("hex")}`;
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_write", {
+      path: "sparse.bin",
+      content: "small",
+      expectedSha256: sparseSha256,
+    })).rejects.toThrow(/exact preimage/);
+    expect(statSync(path).size).toBe(size);
+  });
+
+  it("does not authorize graph writes from truncated or binary read preimages", async () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "omb-graph-complete-read-")));
+    temporary.push(cwd);
+    const truncatedPath = join(cwd, "truncated.txt");
+    const binaryPath = join(cwd, "binary.txt");
+    const truncatedBody = Buffer.alloc(256 * 1024 + 1, "a");
+    const binaryBody = Buffer.from([0x61, 0x00, 0x62]);
+    writeFileSync(truncatedPath, truncatedBody);
+    writeFileSync(binaryPath, binaryBody);
+    const hostCatalog: HostMcpCatalog = {
+      servers: { "openmaus-host": { type: "builtin" } },
+      manifest: createCapabilityProfileManifest(),
+      sources: { claude: "missing", codex: "missing" },
+    };
+    const gateway = new CapabilityGateway(hostCatalog);
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, {
+      botId: "graph",
+      threadId: "complete-read",
+      cwd,
+      graphPermissionClass: "workspace-write",
+    });
+
+    const truncated = await gateway.callTool(TOKEN, "openmaus-host", "filesystem_read", { path: "truncated.txt" });
+    expect(JSON.stringify(truncated)).toContain("oversized capability output truncated");
+    const truncatedSha256 = `sha256:${createHash("sha256").update(truncatedBody).digest("hex")}`;
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_write", {
+      path: "truncated.txt",
+      content: "replacement",
+      expectedSha256: truncatedSha256,
+    })).rejects.toThrow(/complete UTF-8 preimage/);
+
+    const binary = await gateway.callTool(TOKEN, "openmaus-host", "filesystem_read", { path: "binary.txt" });
+    expect(binary).toMatchObject({ content: "[binary capability output omitted]", bytes: binaryBody.byteLength });
+    await expect(gateway.callTool(TOKEN, "openmaus-host", "filesystem_write", {
+      path: "binary.txt",
+      content: "replacement",
+      expectedSha256: binary.sha256,
+    })).rejects.toThrow(/complete UTF-8 preimage/);
+
+    expect(readFileSync(truncatedPath)).toEqual(truncatedBody);
+    expect(readFileSync(binaryPath)).toEqual(binaryBody);
   });
 
   it("rejects whole-repository deletion and scrubs exact canaries before host execution", async () => {

@@ -20,8 +20,8 @@ export const BUILTIN_CAPABILITY_TOOLS = [
   },
   {
     name: "filesystem_write",
-    description: "Write or append UTF-8 content to a task-scoped host file.",
-    inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" }, append: { type: "boolean" } }, required: ["path", "content"] },
+    description: "Write or append UTF-8 content to a task-scoped host file. Agent graphs must supply the exact sha256 returned by a prior read, or 'absent' returned by stat.",
+    inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" }, append: { type: "boolean" }, expectedSha256: { type: "string" } }, required: ["path", "content"] },
   },
   {
     name: "filesystem_delete",

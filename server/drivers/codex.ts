@@ -17,7 +17,7 @@ import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
 import { writeFileAtomic } from "../atomic.ts";
 import { fullTaskScopedHardDeny } from "../auto-approve.ts";
 import { computerProxyEnv } from "../container-computer.ts";
-import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import { describeSpawnFailure, execCli, spawnCli, terminateCliTree } from "../procs.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 
 import type {
@@ -33,6 +33,11 @@ import { newEventId, newId } from "../contracts.ts";
 import { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 import { codexLocalProviderArgs } from "./local-inject.ts";
 import { augmentedPath } from "../env-path.ts";
+import {
+  isolatedGraphCapabilityMcpEnvironment,
+  isolatedGraphChildEnvironment,
+  stripUnsafeGraphEnvironment,
+} from "../graph-safe-environment.ts";
 import { appendNative } from "./native.ts";
 
 export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
@@ -66,14 +71,15 @@ function mountMcpServer(
   server: StdioMcpServer,
   approvalMode: "auto" | "prompt" = "auto",
 ): void {
-  Object.assign(env, server.env);
+  const safeEnvironment = stripUnsafeGraphEnvironment(server.env);
+  Object.assign(env, safeEnvironment);
   const prefix = `mcp_servers.${name}`;
   appServerArgs.push(
     "-c", `${prefix}.command=${JSON.stringify(server.command)}`,
     "-c", `${prefix}.args=${JSON.stringify(server.args)}`,
     // Values stay in the child environment; argv contains names only so
     // credentials never appear in process listings or diagnostics.
-    "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(server.env))}`,
+    "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(safeEnvironment))}`,
     "-c", `${prefix}.default_tools_approval_mode=${JSON.stringify(approvalMode)}`,
   );
 }
@@ -195,14 +201,17 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     await refreshModels();
     const listeners = new Set<RuntimeEventListener>();
     interface Turn {
-      stop: () => void;
+      stop: () => Promise<void>;
       turnId: string;
+      turnToken?: string;
       asks: Map<string, (behavior: "allow" | "deny" | "answer", message?: string, source?: "user" | "timeout" | "system") => void>;
     }
     const active = new Map<string, Turn>();
 
     const emit = (event: RuntimeEvent) => {
-      for (const l of [...listeners]) l(event);
+      const turnToken = event.turnToken ?? active.get(event.threadId)?.turnToken;
+      const bound = turnToken && !event.turnToken ? { ...event, turnToken } : event;
+      for (const l of [...listeners]) l(bound);
     };
     const base = (threadId: string, turnId: string) => ({
       eventId: newEventId(),
@@ -218,10 +227,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       const fullTaskScoped = turn.accessProfile === "full-task-scoped";
       const turnId = newId();
 
-      const env = childEnv();
+      let env = childEnv();
       if (fullTaskScoped) {
-        env.CODEX_HOME = ensureOpenMausCodexHome();
-        for (const name of Object.keys(env)) if (name.startsWith("AOS_")) delete env[name];
+        env = isolatedGraphChildEnvironment(env, {
+          PATH: augmentedPath(),
+          NPM_CONFIG_LOGLEVEL: "error",
+          CODEX_HOME: ensureOpenMausCodexHome(),
+        });
       }
       const appServerArgs = ["app-server", ...codexLocalProviderArgs(env, turn.model)];
       if (turn.integrations?.capabilityGateway) {
@@ -229,15 +241,18 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           appServerArgs,
           env,
           "openmaus_capabilities",
-          turn.integrations.capabilityGateway,
-          fullTaskScoped && !turn.autoApprove ? "prompt" : "auto",
+          {
+            ...turn.integrations.capabilityGateway,
+            env: isolatedGraphCapabilityMcpEnvironment(turn.integrations.capabilityGateway.env),
+          },
+          turn.forceApprovalBroker || (fullTaskScoped && !turn.autoApprove) ? "prompt" : "auto",
         );
       }
       if (turn.integrations?.composio && !fullTaskScoped) {
-        mountMcpServer(appServerArgs, env, "openmausbot_connectors", turn.integrations.composio, fullTaskScoped ? "prompt" : "auto");
+        mountMcpServer(appServerArgs, env, "openmausbot_connectors", turn.integrations.composio, turn.forceApprovalBroker || fullTaskScoped ? "prompt" : "auto");
       }
       if (turn.integrations?.agents && !fullTaskScoped) {
-        mountMcpServer(appServerArgs, env, "agents", turn.integrations.agents, fullTaskScoped ? "prompt" : "auto");
+        mountMcpServer(appServerArgs, env, "agents", turn.integrations.agents, turn.forceApprovalBroker || fullTaskScoped ? "prompt" : "auto");
       }
       if (turn.integrations?.computer && !fullTaskScoped) {
         const proxyEnv = computerProxyEnv(turn.integrations.computer);
@@ -253,21 +268,22 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             OMB_CONTROL_URL: proxyEnv.OMB_CONTROL_URL ?? "",
             OMB_CONTROL_TOKEN: proxyEnv.OMB_CONTROL_TOKEN ?? "",
           },
-        }, fullTaskScoped ? "prompt" : "auto");
+        }, turn.forceApprovalBroker || fullTaskScoped ? "prompt" : "auto");
       } else if (turn.integrations?.localComputer && !fullTaskScoped) {
         // The host daemon and isolated Local VM both arrive as a direct Cua
         // Driver stdio MCP server. Codex sees the same computer tool surface.
-        mountMcpServer(appServerArgs, env, "computer", turn.integrations.localComputer, fullTaskScoped ? "prompt" : "auto");
+        mountMcpServer(appServerArgs, env, "computer", turn.integrations.localComputer, turn.forceApprovalBroker || fullTaskScoped ? "prompt" : "auto");
       }
       if (turn.integrations?.phone && !fullTaskScoped) {
         const bridge = turn.integrations.phone;
-        Object.assign(env, bridge.env);
+        const safeEnvironment = stripUnsafeGraphEnvironment(bridge.env);
+        Object.assign(env, safeEnvironment);
         const prefix = "mcp_servers.openmausbot_phone";
         appServerArgs.push(
           "-c", `${prefix}.command=${JSON.stringify(bridge.command)}`,
           "-c", `${prefix}.args=${JSON.stringify(bridge.args)}`,
-          "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(bridge.env))}`,
-          "-c", `${prefix}.default_tools_approval_mode=${JSON.stringify(fullTaskScoped ? "prompt" : "auto")}`,
+          "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(safeEnvironment))}`,
+          "-c", `${prefix}.default_tools_approval_mode=${JSON.stringify(turn.forceApprovalBroker || fullTaskScoped ? "prompt" : "auto")}`,
         );
       }
 
@@ -317,7 +333,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           send({ jsonrpc: "2.0", id, method, params });
         });
 
-      const stop = () => killCliTree(child);
+      const stop = () => terminateCliTree(child);
 
       const settle = (ok: boolean, stopReason: string | null) => {
         if (state.settled) return;
@@ -327,7 +343,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         rpcPending.clear();
         active.delete(threadId);
         emit({ ...base(threadId, turnId), turnToken: turn.turnToken, type: "turn.completed", ok, stopReason, cost: null, ...(state.usage ? { usage: state.usage } : {}) });
-        stop(); // the app-server never exits on its own
+        void stop().catch(() => {}); // the app-server never exits on its own
       };
 
       // server→client approval request → canonical request.opened
@@ -388,11 +404,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             });
             return send({ jsonrpc: "2.0", id: msg.id, result: approvalResult("deny") });
           }
-          if (turn.autoApprove) {
+          if (turn.autoApprove && !turn.forceApprovalBroker) {
             return send({ jsonrpc: "2.0", id: msg.id, result: approvalResult("allow") });
           }
         }
-        if (config.fullAuto && !isQuestion && !fullTaskScoped) {
+        if (config.fullAuto && !turn.forceApprovalBroker && !isQuestion && !fullTaskScoped) {
           return send({ jsonrpc: "2.0", id: msg.id, result: approvalResult("allow") });
         }
         const requestId = newId();
@@ -579,7 +595,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         }
       });
 
-      active.set(threadId, { stop, turnId, asks });
+      active.set(threadId, { stop, turnId, turnToken: turn.turnToken, asks });
       emit({ ...base(threadId, turnId), type: "turn.started" });
 
       // handshake + kickoff; any refusal surfaces as failure, not a hang
@@ -683,11 +699,20 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           phoneMcp: true,
           localComputerMcp: !config.fullAuto,
           fullTaskScoped: true,
+          approvalBroker: true,
           images: true,
           effortLevels: ["low", "medium", "high", "xhigh", "max"],
         },
         sendTurn,
-        interruptTurn: async (threadId) => active.get(threadId)?.stop(),
+        interruptTurn: async (threadId, expectedTurnId) => {
+          const turn = active.get(threadId);
+          if (!turn) throw new Error("the requested Codex turn is no longer active");
+          if (expectedTurnId && turn.turnId !== expectedTurnId) throw new Error("the requested Codex turn identity does not match");
+          await turn.stop();
+          if (active.get(threadId)?.turnId === turn.turnId) {
+            throw new Error("the requested Codex turn did not settle after process exit");
+          }
+        },
         respondToRequest: async (threadId, requestId, decision) => {
           const turn = active.get(threadId);
           const finish = turn?.asks.get(requestId);
@@ -697,7 +722,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         },
         hasSession: (threadId) => active.has(threadId),
         stopAll: async () => {
-          for (const { stop } of active.values()) stop();
+          await Promise.allSettled([...active.values()].map(({ stop }) => stop()));
         },
         onEvent: (listener) => {
           listeners.add(listener);
@@ -705,7 +730,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         },
       },
       dispose: async () => {
-        for (const { stop } of active.values()) stop();
+        await Promise.allSettled([...active.values()].map(({ stop }) => stop()));
         listeners.clear();
       },
     };

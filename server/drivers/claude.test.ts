@@ -128,14 +128,18 @@ describe("ClaudeDriver turns (fake CLI)", () => {
   let recorder: EventRecorder;
   let scratch: string;
 
-  const create = async (mode?: string, environment: Record<string, string> = {}) => {
+  const create = async (
+    mode?: string,
+    environment: Record<string, string> = {},
+    permissionMode: "acceptEdits" | "auto" | "bypassPermissions" = "acceptEdits",
+  ) => {
     if (mode) process.env.FAKE_CLAUDE_MODE = mode;
     instance = await ClaudeDriver.create({
       instanceId: "claude-test",
       displayName: "Claude Test",
       environment,
       enabled: true,
-      config: { cli: FAKE_CLI, permissionMode: "acceptEdits" },
+      config: { cli: FAKE_CLI, permissionMode },
     });
     recorder = recordEvents(instance.adapter);
   };
@@ -158,6 +162,8 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.AOS_STARTUP_DIRECTIVE;
     delete process.env.OMB_CLAUDE_SESSION_IDLE_MS;
     delete process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS;
+    delete process.env.OPENSSL_CONF;
+    delete process.env.OMB_CLAUDE_API_KEY_ALIAS;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -188,6 +194,24 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     // the harness has one figure to bank per turn
     expect(done).toMatchObject({ type: "turn.completed", ok: true, cost: 0.01, usage: { input: 12, output: 5 } });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+  });
+
+  it("overrides bypassPermissions for an approval-bound graph turn", async () => {
+    await create(undefined, {}, "bypassPermissions");
+    const dump = join(scratch, "forced-broker.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-forced-broker",
+      text: "inspect the workspace",
+      autoApprove: true,
+      forceApprovalBroker: true,
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    const argv = JSON.parse(readFileSync(dump, "utf8")).argv as string[];
+    const modeIndex = argv.indexOf("--permission-mode");
+    expect(argv[modeIndex + 1]).toBe("default");
+    expect(instance.adapter.capabilities.approvalBroker).toBe(true);
   });
 
   it("streams partial-message text deltas without re-emitting the whole message", async () => {
@@ -286,6 +310,53 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(allowed).toContain("mcp__ogb");
     expect(allowed).not.toContain("mcp__composio");
     delete process.env.AOS_STARTUP_DIRECTIVE;
+  });
+
+  it("strips process-control environment from full-task children and MCP config", async () => {
+    await create(undefined, {
+      nOdE_OpTiOnS: "--require=/tmp/provider-preload.js",
+      LD_PRELOAD: "/tmp/provider-preload.dylib",
+      PATH: "/tmp/provider-bin",
+      OMB_GRAPH_SAFE_SETTING: "retained",
+      claude_config_dir: "/tmp/foreign-claude-config",
+      NODE_PATH: "/tmp/foreign-node-modules",
+    });
+    const dump = join(scratch, "full-profile-environment.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    process.env.OPENSSL_CONF = "/tmp/inherited-openssl.cnf";
+    process.env.OMB_CLAUDE_API_KEY_ALIAS = "logical/account-that-must-not-be-selected";
+
+    await instance.adapter.sendTurn({
+      threadId: "t-full-profile-environment",
+      turnToken: "turn-token-environment-123456789012345",
+      text: "work",
+      accessProfile: "full-task-scoped",
+      integrations: {
+        capabilityGateway: {
+          command: process.execPath,
+          args: ["/tmp/capability-proxy.js"],
+          env: {
+            OMB_TURN_TOKEN: "turn-token-environment-123456789012345",
+            DyLd_InSeRt_LiBrArIeS: "/tmp/proxy-preload.dylib",
+            Bash_Env: "/tmp/proxy-startup",
+          },
+        },
+      },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    for (const name of [
+      "nOdE_OpTiOnS", "LD_PRELOAD", "HOME", "TMPDIR", "OPENSSL_CONF",
+      "OMB_CLAUDE_API_KEY_ALIAS", "claude_config_dir", "NODE_PATH", "OMB_GRAPH_SAFE_SETTING",
+    ]) {
+      expect(seen.env[name]).toBeUndefined();
+    }
+    expect(seen.env.PATH).not.toBe("/tmp/provider-bin");
+    expect(seen.argv).not.toContain("--bare");
+    expect(seen.mcpConfig.mcpServers.openmaus_capabilities.env).toEqual({
+      OMB_TURN_TOKEN: "turn-token-environment-123456789012345",
+    });
   });
 
   it("uses bare mode with an app-owned CredVault helper when an API-key alias is configured", async () => {
@@ -540,10 +611,13 @@ describe("ClaudeDriver turns (fake CLI)", () => {
 
   it("interrupt kills the turn and settles it as failed, not hung", async () => {
     await create("hang");
-    await instance.adapter.sendTurn({ threadId: "t-int", text: "go" });
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-int", text: "go" });
     await recorder.until((e) => e.type === "session.started");
 
-    await instance.adapter.interruptTurn("t-int");
+    await expect(instance.adapter.interruptTurn("t-int", "wrong-turn")).rejects.toThrow(/identity does not match/);
+    expect(instance.adapter.hasSession("t-int")).toBe(true);
+    await instance.adapter.interruptTurn("t-int", turnId);
+    expect(instance.adapter.hasSession("t-int")).toBe(false);
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ ok: false, stopReason: "exit_before_result" });
   });

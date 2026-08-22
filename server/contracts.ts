@@ -167,6 +167,9 @@ export interface SendTurnInput {
   /** Independent approval preference. The access profile selects available
    * capabilities and hard denials; this flag alone removes routine pauses. */
   autoApprove?: boolean;
+  /** Graph turns force the provider's interactive broker even when its
+   * instance or bot is configured full-auto. */
+  forceApprovalBroker?: boolean;
   /** Per-bot integrations the driver may hand to the agent as tools. */
   integrations?: {
     /** A local stdio bridge owns the remote Composio transport. Keeping the
@@ -254,6 +257,8 @@ export interface ProviderAdapter {
     /** True when explicitly selected turns can use the guarded
      * full-task-scoped capability profile. */
     fullTaskScoped?: boolean;
+    /** True when a per-turn forceApprovalBroker override is enforceable. */
+    approvalBroker?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;

@@ -1,11 +1,18 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { appendFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { constants as fsConstants, lstatSync, realpathSync, type Stats } from "node:fs";
+import { appendFile, lstat, mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, win32 as winPath } from "node:path";
 import { z } from "zod";
 
-import { createCapabilityProfileManifest, createObserverRouterProfileManifest } from "./access-profile.ts";
+import {
+  createAgentGraphProfileManifest,
+  createCapabilityProfileManifest,
+  createObserverRouterProfileManifest,
+} from "./access-profile.ts";
+import { AGENT_GRAPH_MAX_FILE_BYTES, readStableAgentGraphFile } from "./agent-graph-evidence.ts";
+import { agentGraphPathWithinWorkspace, agentGraphWritePathAllowed } from "./agent-graph-permissions.ts";
 import { fullTaskScopedHardDeny } from "./auto-approve.ts";
 import { BUILTIN_CAPABILITY_TOOLS } from "./builtin-capability-tools.ts";
 import { augmentedPath } from "./env-path.ts";
@@ -27,6 +34,7 @@ import {
   redactKnownValues,
   redactSecrets,
 } from "./redact.ts";
+import type { AgentGraphPermissionClass } from "../shared/agent-graphs.ts";
 
 type JsonObject = Record<string, any>;
 
@@ -60,6 +68,10 @@ function boundedPath(raw: unknown, cwd?: string): string {
   if (typeof raw !== "string" || !raw.trim() || raw.includes("\0")) throw new Error("a valid path is required");
   const expanded = raw.trim().replace(/^~(?=\/|$)/, homedir());
   return isAbsolute(expanded) ? resolve(expanded) : resolve(cwd || process.cwd(), expanded);
+}
+
+function contentSha256(value: Uint8Array | string): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
 function shellCommand(command: string, cwd: string, timeoutMs: number): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -417,10 +429,97 @@ interface ActiveTurn {
   botId: string;
   threadId: string;
   cwd?: string;
+  graphPermissionClass?: AgentGraphPermissionClass;
+  graphWorkspace?: GraphWorkspaceIdentity;
   expiresAt: number;
   servers: Record<string, HostMcpServer>;
   interactiveInput: string;
   completedCalls: Map<string, any>;
+  graphReadPreimages: Map<string, GraphPreimage>;
+}
+
+interface GraphFilePreimage {
+  kind: "file";
+  sha256: string;
+  /** True only when the exact UTF-8 body was returned to this graph turn. */
+  writable: boolean;
+  dev: number;
+  ino: number;
+  nlink: number;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+}
+
+interface GraphAbsentPreimage {
+  kind: "absent";
+  sha256: "absent";
+  parentPath: string;
+  parentDev: number;
+  parentIno: number;
+}
+
+type GraphPreimage = GraphFilePreimage | GraphAbsentPreimage;
+
+interface GraphWorkspaceIdentity {
+  root: string;
+  dev: number;
+  ino: number;
+}
+
+function captureGraphWorkspace(cwd: string | undefined): GraphWorkspaceIdentity {
+  if (!cwd) throw new Error("agent graph turn requires an exact workspace root");
+  const root = resolve(cwd);
+  const info = lstatSync(root);
+  if (!info.isDirectory() || info.isSymbolicLink() || realpathSync(root) !== root) {
+    throw new Error("agent graph workspace root must be a real non-symlink directory");
+  }
+  return { root, dev: info.dev, ino: info.ino };
+}
+
+function requireGraphWorkspace(identity: GraphWorkspaceIdentity | undefined): void {
+  if (!identity) throw new Error("agent graph workspace identity is unavailable");
+  try {
+    const info = lstatSync(identity.root);
+    if (!info.isDirectory() || info.isSymbolicLink() || realpathSync(identity.root) !== identity.root ||
+        info.dev !== identity.dev || info.ino !== identity.ino) {
+      throw new Error("agent graph workspace root identity changed after dispatch");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("identity changed")) throw error;
+    throw new Error("agent graph workspace root identity changed after dispatch");
+  }
+}
+
+function graphNoFollowFlag(): number {
+  const flag = fsConstants.O_NOFOLLOW;
+  if (typeof flag !== "number" || flag === 0) {
+    throw new Error("agent graph filesystem access requires O_NOFOLLOW support");
+  }
+  return flag;
+}
+
+function graphFilePreimage(info: Stats, sha256: string, writable = true): GraphFilePreimage {
+  return {
+    kind: "file",
+    sha256,
+    writable,
+    dev: info.dev,
+    ino: info.ino,
+    nlink: info.nlink,
+    size: info.size,
+    mtimeMs: info.mtimeMs,
+    ctimeMs: info.ctimeMs,
+  };
+}
+
+function sameGraphFileIdentity(left: GraphFilePreimage, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino && right.isFile() && right.nlink === 1;
+}
+
+function graphFileStable(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.nlink === 1 && right.nlink === 1 &&
+    left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
 }
 
 interface BackendSlot {
@@ -477,6 +576,7 @@ export class CapabilityGateway {
     botId: string;
     threadId: string;
     cwd?: string;
+    graphPermissionClass?: AgentGraphPermissionClass;
     ttlMs?: number;
     servers?: Record<string, HostMcpServer>;
   }): void {
@@ -486,14 +586,18 @@ export class CapabilityGateway {
     const ttlMs = this.observerOnly
       ? Math.min(Math.max(requestedTtl, 1), OBSERVER_TURN_TTL_MS)
       : requestedTtl;
+    const graphWorkspace = turn.graphPermissionClass ? captureGraphWorkspace(turn.cwd) : undefined;
     this.activeTurns.set(token, {
       botId: turn.botId,
       threadId: turn.threadId,
-      cwd: turn.cwd,
+      cwd: graphWorkspace?.root ?? turn.cwd,
+      graphPermissionClass: turn.graphPermissionClass,
+      graphWorkspace,
       expiresAt: this.now() + ttlMs,
       servers: this.observerOnly ? {} : { ...turn.servers },
       interactiveInput: "",
       completedCalls: new Map(),
+      graphReadPreimages: new Map(),
     });
     if (!this.observerOnly) this.protectServerValues(turn.servers ?? {});
   }
@@ -528,8 +632,15 @@ export class CapabilityGateway {
     return false;
   }
 
+  graphPermissionClass(token: string): AgentGraphPermissionClass | undefined {
+    this.requireTurn(token);
+    return this.activeTurns.get(token)?.graphPermissionClass;
+  }
+
   private requireTurn(token: string): void {
     if (!this.ownsTurn(token)) throw new Error("capability request rejected: turn is no longer active");
+    const turn = this.activeTurns.get(token)!;
+    if (turn.graphPermissionClass) requireGraphWorkspace(turn.graphWorkspace);
   }
 
   extendTurn(token: string, servers: Record<string, HostMcpServer>): void {
@@ -561,6 +672,11 @@ export class CapabilityGateway {
   }
 
   private manifestFor(token: string): HostMcpCatalog["manifest"] {
+    this.requireTurn(token);
+    const turn = this.activeTurns.get(token)!;
+    if (turn.graphPermissionClass) {
+      return createAgentGraphProfileManifest(turn.graphPermissionClass);
+    }
     const inventory = Object.entries(this.serversFor(token)).flatMap(([name, server]) =>
       server.type === "builtin" ? BUILTIN_CAPABILITY_TOOLS.map((tool) => `${name}:${tool.name}`) : [name],
     );
@@ -570,6 +686,14 @@ export class CapabilityGateway {
 
   inventory(token: string): { manifest: HostMcpCatalog["manifest"]; servers: Array<{ name: string; type: string }> } {
     const servers = this.serversFor(token);
+    const graphPermissionClass = this.activeTurns.get(token)?.graphPermissionClass;
+    if (graphPermissionClass) {
+      const host = servers["openmaus-host"];
+      return {
+        manifest: createAgentGraphProfileManifest(graphPermissionClass),
+        servers: host ? [{ name: "openmaus-host", type: host.type }] : [],
+      };
+    }
     return {
       manifest: this.manifestFor(token),
       servers: Object.entries(servers).map(([name, server]) => ({ name, type: server.type })),
@@ -579,6 +703,9 @@ export class CapabilityGateway {
   async aliases(token: string): Promise<string[]> {
     this.requireTurn(token);
     if (this.observerOnly) throw new Error("observer profile does not expose credential aliases");
+    if (this.activeTurns.get(token)?.graphPermissionClass) {
+      throw new Error("agent graph profile does not expose credential aliases");
+    }
     return [...new Set(await this.listAliasesImpl())].filter((name) => /^[A-Za-z0-9_.\/-]{1,200}$/.test(name)).sort();
   }
 
@@ -590,6 +717,9 @@ export class CapabilityGateway {
   ): Promise<void> {
     this.requireTurn(token);
     if (this.observerOnly) throw new Error("observer profile does not allow credential selection");
+    if (this.activeTurns.get(token)?.graphPermissionClass) {
+      throw new Error("agent graph profile does not allow credential selection");
+    }
     const server = this.serverFor(token, serverName);
     if (!server) throw new Error("unknown capability server");
     if (server.type !== "stdio") {
@@ -717,7 +847,19 @@ export class CapabilityGateway {
         },
       };
     }
-    if (this.serverFor(token, serverName)?.type === "builtin") return { tools: BUILTIN_CAPABILITY_TOOLS };
+    const turn = this.activeTurns.get(token)!;
+    if (turn.graphPermissionClass && serverName !== "openmaus-host") {
+      throw new Error("agent graphs expose only the bounded local capability gateway");
+    }
+    if (this.serverFor(token, serverName)?.type === "builtin") {
+      if (!turn.graphPermissionClass) return { tools: BUILTIN_CAPABILITY_TOOLS };
+      const allowed = turn.graphPermissionClass === "workspace-write"
+        ? new Set(["filesystem_read", "filesystem_stat", "filesystem_write"])
+        : turn.graphPermissionClass === "read"
+          ? new Set(["filesystem_read", "filesystem_stat"])
+          : new Set<string>();
+      return { tools: BUILTIN_CAPABILITY_TOOLS.filter((tool) => allowed.has(tool.name)) };
+    }
     const backend = this.backend(token, serverName);
     try {
       return this.sanitize(await backend.client.request("tools/list", {}));
@@ -730,6 +872,9 @@ export class CapabilityGateway {
     this.requireTurn(token);
     if (this.observerOnly) return this.callObserverTool(token, serverName, tool, args);
     const turn = this.activeTurns.get(token)!;
+    if (turn.graphPermissionClass && serverName !== "openmaus-host") {
+      throw new Error("agent graphs expose only the bounded local capability gateway");
+    }
     const interactive = /(?:computer|browser|cua|desktop)/i.test(`${serverName}:${tool}`);
     const interactiveInput = interactive ? this.interactiveText(turn, tool, args) : null;
     const denial = fullTaskScopedHardDeny(
@@ -849,33 +994,182 @@ export class CapabilityGateway {
   private async callBuiltin(token: string, tool: string, args: JsonObject): Promise<any> {
     const turn = this.activeTurns.get(token);
     this.requireTurn(token);
-    const cwd = boundedPath(args.cwd ?? turn?.cwd ?? process.cwd(), turn?.cwd);
+    const requestedCwd = args.cwd ?? turn?.cwd ?? process.cwd();
+    if (turn?.graphPermissionClass && (
+      typeof requestedCwd !== "string" || !agentGraphPathWithinWorkspace(requestedCwd, turn.cwd)
+    )) throw new Error("agent graph capability cwd is outside the approved workspace");
+    const cwd = boundedPath(requestedCwd, turn?.cwd);
     if (tool === "shell_execute") {
       if (typeof args.command !== "string" || !args.command.trim()) throw new Error("command is required");
+      if (turn?.graphPermissionClass) throw new Error("agent graph shell execution requires a separate OS sandbox");
       const timeoutMs = Math.min(Math.max(Number(args.timeoutMs) || 60_000, 100), 300_000);
       return this.sanitize(await shellCommand(args.command, cwd, timeoutMs));
     }
+    if (turn?.graphPermissionClass && (
+      typeof args.path !== "string" || !agentGraphPathWithinWorkspace(args.path, turn.cwd)
+    )) throw new Error("agent graph capability path is outside the approved workspace");
     const path = boundedPath(args.path, turn?.cwd);
     if (tool === "filesystem_read") {
       const maxBytes = Math.min(Math.max(Number(args.maxBytes) || MAX_TOOL_RESULT_BYTES, 1), MAX_TOOL_RESULT_BYTES);
-      const body = await readFile(path);
-      if (body.includes(0)) return { content: "[binary capability output omitted]", bytes: body.byteLength };
-      return this.sanitize({ path, content: body.subarray(0, maxBytes).toString("utf8"), truncated: body.byteLength > maxBytes });
+      let body: Buffer;
+      if (turn?.graphPermissionClass) {
+        requireGraphWorkspace(turn.graphWorkspace);
+        const stable = await readStableAgentGraphFile(turn.cwd!, path, AGENT_GRAPH_MAX_FILE_BYTES);
+        body = stable.body;
+        const utf8 = body.toString("utf8");
+        const fullUtf8Returned = body.byteLength <= maxBytes && !body.includes(0) && Buffer.from(utf8, "utf8").equals(body);
+        turn.graphReadPreimages.set(path, graphFilePreimage(stable.info, stable.sha256, fullUtf8Returned));
+      } else {
+        body = await readFile(path);
+      }
+      const sha256 = contentSha256(body);
+      if (body.includes(0)) return { content: "[binary capability output omitted]", bytes: body.byteLength, sha256 };
+      return this.sanitize({ path, content: body.subarray(0, maxBytes).toString("utf8"), sha256, truncated: body.byteLength > maxBytes });
     }
     if (tool === "filesystem_write") {
+      if (turn?.graphPermissionClass !== undefined && turn.graphPermissionClass !== "workspace-write") {
+        throw new Error("agent graph filesystem write is outside the approved permission class");
+      }
       if (typeof args.content !== "string") throw new Error("content must be a string");
+      if (turn?.graphPermissionClass) {
+        if (typeof args.path !== "string" || !agentGraphWritePathAllowed(args.path, turn.cwd)) {
+          throw new Error("agent graph filesystem write targets repository control metadata or an unsafe path");
+        }
+        if (args.append === true) throw new Error("agent graph filesystem append is not preimage-bound");
+        const expected = typeof args.expectedSha256 === "string" ? args.expectedSha256 : "";
+        const preimage = turn.graphReadPreimages.get(path);
+        if (!/^(?:absent|sha256:[0-9a-f]{64})$/.test(expected) || preimage?.sha256 !== expected) {
+          throw new Error("agent graph filesystem write requires the exact preimage returned by this turn");
+        }
+        if (preimage.kind === "file" && !preimage.writable) {
+          throw new Error("agent graph filesystem write requires a complete UTF-8 preimage returned by this turn");
+        }
+        if (!agentGraphWritePathAllowed(args.path, turn.cwd)) {
+          throw new Error("agent graph filesystem write path changed after the approved read");
+        }
+        const bytes = Buffer.from(args.content, "utf8");
+        if (bytes.byteLength > AGENT_GRAPH_MAX_FILE_BYTES) {
+          throw new Error("agent graph filesystem write exceeds the bounded file size");
+        }
+        let finalInfo: Stats;
+        if (preimage.kind === "file") {
+          const handle = await open(path, fsConstants.O_RDWR | graphNoFollowFlag());
+          try {
+            const before = await handle.stat();
+            if (!sameGraphFileIdentity(preimage, before)) {
+              throw new Error("agent graph filesystem write rejected file identity or hard-link drift");
+            }
+            if (before.size > AGENT_GRAPH_MAX_FILE_BYTES) {
+              throw new Error("agent graph filesystem write preimage exceeds the bounded file size");
+            }
+            const currentBody = await handle.readFile();
+            const afterRead = await handle.stat();
+            if (!graphFileStable(before, afterRead) || contentSha256(currentBody) !== expected) {
+              throw new Error("agent graph filesystem write rejected owner drift since the approved read");
+            }
+            const pathInfo = await lstat(path);
+            if (!sameGraphFileIdentity(preimage, pathInfo)) {
+              throw new Error("agent graph filesystem write rejected a final-path swap");
+            }
+            await handle.truncate(0);
+            for (let offset = 0; offset < bytes.byteLength;) {
+              const written = await handle.write(bytes, offset, bytes.byteLength - offset, offset);
+              if (written.bytesWritten <= 0) throw new Error("agent graph filesystem write made no progress");
+              offset += written.bytesWritten;
+            }
+            await handle.truncate(bytes.byteLength);
+            await handle.sync();
+            finalInfo = await handle.stat();
+            if (!sameGraphFileIdentity(preimage, finalInfo)) {
+              throw new Error("agent graph filesystem write target changed during the write");
+            }
+          } finally {
+            await handle.close();
+          }
+        } else {
+          const parentPath = dirname(path);
+          if (preimage.parentPath !== parentPath) {
+            throw new Error("agent graph filesystem creation parent changed since stat");
+          }
+          const parentBefore = await lstat(parentPath);
+          if (!parentBefore.isDirectory() || parentBefore.isSymbolicLink() ||
+              parentBefore.dev !== preimage.parentDev || parentBefore.ino !== preimage.parentIno) {
+            throw new Error("agent graph filesystem creation rejected parent drift since stat");
+          }
+          const handle = await open(
+            path,
+            fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | graphNoFollowFlag(),
+            0o600,
+          );
+          try {
+            const opened = await handle.stat();
+            const pathInfo = await lstat(path);
+            const parentAfterOpen = await lstat(parentPath);
+            if (!opened.isFile() || opened.nlink !== 1 || pathInfo.dev !== opened.dev || pathInfo.ino !== opened.ino ||
+                !parentAfterOpen.isDirectory() || parentAfterOpen.isSymbolicLink() ||
+                parentAfterOpen.dev !== preimage.parentDev || parentAfterOpen.ino !== preimage.parentIno) {
+              throw new Error("agent graph filesystem creation rejected a final-path or parent swap");
+            }
+            for (let offset = 0; offset < bytes.byteLength;) {
+              const written = await handle.write(bytes, offset, bytes.byteLength - offset, offset);
+              if (written.bytesWritten <= 0) throw new Error("agent graph filesystem write made no progress");
+              offset += written.bytesWritten;
+            }
+            await handle.truncate(bytes.byteLength);
+            await handle.sync();
+            finalInfo = await handle.stat();
+            if (!finalInfo.isFile() || finalInfo.nlink !== 1 || finalInfo.dev !== opened.dev || finalInfo.ino !== opened.ino) {
+              throw new Error("agent graph filesystem creation target changed during the write");
+            }
+          } finally {
+            await handle.close();
+          }
+        }
+        const sha256 = contentSha256(args.content);
+        const finalPathInfo = await lstat(path);
+        if (!finalPathInfo.isFile() || finalPathInfo.nlink !== 1 ||
+            finalPathInfo.dev !== finalInfo.dev || finalPathInfo.ino !== finalInfo.ino) {
+          throw new Error("agent graph filesystem write rejected a post-write path swap");
+        }
+        turn.graphReadPreimages.set(path, graphFilePreimage(finalInfo, sha256));
+        return { path, bytes: Buffer.byteLength(args.content), appended: false, sha256 };
+      }
       await mkdir(dirname(path), { recursive: true });
       if (args.append === true) await appendFile(path, args.content, { encoding: "utf8", mode: 0o600 });
       else await writeFile(path, args.content, { encoding: "utf8", mode: 0o600 });
       return { path, bytes: Buffer.byteLength(args.content), appended: args.append === true };
     }
     if (tool === "filesystem_delete") {
+      if (turn?.graphPermissionClass) throw new Error("agent graphs cannot delete through the local capability gateway");
       await rm(path, { recursive: args.recursive === true, force: false });
       return { path, deleted: true };
     }
     if (tool === "filesystem_stat") {
-      const info = await stat(path);
-      return { path, type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "other", size: info.size, modifiedAt: info.mtime.toISOString() };
+      try {
+        const info = turn?.graphPermissionClass ? await lstat(path) : await stat(path);
+        if (turn?.graphPermissionClass) requireGraphWorkspace(turn.graphWorkspace);
+        if (turn?.graphPermissionClass && (info.isSymbolicLink() || (info.isFile() && info.nlink !== 1))) {
+          throw new Error("agent graph stat rejected a symlink or hard-linked file");
+        }
+        return { path, exists: true, type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "other", size: info.size, modifiedAt: info.mtime.toISOString() };
+      } catch (error) {
+        if (turn?.graphPermissionClass && (error as NodeJS.ErrnoException).code === "ENOENT") {
+          const parentPath = dirname(path);
+          const parent = await lstat(parentPath);
+          if (!parent.isDirectory() || parent.isSymbolicLink()) {
+            throw new Error("agent graph filesystem creation requires an existing regular parent directory");
+          }
+          turn.graphReadPreimages.set(path, {
+            kind: "absent",
+            sha256: "absent",
+            parentPath,
+            parentDev: parent.dev,
+            parentIno: parent.ino,
+          });
+          return { path, exists: false, type: "missing", sha256: "absent" };
+        }
+        throw error;
+      }
     }
     throw new Error("unknown built-in capability tool");
   }

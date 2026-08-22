@@ -529,6 +529,7 @@ export interface AutoApprover {
  * contrast: a grant WOULD have fired, and the only thing that stopped it
  * was that nobody started this turn — the most audit-worthy card of all. */
 export type AutoVerdictSource =
+  | "agent-graph"
   | "always-allow"
   | "auto-mode"
   | "unattended-block"

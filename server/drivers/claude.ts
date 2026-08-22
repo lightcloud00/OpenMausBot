@@ -16,7 +16,12 @@ import { join, dirname } from "node:path";
 
 import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
-import { brokerSocketPath, describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import {
+  isolatedGraphCapabilityMcpEnvironment,
+  isolatedGraphChildEnvironment,
+  stripUnsafeGraphEnvironment,
+} from "../graph-safe-environment.ts";
+import { brokerSocketPath, describeSpawnFailure, execCli, killCliTree, spawnCli, terminateCliTree } from "../procs.ts";
 
 import type {
   DriverCreateInput,
@@ -89,24 +94,14 @@ function claudeEnvironment(
 }
 
 function isolateInstructionEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const isolated = { ...env };
-  for (const name of Object.keys(isolated)) {
-    if (
-      name.startsWith("AOS_") ||
-      name === "CLAUDE_CONFIG_DIR" ||
-      name === "CLAUDE_PROJECT_DIR" ||
-      name === "CLAUDE_CODE_ENTRYPOINT" ||
-      name === "CLAUDECODE" ||
-      name === "CLAUDE_CODE_SAFE_MODE" ||
-      name === "CLAUDE_CODE_SIMPLE" ||
-      name === "ANTHROPIC_API_KEY" ||
-      name === "ANTHROPIC_AUTH_TOKEN" ||
-      name === "CLAUDE_CODE_OAUTH_TOKEN"
-    ) {
-      delete isolated[name];
-    }
-  }
-  return isolated;
+  return isolatedGraphChildEnvironment(env, {
+    PATH: augmentedPath(),
+    NPM_CONFIG_LOGLEVEL: "error",
+  });
+}
+
+function isolatedMcpServer<T extends { env: Record<string, string> }>(server: T): T {
+  return { ...server, env: stripUnsafeGraphEnvironment(server.env) };
 }
 
 const DRIVER_KIND = "claudeAgent";
@@ -477,7 +472,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     await refreshModels();
     const listeners = new Set<RuntimeEventListener>();
     // one active turn per thread; a second send while busy is a caller bug
-    const active = new Map<string, { stop: () => void; turnId: string; broker?: ReturnType<typeof createPermissionBroker> }>();
+    const active = new Map<string, {
+      stop: () => Promise<void>;
+      turnId: string;
+      turnToken?: string;
+      broker?: ReturnType<typeof createPermissionBroker>;
+    }>();
 
     // One live CLI process per thread, kept across turns. Under
     // --input-format stream-json the CLI settles a turn with `result` while
@@ -553,7 +553,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     };
 
     const emit = (event: RuntimeEvent) => {
-      for (const l of [...listeners]) l(event);
+      const turnToken = event.turnToken ?? active.get(event.threadId)?.turnToken ?? sessions.get(event.threadId)?.turn?.turnToken;
+      const bound = turnToken && !event.turnToken ? { ...event, turnToken } : event;
+      for (const l of [...listeners]) l(bound);
     };
     const base = (threadId: string, turnId: string) => ({
       eventId: newEventId(),
@@ -568,7 +570,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const fullTaskScoped = turn.accessProfile === "full-task-scoped";
       const controlsHost = turn.integrations?.localComputer?.scope === "local-computer";
-      if (controlsHost && config.permissionMode === "bypassPermissions" && !fullTaskScoped) {
+      if (controlsHost && config.permissionMode === "bypassPermissions" && !fullTaskScoped && !turn.forceApprovalBroker) {
         throw new Error("local computer control requires the interactive approval broker");
       }
       const turnId = newId();
@@ -583,7 +585,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // token-level streaming: content_block_delta events between the
         // whole-message frames, so the bubble grows as the model writes
         "--include-partial-messages",
-        "--permission-mode", fullTaskScoped
+        "--permission-mode", turn.forceApprovalBroker
+          ? "default"
+          : fullTaskScoped
           ? turn.autoApprove ? "acceptEdits" : "default"
           : config.permissionMode === "auto" ? "acceptEdits" : config.permissionMode,
       ];
@@ -593,9 +597,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // filesystem, browser and computer tools, which otherwise bypass the
         // gateway's two centrally-enforced hard denials. Explicit MCP tools
         // supplied below remain available.
-        const bareCredentialAlias = String(
-          input.environment.OMB_CLAUDE_API_KEY_ALIAS ?? process.env.OMB_CLAUDE_API_KEY_ALIAS ?? "",
-        ).trim();
+        // Graph approval never authorizes credential/account selection. A
+        // normal full-task profile may opt into a logical CredVault alias;
+        // an approval-bound graph always stays on the admitted subscription
+        // identity that snapshot() already verified.
+        const bareCredentialAlias = turn.forceApprovalBroker
+          ? ""
+          : String(input.environment.OMB_CLAUDE_API_KEY_ALIAS ?? "").trim();
         args.push(
           "--strict-mcp-config",
           "--disable-slash-commands",
@@ -617,7 +625,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           args.push("--setting-sources", "");
         }
       }
-      const turnEnvironment: NodeJS.ProcessEnv = { ...process.env, ...input.environment };
+      const configuredTurnEnvironment: NodeJS.ProcessEnv = { ...process.env, ...input.environment };
+      const turnEnvironment = fullTaskScoped
+        ? stripUnsafeGraphEnvironment(configuredTurnEnvironment)
+        : configuredTurnEnvironment;
       const turnModel = await resolveClaudeTurnModel(turn.model, turnEnvironment);
       const injected = applyClaudeInject({ ...turnEnvironment }, turnModel);
       if (injected.model) args.push("--model", injected.model);
@@ -629,14 +640,17 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const mcpServers: Record<string, unknown> = {};
       const allowed: string[] = [];
       if (turn.integrations?.capabilityGateway) {
-        mcpServers.openmaus_capabilities = { ...turn.integrations.capabilityGateway };
+        mcpServers.openmaus_capabilities = {
+          ...turn.integrations.capabilityGateway,
+          env: isolatedGraphCapabilityMcpEnvironment(turn.integrations.capabilityGateway.env),
+        };
         // This one server has its own host-side hard-deny and result-redaction
         // boundary, so it can be pre-approved without bypassing enforcement.
-        if (!fullTaskScoped || turn.autoApprove) allowed.push("mcp__openmaus_capabilities");
+        if (!turn.forceApprovalBroker && (!fullTaskScoped || turn.autoApprove)) allowed.push("mcp__openmaus_capabilities");
       }
       if (turn.integrations?.composio && !fullTaskScoped) {
-        mcpServers.composio = { ...turn.integrations.composio };
-        if (!fullTaskScoped) allowed.push("mcp__composio");
+        mcpServers.composio = isolatedMcpServer(turn.integrations.composio);
+        if (!turn.forceApprovalBroker && !fullTaskScoped) allowed.push("mcp__composio");
       }
       if (turn.integrations?.computer && !fullTaskScoped) {
         mcpServers.computer = {
@@ -644,29 +658,29 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           args: [PROXY_PATH],
           env: { ...NODE_ENV_FLAG, ...computerProxyEnv(turn.integrations.computer) },
         };
-        if (!fullTaskScoped) allowed.push("mcp__computer");
+        if (!turn.forceApprovalBroker && !fullTaskScoped) allowed.push("mcp__computer");
       } else if (turn.integrations?.localComputer && !fullTaskScoped) {
         const local = turn.integrations.localComputer;
         mcpServers.computer = {
           command: local.command,
           args: local.args,
-          env: local.env,
+          env: stripUnsafeGraphEnvironment(local.env),
         };
         // The isolated Local VM preserves the established pre-allow behavior.
         // Host tools always route through OpenMausBot's permission broker.
-        if (!controlsHost) allowed.push("mcp__computer");
+        if (!turn.forceApprovalBroker && !controlsHost) allowed.push("mcp__computer");
       }
       // peer-agent comms (list_bots/ask_bot) — the harness builds the whole
       // spawn contract (command/args/env incl. the boot token) in
       // agentsIntegration(); pre-allowing matters doubly here, or the CLI's
       // own ListAgents look-alike shadows it and "@Bot" asks go nowhere
       if (turn.integrations?.agents && !fullTaskScoped) {
-        mcpServers.agents = { ...turn.integrations.agents };
-        if (!fullTaskScoped) allowed.push("mcp__agents");
+        mcpServers.agents = isolatedMcpServer(turn.integrations.agents);
+        if (!turn.forceApprovalBroker && !fullTaskScoped) allowed.push("mcp__agents");
       }
       if (turn.integrations?.phone && !fullTaskScoped) {
-        mcpServers.phone = { ...turn.integrations.phone };
-        if (!fullTaskScoped) allowed.push("mcp__phone");
+        mcpServers.phone = isolatedMcpServer(turn.integrations.phone);
+        if (!turn.forceApprovalBroker && !fullTaskScoped) allowed.push("mcp__phone");
       }
       // dweb network daemon (status / repo / opencode model access) via
       // server/drivers/dweb-proxy.ts — points at the configured dweb instance
@@ -679,14 +693,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             DWEB_URL: turn.integrations.dweb.url,
           },
         };
-        if (!fullTaskScoped) allowed.push("mcp__dweb");
+        if (!turn.forceApprovalBroker && !fullTaskScoped) allowed.push("mcp__dweb");
       }
       // permission broker: anything acceptEdits would silently deny becomes
       // an Allow/Deny card in chat, and the agent gets ask_user. Skipped in
       // bypassPermissions (fullAuto) — nothing would ever ask.
       let broker: ReturnType<typeof createPermissionBroker> | undefined;
       let socketPath: string | null = null;
-      if (config.permissionMode !== "bypassPermissions" || fullTaskScoped) {
+      if (turn.forceApprovalBroker || config.permissionMode !== "bypassPermissions" || fullTaskScoped) {
         socketPath = permissionSocketPath(threadId);
         args.push("--permission-prompt-tool", "mcp__ogb__approve");
         mcpServers.ogb = { command: process.execPath, args: [PERM_PROXY_PATH, socketPath], env: { ...NODE_ENV_FLAG } };
@@ -722,7 +736,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       if (live && !live.turn && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
         live.turn = { turnId, turnToken: turn.turnToken, settled: false, sawStreamDelta: false };
-        active.set(threadId, { stop: () => killCliTree(live.child), turnId, broker: live.broker });
+        active.set(threadId, { stop: () => terminateCliTree(live.child), turnId, turnToken: turn.turnToken, broker: live.broker });
         emit({ ...base(threadId, turnId), type: "turn.started" });
         const written = await writeUser(live, threadId, turn.text);
         if (!written) {
@@ -956,8 +970,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         if (sessions.get(threadId) === session) sessions.delete(threadId);
       });
 
-      const stop = () => killCliTree(child);
-      active.set(threadId, { stop, turnId, broker });
+      const stop = () => terminateCliTree(child);
+      active.set(threadId, { stop, turnId, turnToken: turn.turnToken, broker });
       emit({ ...base(threadId, turnId), type: "turn.started" });
 
       // prompt over stdin as a stream-json message — never argv (ARG_MAX).
@@ -1017,10 +1031,19 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           queueing: true,
           localComputerMcp: config.permissionMode !== "bypassPermissions",
           fullTaskScoped: true,
+          approvalBroker: true,
         },
         sendTurn,
         steer,
-        interruptTurn: async (threadId) => active.get(threadId)?.stop(),
+        interruptTurn: async (threadId, expectedTurnId) => {
+          const turn = active.get(threadId);
+          if (!turn) throw new Error("the requested Claude turn is no longer active");
+          if (expectedTurnId && turn.turnId !== expectedTurnId) throw new Error("the requested Claude turn identity does not match");
+          await turn.stop();
+          if (active.get(threadId)?.turnId === turn.turnId) {
+            throw new Error("the requested Claude turn did not settle after process exit");
+          }
+        },
         respondToRequest: async (threadId, requestId, decision) => {
           // fail-closed by construction: no broker, or an ask that already
           // timed out / settled, is `unavailable` — the caller denies
@@ -1032,7 +1055,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         },
         hasSession: (threadId) => active.has(threadId),
         stopAll: async () => {
-          for (const { stop } of active.values()) stop();
+          await Promise.allSettled([...active.values()].map(({ stop }) => stop()));
           for (const threadId of [...sessions.keys()]) closeSession(threadId, "stopAll");
         },
         onEvent: (listener) => {
@@ -1050,7 +1073,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           );
         }),
       dispose: async () => {
-        for (const { stop } of active.values()) stop();
+        await Promise.allSettled([...active.values()].map(({ stop }) => stop()));
         for (const threadId of [...sessions.keys()]) closeSession(threadId, "dispose");
         listeners.clear();
       },

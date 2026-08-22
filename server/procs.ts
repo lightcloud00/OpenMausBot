@@ -291,6 +291,72 @@ export function killCliTree(child: ChildProcess): void {
   unregisterOwnedProcess(pid);
 }
 
+/**
+ * Interrupt an owned CLI tree and resolve only after the exact child exits.
+ * POSIX receives a short SIGTERM grace period followed by SIGKILL; Windows
+ * taskkill /F is already an immediate whole-tree termination. A fulfilled
+ * promise is therefore process-exit evidence, not merely signal-send proof.
+ */
+export function terminateCliTree(child: ChildProcess, graceMs = 2_000): Promise<void> {
+  const pid = child.pid;
+  if (!pid || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let escalation: NodeJS.Timeout | undefined;
+    let deadline: NodeJS.Timeout | undefined;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (escalation) clearTimeout(escalation);
+      if (deadline) clearTimeout(deadline);
+      child.off("close", onClose);
+      unregisterOwnedProcess(pid);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onClose = () => finish();
+    child.once("close", onClose);
+
+    if (process.platform === "win32") {
+      execFile("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, (error) => {
+        if (!error) return;
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // The close/exit check below remains authoritative.
+        }
+      });
+    } else {
+      try {
+        process.kill(-pid, "SIGTERM");
+      } catch {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // The child may have exited between the initial state check and
+          // signal. Its close event still resolves the exact wait.
+        }
+      }
+      escalation = setTimeout(() => {
+        if (settled) return;
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // The final close deadline decides whether termination proved.
+          }
+        }
+      }, Math.max(100, graceMs));
+    }
+    deadline = setTimeout(
+      () => finish(new Error("owned CLI process did not exit after bounded termination")),
+      Math.max(100, graceMs) + 3_000,
+    );
+  });
+}
+
 /** Per-turn broker channel: unix socket on POSIX, named pipe on Windows
  * (Node can't listen on a filesystem socket path there — EACCES). */
 export function brokerSocketPath(dataDir: string, tag: string): string {

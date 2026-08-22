@@ -215,6 +215,7 @@ beforeAll(async () => {
     env: {
       ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
       ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+      NODE_ENV: "test",
       HOME: home,
       USERPROFILE: home,
       OMB_PORT: String(PORT),
@@ -277,7 +278,7 @@ describe("harness HTTP API", () => {
     expect(body.static).toBe(true);
   });
 
-  it("owns and traces authenticated external capability turns", async () => {
+  it("owns and traces authenticated external observer turns without full-task authority", async () => {
     const endpoint = JSON.parse(readFileSync(join(home, ".openmausbot", "runtime", "capability-gateway.json"), "utf8"));
     const headers = {
       authorization: `Bearer ${endpoint.authorization}`,
@@ -297,8 +298,8 @@ describe("harness HTTP API", () => {
       turnToken: string;
       manifest: { schema: string; profile: string; toolInventory: string[] };
     };
-    expect(lease.manifest).toMatchObject({ schema: "openmaus.capability-profile.v1", profile: "full-task-scoped" });
-    expect(lease.manifest.toolInventory).toContain("openmaus-dweb");
+    expect(lease.manifest).toMatchObject({ schema: "openmaus.capability-profile.v1", profile: "observer-router" });
+    expect(lease.manifest.toolInventory).not.toContain("openmaus-host:filesystem_stat");
 
     const called = await fetch(`${BASE}/api/internal/capabilities/call`, {
       method: "POST",
@@ -306,8 +307,16 @@ describe("harness HTTP API", () => {
       body: JSON.stringify({ server: "openmaus-host", tool: "filesystem_stat", arguments: { path: home } }),
     });
     expect(called.status).toBe(200);
-    const callBody = await called.json() as { result: { type: string } };
-    expect(callBody.result).toMatchObject({ type: "directory" });
+    const callBody = await called.json() as { result: { isError?: boolean; content?: Array<{ text?: string }> } };
+    expect(callBody.result.isError).toBe(true);
+    expect(JSON.stringify(callBody.result.content)).toMatch(/observer denied|identity-pinned fleet bridge/);
+
+    const retrieval = await fetch(`${BASE}/api/internal/capabilities/retrieval`, {
+      method: "POST",
+      headers: { ...headers, "x-openmaus-turn-token": lease.turnToken },
+      body: JSON.stringify({ query: "do not expose a prior transcript" }),
+    });
+    expect(retrieval.status).toBe(403);
 
     const ended = await fetch(`${BASE}/api/internal/capabilities/turns/${lease.turnToken}`, {
       method: "DELETE",
@@ -321,8 +330,85 @@ describe("harness HTTP API", () => {
       botId: "hermes-manus",
       engine: "openmaus-gateway",
       outcome: "completed",
-      tools: [{ name: "openmaus-host:filesystem_stat", ok: true }],
+      tools: [{ name: "openmaus-host:filesystem_stat", ok: false }],
     });
+  });
+
+  it("routes an internal full-task lease through the HTTP proxy without widening observer leases", async () => {
+    const endpoint = JSON.parse(readFileSync(join(home, ".openmausbot", "runtime", "capability-gateway.json"), "utf8"));
+    const headers = {
+      authorization: `Bearer ${endpoint.authorization}`,
+      "content-type": "application/json",
+    };
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const selected = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+        accessProfile: "full-task-scoped",
+      });
+      expect(selected.status).toBe(200);
+
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "inspect this workspace" })).status).toBe(202);
+      await expect.poll(() => {
+        if (!existsSync(fakeClaudeDump)) return "";
+        const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+        return dump.mcpConfig?.mcpServers?.openmaus_capabilities?.env?.OMB_TURN_TOKEN ?? "";
+      }, { timeout: 5_000 }).toMatch(/^[a-f0-9]{64}$/);
+      const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      const turnToken = String(dump.mcpConfig.mcpServers.openmaus_capabilities.env.OMB_TURN_TOKEN);
+
+      const inventory = await fetch(`${BASE}/api/internal/capabilities`, {
+        headers: { ...headers, "x-openmaus-turn-token": turnToken },
+      });
+      expect(inventory.status).toBe(200);
+      const inventoryBody = await inventory.json() as {
+        result: { manifest: { profile: string; toolInventory: string[] } };
+      };
+      expect(inventoryBody.result.manifest.profile).toBe("full-task-scoped");
+      expect(inventoryBody.result.manifest.toolInventory).toContain("openmaus-host:filesystem_stat");
+
+      const listed = await fetch(`${BASE}/api/internal/capabilities/openmaus-host/tools`, {
+        headers: { ...headers, "x-openmaus-turn-token": turnToken },
+      });
+      expect(listed.status).toBe(200);
+      const listedBody = await listed.json() as { result: { tools: Array<{ name: string }> } };
+      expect(listedBody.result.tools.map((tool) => tool.name)).toContain("filesystem_stat");
+
+      const called = await fetch(`${BASE}/api/internal/capabilities/call`, {
+        method: "POST",
+        headers: { ...headers, "x-openmaus-turn-token": turnToken },
+        body: JSON.stringify({ server: "openmaus-host", tool: "filesystem_stat", arguments: { path: home } }),
+      });
+      expect(called.status).toBe(200);
+      expect((await called.json() as { result: { type: string } }).result).toMatchObject({ type: "directory" });
+
+      const retrieval = await fetch(`${BASE}/api/internal/capabilities/retrieval`, {
+        method: "POST",
+        headers: { ...headers, "x-openmaus-turn-token": turnToken },
+        body: JSON.stringify({ query: "inspect this workspace", cwd: home }),
+      });
+      expect(retrieval.status).toBe(200);
+      expect((await retrieval.json() as { result: { schema: string } }).result.schema).toBe("openmaus.retrieval-context.v1");
+
+      const ended = await fetch(`${BASE}/api/internal/capabilities/turns/${turnToken}`, {
+        method: "DELETE",
+        headers,
+      });
+      expect(ended.status).toBe(200);
+      const expired = await fetch(`${BASE}/api/internal/capabilities`, {
+        headers: { ...headers, "x-openmaus-turn-token": turnToken },
+      });
+      expect(expired.status).toBe(409);
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots")).body;
+        return state.bots.find((candidate: { id: string }) => candidate.id === bot.id)?.busy;
+      }, { timeout: 5_000 }).toBe(false);
+      await api("DELETE", `/api/bots/${bot.id}`);
+      rmSync(fakeClaudeDump, { force: true });
+    }
   });
 
   it("serves packaged UI assets and preserves API 404s", async () => {

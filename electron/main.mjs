@@ -1,5 +1,6 @@
 import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, safeStorage, screen, session, shell, systemPreferences, utilityProcess } from "electron";
 import { createRequire } from "node:module";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +20,7 @@ const { createDisplayMediaGuard, invokeDisplayMediaCallback, selectCaptureSource
 );
 const { STAGE_PREFIX: APPIMAGE_CUA_STAGE_PREFIX } = require("./cua-linux-bundle.cjs");
 const { desktopViewerUrl, sameDesktopViewerOrigin } = require("./desktop-viewer.cjs");
+const { graphApprovalDetail, graphVerificationDetail } = require("./agent-graph-approval.cjs");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 127.0.0.1 explicitly — vite binds IPv4; a bare "localhost" here can
@@ -34,6 +36,13 @@ const SMOKE_TEST = process.env.OMB_SMOKE_TEST === "1";
 const SMOKE_CUA = SMOKE_TEST && process.env.OMB_SMOKE_CUA === "1";
 const SMOKE_BUNDLED_CUA = SMOKE_TEST && process.env.OMB_SMOKE_BUNDLED_CUA === "1";
 const SMOKE_HARD_DEATH_CUA = SMOKE_TEST && process.env.OMB_SMOKE_HARD_DEATH === "1";
+// Per-boot authority is generated in Electron and never accepted from the
+// ambient environment. Delete compatibility inputs before any child env is
+// assembled so same-UID process inspection cannot recover a static secret.
+delete process.env.OMB_AGENT_GRAPH_APPROVAL_SECRET;
+delete process.env.OMB_AGENT_GRAPH_APPROVAL_BOOT_ID;
+const AGENT_GRAPH_APPROVAL_SECRET = randomBytes(32).toString("base64url");
+const AGENT_GRAPH_APPROVAL_BOOT_ID = randomUUID();
 
 // GNOME groups the window with its installed desktop entry only when both
 // identities match. This must run before Electron becomes ready.
@@ -247,6 +256,7 @@ async function startServerOn(port) {
       OMB_PORT: String(port),
       OMB_RELEASE: app.getVersion(),
       OMB_USER_DATA: app.getPath("userData"),
+      OMB_AGENT_GRAPH_APPROVAL_IPC: "1",
       ...(secureCredentials.composioApiKey
         ? { COMPOSIO_API_KEY: secureCredentials.composioApiKey }
         : {}),
@@ -265,7 +275,14 @@ async function startServerOn(port) {
   });
   proc.stdout?.on("data", (d) => slog(`[out] ${String(d).trimEnd()}`));
   proc.stderr?.on("data", (d) => slog(`[err] ${String(d).trimEnd()}`));
-  proc.once("spawn", () => slog(`spawned pid=${proc.pid}`));
+  proc.once("spawn", () => {
+    proc.postMessage({
+      type: "openmaus.agent-graph-authority.v1",
+      secret: AGENT_GRAPH_APPROVAL_SECRET,
+      bootId: AGENT_GRAPH_APPROVAL_BOOT_ID,
+    });
+    slog(`spawned pid=${proc.pid}`);
+  });
   let exited = false;
   proc.once("exit", (code) => {
     exited = true;
@@ -754,6 +771,135 @@ ipcMain.handle("desktop:capabilities", async () =>
     localConnection: await cuaReady,
   }),
 );
+
+function canonicalGraphAction(value) {
+  const visit = (item) => {
+    if (Array.isArray(item)) return item.map(visit);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(
+      Object.entries(item)
+        .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+        .map(([key, nested]) => [key, visit(nested)]),
+    );
+  };
+  return JSON.stringify(visit(value));
+}
+
+async function signedAgentGraphRequest(action, path, body) {
+  const nonce = randomUUID();
+  const issuedAt = Date.now();
+  const proof = `sha256:${createHmac("sha256", AGENT_GRAPH_APPROVAL_SECRET)
+    .update(canonicalGraphAction({ action, body, bootId: AGENT_GRAPH_APPROVAL_BOOT_ID, issuedAt, nonce, path }))
+    .digest("hex")}`;
+  const response = await fetch(`http://127.0.0.1:${SERVER_PORT}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...body, _desktopAuthority: { bootId: AGENT_GRAPH_APPROVAL_BOOT_ID, issuedAt, nonce, proof } }),
+  });
+  const result = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(result?.error || `Agent graph action failed (HTTP ${response.status})`);
+  return result;
+}
+
+ipcMain.handle("agent-graphs:mutate", async (event, action, graphId, rawBody) => {
+  if (event.senderFrame !== event.sender.mainFrame) {
+    throw new Error("Agent graph controls are available only to the main OpenMausBot frame");
+  }
+  if (new URL(event.senderFrame.url).origin !== rendererOrigin()) {
+    throw new Error("Agent graph controls are available only in the trusted OpenMausBot window");
+  }
+  if (!["preview", "approve", "cancel", "verify"].includes(action)) throw new Error("Unsupported agent graph action");
+  const id = typeof graphId === "string" && /^[\w-]+$/.test(graphId) ? graphId : "";
+  if (action !== "preview" && !id) throw new Error("Invalid agent graph id");
+  let body = rawBody && typeof rawBody === "object" && !Array.isArray(rawBody) ? rawBody : {};
+  if (action === "approve") {
+    const graphHash = typeof body.graphHash === "string" && /^sha256:[0-9a-f]{64}$/.test(body.graphHash)
+      ? body.graphHash
+      : "";
+    if (!graphHash) throw new Error("Invalid agent graph hash");
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner) throw new Error("Agent graph approval requires the visible OpenMausBot window");
+    const currentResponse = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/agent-graphs/${id}`, {
+      headers: { accept: "application/json" },
+      cache: "no-store",
+    });
+    const currentPayload = await currentResponse.json().catch(() => null);
+    if (!currentResponse.ok) throw new Error(currentPayload?.error || "Agent graph draft is unavailable");
+    const manifest = graphApprovalDetail(currentPayload, id, graphHash);
+    const confirmation = await dialog.showMessageBox(owner, {
+      type: "warning",
+      title: "Approve this exact agent graph?",
+      message: "Approve the displayed graph for one safe-local run?",
+      detail: `${manifest}\n\nProtected actions, credentials, external sends, merge, deployment, release, and destructive operations will still pause.`,
+      buttons: ["Cancel", "Approve exact graph"],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+    });
+    if (confirmation.response !== 1) throw new Error("Agent graph approval was cancelled");
+  }
+  if (action === "verify") {
+    const graphHash = typeof body.graphHash === "string" && /^sha256:[0-9a-f]{64}$/.test(body.graphHash)
+      ? body.graphHash
+      : "";
+    const receiptHash = typeof body.receiptHash === "string" && /^sha256:[0-9a-f]{64}$/.test(body.receiptHash)
+      ? body.receiptHash
+      : "";
+    const paths = Array.isArray(body.paths) ? body.paths : [];
+    if (!graphHash || !receiptHash || !paths.length || paths.length > 320 || paths.some((item) =>
+      !item || typeof item !== "object" || Array.isArray(item) ||
+      typeof item.nodeId !== "string" || typeof item.relativePath !== "string"
+    )) throw new Error("Invalid agent graph verification identity or evidence paths");
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner) throw new Error("Agent graph verification requires the visible OpenMausBot window");
+    const [graphResponse, receiptResponse] = await Promise.all([
+      fetch(`http://127.0.0.1:${SERVER_PORT}/api/agent-graphs/${id}`, {
+        headers: { accept: "application/json" }, cache: "no-store",
+      }),
+      fetch(`http://127.0.0.1:${SERVER_PORT}/api/agent-graphs/${id}/receipt`, {
+        headers: { accept: "application/json" }, cache: "no-store",
+      }),
+    ]);
+    const [graphPayload, receiptPayload] = await Promise.all([
+      graphResponse.json().catch(() => null),
+      receiptResponse.json().catch(() => null),
+    ]);
+    if (!graphResponse.ok || !receiptResponse.ok) {
+      throw new Error(graphPayload?.error || receiptPayload?.error || "Agent graph verification evidence is unavailable");
+    }
+    const previewBody = { graphHash, receiptHash, paths };
+    const verificationPreview = await signedAgentGraphRequest(
+      "verification-preview",
+      `/api/agent-graphs/${id}/verification-preview`,
+      previewBody,
+    );
+    const manifest = graphVerificationDetail(
+      { ...graphPayload, ...receiptPayload, verificationPreview },
+      id,
+      graphHash,
+      receiptHash,
+    );
+    const confirmation = await dialog.showMessageBox(owner, {
+      type: "warning",
+      title: "Verify this exact agent graph run?",
+      message: "Mark the displayed completed run as host verified?",
+      detail: `${manifest}\n\nThis emits proposal-only improvement evidence. It does not retrain models, rewrite policy, or authorize another run.`,
+      buttons: ["Cancel", "Verify exact run"],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+    });
+    if (confirmation.response !== 1) throw new Error("Agent graph verification was cancelled");
+    body = {
+      graphHash,
+      receiptHash,
+      evidenceManifestHash: verificationPreview.evidence_manifest_hash,
+      evidence: verificationPreview.evidence,
+    };
+  }
+  const path = action === "preview" ? "/api/agent-graphs/preview" : `/api/agent-graphs/${id}/${action}`;
+  return signedAgentGraphRequest(action, path, body);
+});
 
 const CREDENTIAL_PATCH = {
   composioApiKey: (value) => ({ composio: { apiKey: value } }),

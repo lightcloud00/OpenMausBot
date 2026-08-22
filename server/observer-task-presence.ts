@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { z } from "zod";
 
+import { redactSecretsInText } from "./redact.ts";
+
 type JsonObject = Record<string, unknown>;
 
 export const OBSERVER_BRIDGE_SERVER = "aos-fleet-bridge";
@@ -13,7 +15,10 @@ export const OBSERVER_TURN_TTL_MS = 5 * 60_000;
 const MAX_PRESENCE_FILES = 512;
 const MAX_PRESENCE_FILE_BYTES = 128 * 1024;
 const MAX_PROPOSAL_FEED_BYTES = 1024 * 1024;
-const PROPOSAL_FRESHNESS_MS = 48 * 60 * 60_000;
+// The governed feed is produced weekly. Consumers accept it through the next
+// scheduled cycle plus one day of launchd/TCC grace, and no longer invent
+// shorter surface-specific freshness windows.
+export const PROPOSAL_FRESHNESS_MS = 8 * 24 * 60 * 60_000;
 const SHA256 = /^sha256:[0-9a-f]{64}$/;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$/;
 
@@ -341,7 +346,10 @@ export class ObserverTaskPresenceAdapter {
         description: "List fresh proposal-only improvement metadata; stale feeds and mutation instructions are withheld.",
         inputSchema: {
           type: "object",
-          properties: { limit: { type: "integer", minimum: 1, maximum: 20, default: 10 } },
+          properties: {
+            limit: { type: "integer", minimum: 1, maximum: 20, default: 10 },
+            schema_version: { type: "integer", enum: [1, 2], default: 2 },
+          },
           additionalProperties: false,
         },
       },
@@ -478,68 +486,111 @@ export class ObserverTaskPresenceAdapter {
   }
 
   private async proposals(args: JsonObject): Promise<JsonObject> {
-    const { limit = 10 } = z.object({ limit: z.number().int().min(1).max(20).optional() }).strict().parse(args);
+    const { limit = 10, schema_version: schemaVersion = 2 } = z.object({
+      limit: z.number().int().min(1).max(20).optional(),
+      schema_version: z.union([z.literal(1), z.literal(2)]).optional(),
+    }).strict().parse(args);
+    const responseSchema = `openmaus.observer_improvement_proposals.v${schemaVersion}`;
+    const withheld = (state: string, generatedAt: unknown = null): JsonObject => ({
+      schema: responseSchema,
+      state,
+      generated_at: typeof generatedAt === "string" ? generatedAt : null,
+      mutation_authority: "none",
+      instruction_authority: false,
+      proposals: [],
+    });
     let raw: unknown;
     try {
-      raw = await boundedJson(this.proposalFeedPath, MAX_PROPOSAL_FEED_BYTES);
-    } catch {
-      return {
-        schema: "openmaus.observer_improvement_proposals.v1",
-        state: "unavailable",
-        mutation_authority: "none",
-        instruction_authority: false,
-        proposals: [],
-      };
+      const metadata = await lstat(this.proposalFeedPath);
+      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_PROPOSAL_FEED_BYTES) {
+        return withheld("unsafe-withheld");
+      }
+      raw = JSON.parse(await readFile(this.proposalFeedPath, "utf8"));
+    } catch (error) {
+      return withheld((error as NodeJS.ErrnoException).code === "ENOENT" ? "unavailable" : "invalid-withheld");
     }
     if (!plainObject(raw) || !["improvement_proposal_feed.v1", "improvement_proposal_feed.v2"].includes(String(raw.schema))) {
-      return {
-        schema: "openmaus.observer_improvement_proposals.v1",
-        state: "invalid-withheld",
-        mutation_authority: "none",
-        instruction_authority: false,
-        proposals: [],
-      };
+      return withheld("invalid-withheld");
     }
     const generatedAt = typeof raw.generated_at === "string" ? Date.parse(raw.generated_at) : Number.NaN;
     const ageMs = this.now() - generatedAt;
+    const explicitExpiry = typeof raw.expires_at === "string" ? Date.parse(raw.expires_at) : null;
     const isV2 = raw.schema === "improvement_proposal_feed.v2";
-    const proposalOnly = isV2
-      ? raw.proposal_only === true && raw.mutation_authority === "none" && raw.automatic_mutation === false &&
-        Array.isArray(raw.action_capabilities) && raw.action_capabilities.length === 0
-      : raw.proposal_only === true && raw.automatic_mutation === false;
+    const capabilities = raw.action_capabilities ?? [];
+    const proposalOnly = raw.proposal_only === true && raw.automatic_mutation === false &&
+      (raw.mutation_authority === undefined || raw.mutation_authority === "none") &&
+      Array.isArray(capabilities) && capabilities.length === 0;
     const mutationDisabled = raw.automatic_mutation === false && (!isV2 || raw.mutation_authority === "none");
-    if (!Number.isFinite(generatedAt) || ageMs < -5 * 60_000 || ageMs > PROPOSAL_FRESHNESS_MS || !proposalOnly || !mutationDisabled) {
-      return {
-        schema: "openmaus.observer_improvement_proposals.v1",
-        state: ageMs > PROPOSAL_FRESHNESS_MS ? "stale-withheld" : "unsafe-withheld",
-        generated_at: typeof raw.generated_at === "string" ? raw.generated_at : null,
-        mutation_authority: "none",
-        instruction_authority: false,
-        proposals: [],
-      };
+    const stale = ageMs > PROPOSAL_FRESHNESS_MS || (explicitExpiry !== null && Number.isFinite(explicitExpiry) && explicitExpiry <= this.now());
+    const invalidExpiry = explicitExpiry !== null && !Number.isFinite(explicitExpiry);
+    if (!Number.isFinite(generatedAt) || ageMs < -5 * 60_000 || stale || invalidExpiry || !proposalOnly || !mutationDisabled) {
+      return withheld(stale ? "stale-withheld" : "unsafe-withheld", raw.generated_at);
     }
-    const proposals = (Array.isArray(raw.proposals) ? raw.proposals : []).flatMap((candidate) => {
-      if (!plainObject(candidate) || candidate.automatic_mutation !== false) return [];
+    if (!Array.isArray(raw.proposals)) return withheld("invalid-withheld", raw.generated_at);
+    const expectedFeedHash = sha256(canonicalJson(raw.proposals));
+    const suppliedFeedHash = typeof raw.feed_hash === "string"
+      ? (raw.feed_hash.startsWith("sha256:") ? raw.feed_hash : `sha256:${raw.feed_hash}`)
+      : null;
+    if (suppliedFeedHash !== expectedFeedHash) return withheld("invalid-withheld", raw.generated_at);
+
+    const projectedRows = raw.proposals.map((candidate): JsonObject | null => {
+      if (!plainObject(candidate) || candidate.automatic_mutation !== false) return null;
       const candidateV2 = candidate.schema === "improvement_proposal.v2";
       if (candidateV2) {
-        if (candidate.mutation_authority !== "none" || candidate.trust_class !== "untrusted_observation_data") return [];
-        if (candidate.state !== "proposed") return [];
-      } else if (candidate.approval_required !== true) return [];
+        if (candidate.mutation_authority !== "none" || candidate.trust_class !== "untrusted_observation_data") return null;
+        if (candidate.state !== "proposed") return null;
+      } else if (candidate.schema !== "improvement_proposal.v1" || candidate.approval_required !== true) return null;
+      const candidateJson = canonicalJson(candidate);
+      if (redactSecretsInText(candidateJson) !== candidateJson) return null;
       const proposalId = typeof candidate.proposal_id === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(candidate.proposal_id)
         ? candidate.proposal_id
         : null;
       const title = typeof candidate.title === "string" ? candidate.title.trim().slice(0, 500) : "";
-      if (!proposalId || !title) return [];
+      if (!proposalId || !title || redactSecretsInText(title) !== title) return null;
       const expiry = typeof candidate.expires_at === "string"
         ? candidate.expires_at
         : typeof candidate.expiry === "string" ? candidate.expiry : null;
-      if (candidateV2 && (!expiry || !Number.isFinite(Date.parse(expiry)) || Date.parse(expiry) <= this.now())) return [];
+      if (
+        !expiry || !Number.isFinite(Date.parse(expiry)) || Date.parse(expiry) <= this.now() ||
+        !Number.isInteger(candidate.recurrence_count) || Number(candidate.recurrence_count) < 2
+      ) return null;
+      const contentHash = typeof candidate.content_hash === "string" && SHA256.test(candidate.content_hash)
+        ? candidate.content_hash
+        : null;
+      if (!contentHash) return null;
+      if (!candidateV2) {
+        const { content_hash: _contentHash, ...content } = candidate;
+        if (sha256(canonicalJson(content)) !== contentHash) return null;
+        if (
+          typeof candidate.proposed_diff !== "string" || !candidate.proposed_diff.trim() ||
+          typeof candidate.risk !== "string" || !candidate.risk.trim() ||
+          !Array.isArray(candidate.tests) || !candidate.tests.some((value) => typeof value === "string" && value.trim()) ||
+          typeof candidate.rollback !== "string" || !candidate.rollback.trim()
+        ) return null;
+      }
       const evidence = [candidate.content_hash, ...(Array.isArray(candidate.evidence_hashes) ? candidate.evidence_hashes : []), ...(Array.isArray(candidate.evidence) ? candidate.evidence : [])]
         .flatMap((value) => typeof value === "string" ? (value.match(/(?:sha256:)?[0-9a-f]{64}/g) ?? []) : [])
         .map((value) => value.startsWith("sha256:") ? value : `sha256:${value}`)
         .filter((value, index, rows) => rows.indexOf(value) === index)
         .slice(0, 20);
-      return [{
+      if (evidence.length < 2) return null;
+      const displayOnly = {
+        proposed_change: typeof candidate.proposed_diff === "string"
+          ? candidate.proposed_diff.trim().slice(0, 2_000)
+          : null,
+        risk: typeof candidate.risk === "string" ? candidate.risk.trim().slice(0, 1_000) : null,
+        tests: Array.isArray(candidate.tests)
+          ? candidate.tests.filter((value): value is string => typeof value === "string")
+            .map((value) => value.trim().slice(0, 500)).filter(Boolean).slice(0, 5)
+          : [],
+        rollback: typeof candidate.rollback === "string" ? candidate.rollback.trim().slice(0, 1_000) : null,
+        trusted_as_instructions: false,
+      };
+      // Do not project even redacted credential material: a proposal carrying a
+      // secret-shaped value is malformed observer input and must be withheld.
+      const displayJson = canonicalJson(displayOnly);
+      if (redactSecretsInText(displayJson) !== displayJson) return null;
+      const projected = {
         proposal_id: proposalId,
         cluster_id: typeof candidate.cluster_id === "string" && SAFE_ID.test(candidate.cluster_id) ? candidate.cluster_id : null,
         title,
@@ -555,16 +606,24 @@ export class ObserverTaskPresenceAdapter {
         recurrence_count: Number.isInteger(candidate.recurrence_count) ? Math.max(0, Number(candidate.recurrence_count)) : 0,
         expires_at: expiry,
         evidence_hashes: evidence,
+        content_hash: contentHash,
         review_required: true,
         mutation_authority: "none",
         instruction_authority: false,
-      }];
-    }).slice(0, limit);
+      };
+      return schemaVersion === 2 ? { ...projected, display_only: displayOnly } : projected;
+    });
+    // A feed is one governed, hash-bound unit. Never turn a partially invalid
+    // or secret-shaped feed into a seemingly healthy subset.
+    if (projectedRows.some((proposal) => proposal === null)) {
+      return withheld("unsafe-withheld", raw.generated_at);
+    }
+    const proposals = projectedRows.slice(0, limit) as JsonObject[];
     return {
-      schema: "openmaus.observer_improvement_proposals.v1",
+      schema: responseSchema,
       state: "fresh",
       generated_at: raw.generated_at,
-      feed_hash: typeof raw.feed_hash === "string" && /^(?:sha256:)?[0-9a-f]{64}$/.test(raw.feed_hash) ? raw.feed_hash : null,
+      feed_hash: expectedFeedHash,
       mutation_authority: "none",
       instruction_authority: false,
       proposals,

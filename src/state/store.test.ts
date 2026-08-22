@@ -8,6 +8,27 @@ import {
   type Bot,
   type Message,
 } from "./store";
+import { AGENT_GRAPH_SCHEMA, type AgentGraph } from "../../shared/agent-graphs";
+
+function graph(overrides: Partial<AgentGraph> = {}): AgentGraph {
+  return {
+    schema: AGENT_GRAPH_SCHEMA,
+    id: "graph-1",
+    revision: 1,
+    objective: "Implement and verify one bounded local change",
+    proposalIds: [],
+    feedHash: null,
+    proposalSnapshots: [],
+    goalId: null,
+    maxParallel: 1,
+    graphHash: "sha256:graph",
+    status: "draft",
+    nodes: [],
+    createdAt: 1_000,
+    updatedAt: 1_000,
+    ...overrides,
+  };
+}
 
 describe("notification routing", () => {
   const bots = [{ id: "bot-1", threadId: "main-thread", tasks: [{ threadId: "detached-thread" }] }] as never;
@@ -103,5 +124,90 @@ describe("cross-client bot creation", () => {
     });
 
     expect(greeted.bots[0]?.messages).toEqual([greeting]);
+  });
+});
+
+describe("agent graph revision ordering", () => {
+  const hydrationMetadata = {
+    enabled: true,
+    desktopMutationsAvailable: true,
+    health: { state: "healthy" as const, quarantined: [], sinkErrors: [] },
+    baselineRevisions: {},
+  };
+
+  it("accepts a newer revision even when its timestamp is identical", () => {
+    const original = graph({ revision: 1, status: "draft", updatedAt: 2_000 });
+    const newer = graph({ revision: 2, status: "approved", updatedAt: 2_000 });
+
+    const state = reducer({ ...initialState, agentGraphs: [original] }, {
+      type: "agentGraphPatched",
+      graph: newer,
+    });
+
+    expect(state.agentGraphs).toEqual([newer]);
+  });
+
+  it("does not let stale REST hydration overwrite a newer SSE revision", () => {
+    const newest = graph({ revision: 3, status: "running", updatedAt: 2_000 });
+    const afterSse = reducer(initialState, { type: "agentGraphPatched", graph: newest });
+    const staleSnapshot = graph({ revision: 2, status: "approved", updatedAt: 9_000 });
+
+    const hydrated = reducer(afterSse, {
+      type: "agentGraphsHydrated",
+      graphs: [staleSnapshot],
+      ...hydrationMetadata,
+      baselineRevisions: { [newest.id]: 2 },
+    });
+
+    expect(hydrated.agentGraphs).toEqual([newest]);
+    expect(hydrated.agentGraphsEnabled).toBe(true);
+  });
+
+  it("removes a retained graph omitted by the authoritative REST membership", () => {
+    const retained = graph({ id: "evicted", revision: 7, status: "completed" });
+
+    const hydrated = reducer({ ...initialState, agentGraphs: [retained] }, {
+      type: "agentGraphsHydrated",
+      graphs: [],
+      ...hydrationMetadata,
+      baselineRevisions: { [retained.id]: retained.revision },
+    });
+
+    expect(hydrated.agentGraphs).toEqual([]);
+  });
+
+  it("preserves a graph created by SSE after an authoritative REST request began", () => {
+    const concurrent = graph({ id: "concurrent", revision: 1, status: "running" });
+
+    const hydrated = reducer({ ...initialState, agentGraphs: [concurrent] }, {
+      type: "agentGraphsHydrated",
+      graphs: [],
+      ...hydrationMetadata,
+      baselineRevisions: {},
+    });
+
+    expect(hydrated.agentGraphs).toEqual([concurrent]);
+  });
+
+  it("treats an equal-revision identical replay as idempotent", () => {
+    const current = graph({ revision: 4, status: "running" });
+    const identicalReplay = structuredClone(current);
+    const before = { ...initialState, agentGraphs: [current] };
+
+    const after = reducer(before, { type: "agentGraphPatched", graph: identicalReplay });
+
+    expect(after).toBe(before);
+    expect(after.agentGraphs).toEqual([current]);
+  });
+
+  it("rejects conflicting content at the same revision", () => {
+    const current = graph({ revision: 5, status: "running", updatedAt: 2_000 });
+    const conflicting = graph({ revision: 5, status: "completed", updatedAt: 3_000 });
+    const before = { ...initialState, agentGraphs: [current] };
+
+    const after = reducer(before, { type: "agentGraphPatched", graph: conflicting });
+
+    expect(after).toBe(before);
+    expect(after.agentGraphs).toEqual([current]);
   });
 });

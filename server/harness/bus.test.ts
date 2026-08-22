@@ -8,7 +8,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { EVENTS_DIR, ensureDirs } from "../config.ts";
 import type { RuntimeEvent } from "../contracts.ts";
 import { makeFakeDriver } from "../testing/fake-driver.ts";
-import { EventBus } from "./bus.ts";
+import { EventBus, internalRuntimeTurnToken } from "./bus.ts";
 
 const testEvent = (over: Partial<RuntimeEvent> = {}): RuntimeEvent =>
   ({
@@ -108,6 +108,35 @@ describe("EventBus", () => {
     } finally {
       delete process.env.BUS_TEST_API_KEY;
     }
+  });
+
+  it("keeps a turn lease available only as non-serializable in-process proof", () => {
+    const rawToken = "turn-token-exact-internal-proof-1234567890";
+    const bus = new EventBus();
+    const seen: RuntimeEvent[] = [];
+    bus.subscribe((event) => seen.push(event));
+
+    bus.publish(testEvent({ threadId: "turn-token-proof", turnToken: rawToken }));
+
+    expect(seen).toHaveLength(1);
+    expect(internalRuntimeTurnToken(seen[0]!)).toBe(rawToken);
+    expect(seen[0]!.turnToken).not.toBe(rawToken);
+    expect(JSON.stringify(seen[0])).not.toContain(rawToken);
+    expect(readFileSync(join(EVENTS_DIR, "turn-token-proof.ndjson"), "utf8")).not.toContain(rawToken);
+    expect(Object.keys(seen[0]!)).not.toContain("openmaus.internal-runtime-turn-token");
+  });
+
+  it("drops a guard-rejected event before logging or subscriber delivery", () => {
+    const rawToken = "turn-token-wrong-owner-proof-1234567890";
+    const bus = new EventBus();
+    const seen: RuntimeEvent[] = [];
+    bus.addAdmissionGuard((event) => internalRuntimeTurnToken(event) !== rawToken);
+    bus.subscribe((event) => seen.push(event));
+
+    bus.publish(testEvent({ threadId: "guard-rejected", turnToken: rawToken }));
+
+    expect(seen).toEqual([]);
+    expect(existsSync(join(EVENTS_DIR, "guard-rejected.ndjson"))).toBe(false);
   });
 
   it("still delivers when the NDJSON log cannot be written", () => {

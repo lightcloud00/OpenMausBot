@@ -992,7 +992,7 @@ export class Store {
 
   /** A fresh context on the same bot: new thread, new session, same
    * persona/tools/computer. Becomes the active task. */
-  createTask(botId: string, title?: string, activate = true): TaskRecord | null {
+  createTask(botId: string, title?: string, activate = true, exactCwd?: string | null): TaskRecord | null {
     const bot = this.bot(botId);
     if (!bot) return null;
     const task: TaskRecord = {
@@ -1000,6 +1000,7 @@ export class Store {
       title: title?.trim() || UNTITLED_TASK,
       createdAt: Date.now(),
       resumeCursors: {},
+      ...(exactCwd === undefined ? {} : { cwd: exactCwd }),
     };
     bot.tasks = [task, ...(bot.tasks ?? [])];
     if (activate) {

@@ -3,7 +3,13 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { loadHostMcpCatalog, parseClaudeMcpServers, parseCodexMcpList, writeHostMcpManifest } from "./host-mcp.ts";
+import {
+  loadHostMcpCatalog,
+  loadHostMcpCatalogs,
+  parseClaudeMcpServers,
+  parseCodexMcpList,
+  writeHostMcpManifest,
+} from "./host-mcp.ts";
 
 describe("host MCP catalog", () => {
   it("loads stdio and HTTP Claude servers while excluding CredVault", () => {
@@ -87,6 +93,25 @@ describe("host MCP catalog", () => {
     expect(catalog.sources).toEqual({ claude: "missing", codex: "loaded" });
   });
 
+  it("keeps full-task tools separate from the external observer catalog", () => {
+    const catalogs = loadHostMcpCatalogs({
+      home: "/does/not/exist",
+      runCodexList: () => JSON.stringify([
+        { name: "sentry", enabled: true, transport: { type: "stdio", command: "/bin/sentry", args: [] } },
+      ]),
+    });
+
+    expect(catalogs.observer).toMatchObject({
+      servers: {},
+      manifest: { profile: "observer-router", toolInventory: [] },
+    });
+    expect(catalogs.fullTask.manifest).toMatchObject({ profile: "full-task-scoped" });
+    expect(catalogs.fullTask.manifest.toolInventory).toContain("sentry");
+    expect(catalogs.fullTask.manifest.toolInventory).toContain("openmaus-host:filesystem_stat");
+    expect(catalogs.fullTask.servers).toHaveProperty("sentry");
+    expect(catalogs.fullTask.servers).toHaveProperty("openmaus-host", { type: "builtin" });
+  });
+
   it("persists only the value-free manifest and source states", () => {
     const dataDir = mkdtempSync(join(tmpdir(), "omb-profile-"));
     const catalog = loadHostMcpCatalog({
@@ -101,6 +126,18 @@ describe("host MCP catalog", () => {
     expect(path).toMatch(/observer-router\.json$/);
     expect(saved).toContain('"profile": "observer-router"');
     expect(saved).not.toContain("/secret/path");
+  });
+
+  it("persists full-task and observer manifests to distinct paths", () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-profile-pair-"));
+    const catalogs = loadHostMcpCatalogs({ home: "/does/not/exist", runCodexList: () => "[]" });
+    const fullPath = writeHostMcpManifest(dataDir, catalogs.fullTask);
+    const observerPath = writeHostMcpManifest(dataDir, catalogs.observer);
+
+    expect(fullPath).toMatch(/full-task-scoped\.json$/);
+    expect(observerPath).toMatch(/observer-router\.json$/);
+    expect(readFileSync(fullPath, "utf8")).toContain('"profile": "full-task-scoped"');
+    expect(readFileSync(observerPath, "utf8")).toContain('"profile": "observer-router"');
   });
 
   it("registers one identity-pinned fleet bridge for OpenMausBot", () => {

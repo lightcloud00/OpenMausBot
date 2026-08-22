@@ -59,6 +59,32 @@ it("keeps package smoke away from shared credentials, CUA, and updater state by 
   expect(source).toContain("if (!SMOKE_TEST) startUpdater(win)");
 });
 
+it("bootstraps graph approval authority over private utility-process IPC, never argv or env", () => {
+  expect(source).toContain('OMB_AGENT_GRAPH_APPROVAL_IPC: "1"');
+  expect(source).toContain('type: "openmaus.agent-graph-authority.v1"');
+  expect(source).toContain("proc.postMessage({");
+  expect(source).not.toMatch(/OMB_AGENT_GRAPH_APPROVAL_SECRET\s*:\s*AGENT_GRAPH_APPROVAL_SECRET/);
+  expect(source).not.toMatch(/OMB_AGENT_GRAPH_APPROVAL_BOOT_ID\s*:\s*AGENT_GRAPH_APPROVAL_BOOT_ID/);
+});
+
+it("checks the trusted frame and server-owned graph manifest before any approval POST", () => {
+  const handler = source.indexOf('ipcMain.handle("agent-graphs:mutate"');
+  const mainFrame = source.indexOf("event.senderFrame !== event.sender.mainFrame", handler);
+  const trustedOrigin = source.indexOf("new URL(event.senderFrame.url).origin !== rendererOrigin()", handler);
+  const currentGraph = source.indexOf("const currentResponse = await fetch", handler);
+  const semanticManifest = source.indexOf("graphApprovalDetail(currentPayload, id, graphHash)", handler);
+  const dialog = source.indexOf("dialog.showMessageBox", handler);
+  const approvalPost = source.indexOf("const response = await fetch", currentGraph + 1);
+  for (const position of [handler, mainFrame, trustedOrigin, currentGraph, semanticManifest, dialog, approvalPost]) {
+    expect(position).toBeGreaterThanOrEqual(0);
+  }
+  expect(mainFrame).toBeLessThan(trustedOrigin);
+  expect(trustedOrigin).toBeLessThan(currentGraph);
+  expect(currentGraph).toBeLessThan(semanticManifest);
+  expect(semanticManifest).toBeLessThan(dialog);
+  expect(dialog).toBeLessThan(approvalPost);
+});
+
 it("packages acceptance builds under a non-production macOS identity", () => {
   expect(packageJson.scripts["package:mac:dev"]).toContain(
     "--config electron-builder.dev.yml --mac dir --arm64",

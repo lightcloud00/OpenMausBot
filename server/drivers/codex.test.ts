@@ -63,6 +63,8 @@ describe("CodexDriver turns (fake app-server)", () => {
     delete process.env.FAKE_CODEX_APPROVAL_KIND;
     delete process.env.FAKE_CODEX_APPROVAL_SERVER_NAME;
     delete process.env.FAKE_CODEX_APPROVAL_FALLBACK_SERVER;
+    delete process.env.OPENSSL_CONF;
+    delete process.env.JDK_JAVA_OPTIONS;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -217,6 +219,52 @@ describe("CodexDriver turns (fake app-server)", () => {
     const start = seen.calls.find((call: { method: string }) => call.method === "thread/start");
     expect(start.params).toMatchObject({ permissions: "openmaus-gateway-only", approvalPolicy: "on-request" });
     expect(start.params.sandbox).toBeUndefined();
+  });
+
+  it("strips process-control environment from full-task children and MCP mounts", async () => {
+    await create({
+      environment: {
+        NoDe_OpTiOnS: "--require=/tmp/provider-preload.js",
+        DYLD_INSERT_LIBRARIES: "/tmp/provider-preload.dylib",
+        Path: "/tmp/provider-bin",
+        OMB_GRAPH_SAFE_SETTING: "retained",
+        Node_Path: "/tmp/foreign-node-modules",
+      },
+    });
+    const dump = join(scratch, "full-profile-environment.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    process.env.OPENSSL_CONF = "/tmp/inherited-openssl.cnf";
+    process.env.JDK_JAVA_OPTIONS = "-javaagent:/tmp/foreign-agent.jar";
+
+    await instance.adapter.sendTurn({
+      threadId: "t-full-profile-environment",
+      turnToken: "turn-token-environment-123456789012345",
+      text: "work",
+      accessProfile: "full-task-scoped",
+      integrations: {
+        capabilityGateway: {
+          command: process.execPath,
+          args: ["/tmp/capability-proxy.js"],
+          env: {
+            OMB_TURN_TOKEN: "turn-token-environment-123456789012345",
+            lD_pReLoAd: "/tmp/proxy-preload.dylib",
+            PYTHONSTARTUP: "/tmp/proxy-startup.py",
+          },
+        },
+      },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    for (const name of [
+      "NoDe_OpTiOnS", "DYLD_INSERT_LIBRARIES", "Path", "HOME", "TMPDIR",
+      "OPENSSL_CONF", "JDK_JAVA_OPTIONS", "Node_Path", "OMB_GRAPH_SAFE_SETTING",
+    ]) {
+      expect(seen.env[name]).toBeUndefined();
+    }
+    expect(seen.env.PATH).not.toBe("/tmp/provider-bin");
+    expect(seen.env.OMB_TURN_TOKEN).toBe("turn-token-environment-123456789012345");
+    expect(JSON.stringify(seen.argv)).not.toMatch(/lD_pReLoAd|PYTHONSTARTUP/);
   });
 
   it("mounts connected apps without placing credential values in argv", async () => {
@@ -454,6 +502,24 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "approved" });
   });
 
+  it("forces the approval broker for graph turns even when fullAuto and turn auto-approval are enabled", async () => {
+    await create({ mode: "approval", fullAuto: true });
+    const dump = join(scratch, "forced-broker.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-forced-broker",
+      text: "inspect the workspace",
+      autoApprove: true,
+      forceApprovalBroker: true,
+    });
+    const opened = await recorder.until((event) => event.type === "request.opened");
+    expect(opened).toMatchObject({ requestType: "permission" });
+    await instance.adapter.respondToRequest("t-forced-broker", opened.requestId!, { behavior: "deny" });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "denied" });
+  });
+
   it("auto-approves an ordinary scoped delete in full-task-scoped mode", async () => {
     await create({ mode: "approval" });
     const dump = join(scratch, "full-delete.json");
@@ -549,10 +615,13 @@ describe("CodexDriver turns (fake app-server)", () => {
 
   it("rejects a second turn while one is in flight", async () => {
     await create({ mode: "approval" }); // approval mode parks the turn open
-    await instance.adapter.sendTurn({ threadId: "t-busy", text: "one" });
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-busy", text: "one" });
     await recorder.until((e) => e.type === "request.opened");
     await expect(instance.adapter.sendTurn({ threadId: "t-busy", text: "two" })).rejects.toThrow(/already running/);
-    await instance.adapter.interruptTurn("t-busy");
+    await expect(instance.adapter.interruptTurn("t-busy", "wrong-turn")).rejects.toThrow(/identity does not match/);
+    expect(instance.adapter.hasSession("t-busy")).toBe(true);
+    await instance.adapter.interruptTurn("t-busy", turnId);
+    expect(instance.adapter.hasSession("t-busy")).toBe(false);
     await recorder.until((e) => e.type === "turn.completed");
   });
 
