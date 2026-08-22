@@ -3,12 +3,12 @@ import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 
 import type { RetrievalProfile } from "../shared/retrieval-profile.ts";
 import { PROVIDER_CREDENTIAL_ENV, WORKSPACE_CREDENTIAL_ENV } from "./config.ts";
-import { augmentedPath } from "./env-path.ts";
+import { augmentedPath, type ResolvedSpawn } from "./env-path.ts";
 import { execCli } from "./procs.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { parseJson, type JsonValue } from "./schema.ts";
@@ -80,6 +80,10 @@ export interface OpenMausRetrieverOptions {
   /** Server-owned persistence root for exact-identity prior-turn material.
    * Evidence cannot nominate or widen this boundary. */
   trustedPriorTurnRoot?: string;
+  /** Server-owned exact files eligible for this request's prior-turn
+   * material. Prefer this over a persistence root when transcripts sit
+   * beside configuration or credential metadata. */
+  trustedPriorTurnPaths?: (request: OpenMausRetrievalRequest) => string[];
   /** Server-owned Fleet snapshot base. `null` disables snapshot aliases. */
   trustedSnapshotRoot?: string | null;
   /** Test seam for the bounded local origin read; its returned value is still
@@ -236,6 +240,15 @@ export function shouldRetrievePrompt(value: string): boolean {
   return /\b(?:repo(?:sitory)?|code(?:base)?|source|symbol|class|function|method|file|config|schema|api|implementation|implement|build|debug|fix|test|prior|previous|decision|project|cross-project|canonical|note|obsidian|hindsight|remember|locate|find|where|why|architecture|dependency|call path)\b/i.test(query);
 }
 
+/** Retrieval has no safe fallback workspace: a missing task cwd must never
+ * widen current-source verification to the user's home directory. */
+export function canRetrieveTaskScope(
+  profile: RetrievalProfile | undefined,
+  cwd: string | undefined,
+): cwd is string {
+  return profile === "task-scoped" && cwd !== undefined && cwd.trim().length > 0;
+}
+
 export function retrievalSession(request: Pick<OpenMausRetrievalRequest, "botId" | "threadId" | "taskId">): string {
   return ["openmausbot", request.botId, request.threadId, request.taskId]
     .map((part) => encodeURIComponent(part))
@@ -301,14 +314,14 @@ function defaultSourceRetrieve(request: OpenMausRetrievalRequest): Promise<JsonV
     "--truth",
     request.truth,
   ];
+  const spawn = retrievalRouterSpawn(router, args);
   return new Promise((resolvePromise, rejectPromise) => {
-    // Use the same no-shell resolver as the native agent drivers. Windows
-    // cannot execute a Node shebang script (or an npm .cmd shim) directly,
-    // while execCli resolves both to their real node entrypoint without
-    // exposing the query or evidence contract to cmd.exe.
+    // Use the same no-shell resolver as the native agent drivers. The spawn
+    // helper first turns a Windows Python router into `python.exe <script>`;
+    // execCli still resolves npm shims without exposing query data to cmd.exe.
     execCli(
-      router,
-      args,
+      spawn.command,
+      spawn.args,
       {
         encoding: "utf8",
         env: retrievalEnvironment(),
@@ -327,6 +340,20 @@ function defaultSourceRetrieve(request: OpenMausRetrievalRequest): Promise<JsonV
       },
     );
   });
+}
+
+/** Resolve the Python Fleet router without a shell on Windows. The general
+ * CLI resolver handles Node shebangs and npm shims, but CreateProcess cannot
+ * execute a .py file directly. */
+export function retrievalRouterSpawn(
+  router: string,
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+): ResolvedSpawn {
+  if (platform === "win32" && extname(router).toLowerCase() === ".py") {
+    return { command: "python.exe", args: [router, ...args] };
+  }
+  return { command: router, args };
 }
 
 function isWithin(root: string, candidate: string): boolean {
@@ -426,11 +453,12 @@ async function pathWithinRoots(
 ): Promise<boolean> {
   if (!isAbsolute(path) || roots.some((root) => !isAbsolute(root))) return false;
   const candidate = resolve(path);
-  if (!roots.some((root) => isWithin(resolve(root), candidate))) return false;
+  const candidateRoots = roots.filter((root) => isWithin(resolve(root), candidate));
+  if (!candidateRoots.length) return false;
   try {
     const [realCandidate, ...realRoots] = await Promise.all([
       realpathSource(candidate),
-      ...roots.map((root) => realpathSource(resolve(root))),
+      ...candidateRoots.map((root) => realpathSource(resolve(root))),
     ]);
     return realRoots.some((root) => isWithin(root, realCandidate));
   } catch {
@@ -505,7 +533,7 @@ async function acceptHit(
   request: OpenMausRetrievalRequest,
   options: Required<Pick<OpenMausRetrieverOptions, "readSource" | "statSource" | "realpathSource">> & {
     workspaceRoot: string;
-    trustedPriorTurnRoot: string | null;
+    trustedPriorTurnBoundaries: string[];
     trustedSnapshotRoot: string | null;
     repositoryIdentity: RepositoryIdentity | null;
   },
@@ -524,14 +552,13 @@ async function acceptHit(
   }
   if (!await pathWithinRoots(canonicalPath, sourceTruth.source_roots, options.realpathSource)) return null;
   if (!await pathWithinRoots(canonicalPath, [sourceTruth.repository_root], options.realpathSource)) return null;
+  const priorTurn = isPriorTurnHit(hit, sourceTruth, canonicalPath);
   const serverOwnedRoots = [
     options.workspaceRoot,
-    ...(isPriorTurnHit(hit, sourceTruth, canonicalPath) && options.trustedPriorTurnRoot
-      ? [options.trustedPriorTurnRoot]
-      : []),
+    ...(priorTurn ? options.trustedPriorTurnBoundaries : []),
   ];
   const isWithinServerRoots = await pathWithinRoots(canonicalPath, serverOwnedRoots, options.realpathSource);
-  const isSameRepositorySnapshot = !isPriorTurnHit(hit, sourceTruth, canonicalPath) &&
+  const isSameRepositorySnapshot = !priorTurn &&
     options.trustedSnapshotRoot !== null && options.repositoryIdentity !== null &&
     await pathWithinSnapshotNamespace(
       canonicalPath,
@@ -619,6 +646,7 @@ export class OpenMausRetriever {
   private readonly statSource: (path: string) => Promise<{ isFile(): boolean; size: number }>;
   private readonly realpathSource: (path: string) => Promise<string>;
   private readonly trustedPriorTurnRoot: string | null;
+  private readonly trustedPriorTurnPaths: (request: OpenMausRetrievalRequest) => string[];
   private readonly trustedSnapshotRoot: string | null;
   private readonly readRepositoryOrigin: (workspaceRoot: string) => Promise<string | null>;
   private readonly now: () => number;
@@ -634,6 +662,7 @@ export class OpenMausRetriever {
     this.statSource = options.statSource ?? stat;
     this.realpathSource = options.realpathSource ?? realpath;
     this.trustedPriorTurnRoot = options.trustedPriorTurnRoot ? resolve(options.trustedPriorTurnRoot) : null;
+    this.trustedPriorTurnPaths = options.trustedPriorTurnPaths ?? (() => []);
     this.trustedSnapshotRoot = options.trustedSnapshotRoot === null
       ? null
       : resolve(options.trustedSnapshotRoot ?? join(homedir(), ".local", "share", "aos-codebase-memory", "snapshots"));
@@ -719,13 +748,19 @@ export class OpenMausRetriever {
 
         const candidates = evidence.hits.slice(0, RETRIEVAL_HIT_LIMIT);
         const repositoryIdentity = await repositoryIdentityPromise;
+        const trustedPriorTurnBoundaries = [
+          ...(this.trustedPriorTurnRoot ? [this.trustedPriorTurnRoot] : []),
+          ...this.trustedPriorTurnPaths(request)
+            .filter((path) => isAbsolute(path))
+            .map((path) => resolve(path)),
+        ];
         const verified = (await Promise.all(
           candidates.map((hit) => acceptHit(hit, request, {
             readSource: this.readSource,
             statSource: this.statSource,
             realpathSource: this.realpathSource,
             workspaceRoot: workspaceBoundary.root,
-            trustedPriorTurnRoot: this.trustedPriorTurnRoot,
+            trustedPriorTurnBoundaries,
             trustedSnapshotRoot: this.trustedSnapshotRoot,
             repositoryIdentity,
           })),

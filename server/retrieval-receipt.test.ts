@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -41,10 +41,11 @@ describe("retrieval receipt persistence", () => {
     const directPath = recordRetrievalReceipt(dataDir, direct, new Date("2026-08-22T07:00:00Z"));
     const groupPath = recordRetrievalReceipt(dataDir, group, new Date("2026-08-22T07:01:00Z"));
 
-    expect(directPath).toBe(retrievalReceiptPath(dataDir, direct));
-    expect(groupPath).toBe(retrievalReceiptPath(dataDir, group));
     expect(directPath).not.toBe(groupPath);
-    expect(basename(directPath!)).toMatch(/^[a-f0-9]{64}\.json$/);
+    expect(basename(directPath!)).toMatch(/^[a-f0-9]{64}-[a-f0-9]{64}\.json$/);
+    expect(basename(groupPath!)).toMatch(/^[a-f0-9]{64}-[a-f0-9]{64}\.json$/);
+    expect(retrievalReceiptPath(dataDir, direct, "dispatch-a"))
+      .not.toBe(retrievalReceiptPath(dataDir, direct, "dispatch-b"));
     const readback = JSON.parse(readFileSync(directPath!, "utf8"));
     expect(readback).toMatchObject({
       schema: "openmaus.retrieval-receipt-record.v1",
@@ -74,6 +75,19 @@ describe("retrieval receipt persistence", () => {
       expect(statSync(directPath!).mode & 0o777).toBe(0o600);
       expect(statSync(join(dataDir, "retrieval-receipts")).mode & 0o777).toBe(0o700);
     }
+  });
+
+  it("preserves every dispatch receipt for the same bot and thread", () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "openmaus-retrieval-receipts-"));
+    const sameSession = receipt("bot-ada", "thread-ada", "task-ada");
+    const first = recordRetrievalReceipt(dataDir, sameSession, new Date("2026-08-22T07:00:00Z"));
+    const second = recordRetrievalReceipt(dataDir, sameSession, new Date("2026-08-22T07:00:00Z"));
+
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(second).not.toBe(first);
+    expect(existsSync(first!)).toBe(true);
+    expect(existsSync(second!)).toBe(true);
   });
 
   it("fails open when the receipt directory cannot be created", () => {

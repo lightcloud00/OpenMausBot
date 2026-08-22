@@ -5,7 +5,6 @@ import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { isIP } from "node:net";
-import { homedir } from "node:os";
 import { extname, join } from "node:path";
 
 import { z } from "zod";
@@ -98,7 +97,12 @@ import { readCuaConnection } from "./local-computer.ts";
 import { LocalVmIdleTimer } from "./local-vm-idle.ts";
 import { LocalVmLease, LocalVmLeasePool } from "./local-vm-lease.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
-import { createRetrievalRequest, OpenMausRetriever, type OpenMausRetrievalReceipt } from "./retrieval.ts";
+import {
+  canRetrieveTaskScope,
+  createRetrievalRequest,
+  OpenMausRetriever,
+  type OpenMausRetrievalReceipt,
+} from "./retrieval.ts";
 import { finalizeRetrievalReceipt, recordRetrievalReceipt } from "./retrieval-receipt.ts";
 import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
@@ -259,7 +263,16 @@ let bootSelection = { instanceId: "", model: "" };
 const store = new Store(() => bootSelection);
 bootSelection = await defaultSelection();
 store.seedIfEmpty();
-const retriever = new OpenMausRetriever({ trustedPriorTurnRoot: DATA_DIR });
+const trustedPriorTurnPaths = (request: { threadId: string }): string[] => {
+  if (!/^[a-z0-9][a-z0-9._-]{0,255}$/iu.test(request.threadId)) return [];
+  return [
+    join(EVENTS_DIR, `${request.threadId}.ndjson`),
+    join(NATIVE_DIR, `${request.threadId}.ndjson`),
+    join(DATA_DIR, `messages-${request.threadId}.json`),
+    join(DATA_DIR, `messages-${request.threadId}.json.imported`),
+  ];
+};
+const retriever = new OpenMausRetriever({ trustedPriorTurnPaths });
 
 /** A bot as a client may see it: no provider session bookkeeping.
  *
@@ -1447,7 +1460,7 @@ async function startTurn(
           ? store.pinTaskCwd(bot.id, threadId, privateWorkspace)
           : null;
       const cwd = pinnedCwd ?? undefined;
-      if (bot.retrievalProfile === "task-scoped") {
+      if (canRetrieveTaskScope(bot.retrievalProfile, cwd)) {
         const outcome = await retriever.retrieve(
           bot.retrievalProfile,
           createRetrievalRequest({
@@ -1455,7 +1468,7 @@ async function startTurn(
             threadId,
             taskId: task.threadId,
             query: text,
-            cwd: cwd ?? homedir(),
+            cwd,
           }),
         );
         retrievalContext = outcome.context;
@@ -1956,7 +1969,7 @@ async function runGroupMemberTurn(
     .find((message) => message.role === "user" && message.kind === "text" && message.text)?.text ?? "";
   let retrievalContext = "";
   let retrievalReceipt: OpenMausRetrievalReceipt | null = null;
-  if (bot.retrievalProfile === "task-scoped") {
+  if (canRetrieveTaskScope(bot.retrievalProfile, cwd)) {
     const outcome = await retriever.retrieve(
       bot.retrievalProfile,
       createRetrievalRequest({
@@ -1964,7 +1977,7 @@ async function runGroupMemberTurn(
         threadId: group.threadId,
         taskId: group.threadId,
         query: latestUserText,
-        cwd: cwd ?? homedir(),
+        cwd,
       }),
     );
     retrievalContext = outcome.context;

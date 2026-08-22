@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
@@ -38,8 +38,17 @@ function identityDigest(receipt: OpenMausRetrievalReceipt): string {
     .digest("hex");
 }
 
-export function retrievalReceiptPath(dataDir: string, receipt: OpenMausRetrievalReceipt): string {
-  return join(dataDir, "retrieval-receipts", `${identityDigest(receipt)}.json`);
+export function retrievalReceiptPath(
+  dataDir: string,
+  receipt: OpenMausRetrievalReceipt,
+  dispatchId: string,
+): string {
+  const dispatchDigest = createHash("sha256")
+    .update(JSON.stringify(receipt.native_dispatch_proof))
+    .update("\0")
+    .update(dispatchId)
+    .digest("hex");
+  return join(dataDir, "retrieval-receipts", `${identityDigest(receipt)}-${dispatchDigest}.json`);
 }
 
 /** Bind a retrieval outcome to the exact native adapter dispatch without
@@ -84,7 +93,7 @@ export function recordRetrievalReceipt(
     const directory = join(dataDir, "retrieval-receipts");
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     chmodSync(directory, 0o700);
-    const path = retrievalReceiptPath(dataDir, receipt);
+    const path = retrievalReceiptPath(dataDir, receipt, randomUUID());
     const record: StoredRetrievalReceipt = {
       schema: "openmaus.retrieval-receipt-record.v1",
       recorded_at: now.toISOString(),
