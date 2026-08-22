@@ -47,6 +47,7 @@ import * as box from "./box.ts";
 import { cloudBackendChangeError, vpsAliasChangeError } from "./cloud-backend.ts";
 import * as composio from "./composio.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
+import { openMausStatusSystemPrompt } from "./openmaus-status-capsule.ts";
 import {
   containerComputerAction,
   containerComputerExists,
@@ -2089,7 +2090,12 @@ async function startTurn(
           )
         : [];
       const coordinationPrompt = bot.chiefOfStaff
-        ? chiefOfStaffSystemPrompt(bot.id, store.bots, Boolean(integrations.agents))
+        ? chiefOfStaffSystemPrompt(
+            bot.id,
+            store.bots,
+            Boolean(integrations.agents),
+            openMausStatusSystemPrompt(),
+          )
         : integrations.agents
           ? "You can work with the user's other bots through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply."
           : "";
