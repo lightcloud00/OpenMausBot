@@ -371,6 +371,45 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "approved" });
   });
 
+  it("marks a reason-only Codex file approval incomplete", async () => {
+    await create({
+      mode: "file-approval",
+      environment: {
+        FAKE_CODEX_FILE_APPROVAL_PARAMS: JSON.stringify({ itemId: "file-item-1", reason: "Apply the implementation" }),
+      },
+    });
+    await instance.adapter.sendTurn({ threadId: "t-file-reason", text: "edit", cwd: scratch });
+    const opened = await recorder.until((event) => event.type === "request.opened");
+    expect(opened).toMatchObject({ tool: "edit", summary: "Apply the implementation", summaryComplete: false });
+    await instance.adapter.respondToRequest("t-file-reason", opened.requestId!, { behavior: "deny" });
+    await recorder.until((event) => event.type === "turn.completed");
+  });
+
+  it("retains exact delete operation/path and writable-scope expansion", async () => {
+    const deleted = join(scratch, "obsolete.txt");
+    const outside = join(dirname(scratch), "outside-root");
+    await create({
+      mode: "file-approval",
+      environment: {
+        FAKE_CODEX_FILE_APPROVAL_PARAMS: JSON.stringify({
+          itemId: "file-item-1",
+          grantRoot: outside,
+          reason: "Cleanup",
+        }),
+        FAKE_CODEX_FILE_ITEM_CHANGES: JSON.stringify([
+          { path: deleted, kind: { type: "delete" }, diff: "" },
+        ]),
+      },
+    });
+    await instance.adapter.sendTurn({ threadId: "t-file-delete", text: "edit", cwd: scratch });
+    const opened = await recorder.until((event) => event.type === "request.opened");
+    expect(opened).toMatchObject({ tool: "delete_file", summaryComplete: true, cwd: scratch, workspaceBound: true });
+    expect((opened as { summary: string }).summary).toContain(`delete ${deleted}`);
+    expect((opened as { summary: string }).summary).toContain(`writable-root ${outside}`);
+    await instance.adapter.respondToRequest("t-file-delete", opened.requestId!, { behavior: "deny" });
+    await recorder.until((event) => event.type === "turn.completed");
+  });
+
   it("stamps approvalScope on cards only when the turn controls this Mac", async () => {
     await create({ mode: "approval" });
 

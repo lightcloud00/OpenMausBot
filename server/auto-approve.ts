@@ -17,14 +17,15 @@ const DESTRUCTIVE = [
   /\bmkfs\b|\bdiskutil\s+erase|\bdd\s+[^|]*\bof=\/dev\//i,
   /\bshutdown\b|\breboot\b|\bhalt\b/i,
   /:\(\)\s*\{.*\}\s*;?\s*:/, // fork bomb
-  /\bgit\s+push\s+[^|]*(?:--force(?:-with-lease)?\b|--delete\b)|\bgit\s+reset\s+--hard\b|\bgit\s+clean\s+-[^\s]*f/i,
+  /\bgit\s+push\s+[^|;&\n]*(?:--force(?:-with-lease)?\b|--delete\b|--mirror\b|(?:^|\s):[^\s]+)|\bgit\s+reset\s+--hard\b|\bgit\s+clean\s+-[^\s]*f/i,
   /\bgit\s+(?:branch|tag)\s+-[dD]\b|\bgh\s+repo\s+delete\b/i,
+  /\bgit\s+update-ref\s+-d\b/i,
   /\bDROP\s+(TABLE|DATABASE)\b|\bTRUNCATE\s+TABLE\b|\bDELETE\s+FROM\b/i,
   /\bsudo\s+rm\b|\bchmod\s+-R\s+777\s+\//i,
   /\b(?:terraform\s+destroy|kubectl\s+delete\s+(?:namespace|cluster)|docker\s+system\s+prune)\b/i,
   /\b(?:curl|wget)\b[^|;&\n]*\|\s*(?:sudo\s+)?(?:ba)?sh\b/i,
   /\b(?:find|fd)\b[^|;&\n]*\s-delete\b|\bRemove-Item\b|(?:^|[;&|\n]\s*)(?:del|erase)\s+[^&|;\n]+/i,
-  /\bgh\s+api\b[^|;&\n]*(?:-X|--method)\s+DELETE\b/i,
+  /\bgh\s+api\b[^|;&\n]*(?:-X|--method)(?:=|\s*)DELETE\b/i,
 ];
 
 const DESTRUCTIVE_TOOL = /(?:^|__|[./_-])(?:delete|remove|unlink|rmdir|trash|purge|destroy|wipe)(?:[./_-]|$)/i;
@@ -46,15 +47,22 @@ const VALUE_READ_TOOL = /(?:^|__|[./_-])(?:read(?:[./_-]?file)?|get[./_-]?file|d
 const VALUE_OUTPUT_OPERATIONS = [
   /\bsecurity\s+find-(?:generic|internet)-password\b[^|;&\n]*\s-w(?:\s|$)/i,
   /\bcredvault[_-]?(?:get[_-]?secret|read[_-]?secret|show[_-]?secret|reveal|export|raw)\b/i,
+  /(?:^|[;&|\n]\s*)\b(?:credvault|cv)\s+(?:get|read|show|reveal|dump|export|raw)\b/i,
+  /(?:^|[;&|\n]\s*)\bop\s+read\s+op:\/\//i,
+  /(?:^|[;&|\n]\s*)\bpass\s+(?:show|grep)\b/i,
   /\b(?:get|read|show|reveal|dump|export)[_-]?(?:secret|credential|token|password)[_-]?(?:value|raw)?\b/i,
   /(?:^|\s--\s|[;&|]\s*|\b(?:ba|z)?sh\s+-c\s+["']?)\s*(?:sudo\s+)?(?:\/usr\/bin\/)?(?:env|set)\s*(?:["']?\s*$|[|>&])/i,
+  /(?:^|\s--\s|[;&|]\s*|\b(?:ba|z)?sh\s+-c\s+["']?)\s*(?:sudo\s+)?(?:\/usr\/bin\/)?env\s+(?:-0|--null)\b/i,
   /(?:^|\s--\s|[;&|]\s*|\b(?:ba|z)?sh\s+-c\s+["']?)\s*(?:sudo\s+)?(?:\/usr\/bin\/)?printenv(?:\s*["']?\s*$|\s+[A-Z0-9_]*(?:KEY|TOKEN|PASSWORD|SECRET|CREDENTIAL)[A-Z0-9_]*\s*(?:["']?\s*$|[|>&]))/i,
   /\b(?:echo|printf)\b[^|;&\n]*\$(?:\{)?[A-Z0-9_]*(?:KEY|TOKEN|PASSWORD|SECRET|CREDENTIAL)[A-Z0-9_]*(?:\})?/i,
-  /\b(?:show|print|reveal|return|dump|export|copy)\b.{0,48}\b(?:api[- ]?key|access[- ]?token|password|secret|credential)\s+(?:value|contents?)\b/i,
+  /\b(?:show|print|reveal|return|dump|export|copy)\b.{0,48}\b(?:api[- ]?key|access[- ]?token|password|secret|credential)(?:\s+(?:value|contents?))?\b/i,
   /\b(?:auth|config)\b.{0,80}\b(?:token|password|secret|credential)\b/i,
 ];
 
-const CREDVAULT_EXEC = /\bcredvault(?:[_-]env)?[_-]exec\b/i;
+const VALUE_OUTPUT_TOOL =
+  /(?:^|__|[./_-])(?:get|read|show|reveal|return|dump|export|copy)[_-]?(?:api[_-]?key|access[_-]?token|secret|credential|token|password)(?:[./_-]|$)/i;
+
+const CREDVAULT_EXEC = /\b(?:credvault(?:[_-]env)?[_-]exec|credvault\s+exec|cv\s+exec)\b/i;
 const VALUE_CAPABLE_PROGRAM = /^(?:env|printenv|sh|bash|zsh|fish|node|python\d*|ruby|perl|php|osascript|pwsh|powershell)$/i;
 
 /** First matching pattern's source, so a verdict can NAME the rule that
@@ -74,6 +82,7 @@ function matchRawValueAccess(text: string): string | null {
 }
 
 function matchRawValueRequest(tool: string, summary: string): string | null {
+  if (VALUE_OUTPUT_TOOL.test(tool)) return VALUE_OUTPUT_TOOL.source;
   const direct = matchRawValueAccess(summary) ?? matchRawValueAccess(tool);
   if (direct) return direct;
   const path = matchFirst(SENSITIVE_NAME, summary);
@@ -119,8 +128,14 @@ const COMMAND_TOOLS = new Set(["bash", "shell", "execute", "run_command", "compu
 const FILE_TOOLS = /^(?:read|write|edit|patch|apply_patch|read_file|write_file|edit_file|filesystem)(?:$|__|[./_-])/i;
 const UNBOUNDED_PROGRAM = /^(?:sh|bash|zsh|fish|node|python\d*|ruby|perl|php|osascript|pwsh|powershell)$/i;
 
+/** MCP server names may contain underscores. Stop at the protocol's double
+ * underscore delimiter, not at the first underscore in the server name. */
+function bareToolName(tool: string): string {
+  return tool.replace(/^mcp__.+?__/i, "").toLowerCase();
+}
+
 export function approvalKey(tool: string, summary: string, scope?: "local-computer"): string {
-  const bare = tool.replace(/^mcp__[^_]+__/, "").toLowerCase();
+  const bare = bareToolName(tool);
   if (!COMMAND_TOOLS.has(bare)) return scope ? `${scope}:${tool}` : tool;
   // first bare word of the command, skipping env assignments and sudo
   const words = summary.trim().split(/\s+/);
@@ -191,24 +206,36 @@ function hasExactTaskScope(context?: GuardedAutoContext): boolean {
 function requestStaysInsideTask(tool: string, summary: string, context?: GuardedAutoContext): boolean {
   const scope = context?.taskScope;
   if (!scope) return false;
-  const bare = tool.replace(/^mcp__[^_]+__/, "").toLowerCase();
+  const bare = bareToolName(tool);
   const commandTool = COMMAND_TOOLS.has(bare);
   if (!commandTool && !FILE_TOOLS.test(bare)) return true;
 
   // Dynamic shells/interpreters and path expansion cannot be proven cwd-only
   // from the approval summary. Card them instead of approving a guess.
-  if (/(?:^|[/\\])\.\.(?:[/\\]|$)|(?:^|\s)~(?:[/\\\s]|$)|\$(?:\{|\(|[A-Za-z_])|`/.test(summary)) return false;
+  if (/(?:^|[\s"'=(]|[/\\])\.\.(?:[/\\]|$)|(?:^|\s)~(?:[/\\\s]|$)|\$(?:\{|\(|[A-Za-z_])|`/.test(summary)) return false;
   let executableToken = "";
   if (commandTool) {
-    const words = summary.trim().split(/\s+/);
-    let i = 0;
-    while (i < words.length && (/^[A-Z_][A-Z0-9_]*=/.test(words[i]) || words[i] === "sudo")) i += 1;
-    executableToken = (words[i] ?? "").replace(/^['"]|['"]$/g, "");
-    const program = (executableToken.split(/[/\\]/).pop() ?? "").replace(/\.exe$/i, "");
-    if (!program || UNBOUNDED_PROGRAM.test(program)) return false;
+    // Every shell segment gets its own executable check. Looking only at the
+    // first word let `git status; python -c ...` inherit git's approval.
+    const segments = summary.split(/&&|\|\||[;|\n]/).map((segment) => segment.trim()).filter(Boolean);
+    if (!segments.length) return false;
+    for (const segment of segments) {
+      const words = segment.replace(/^\(+/, "").trim().split(/\s+/);
+      let i = 0;
+      while (i < words.length && (/^[A-Z_][A-Z0-9_]*=/.test(words[i]) || words[i] === "sudo")) i += 1;
+      // `env NAME=value command` is a wrapper; inspect the command it starts.
+      if ((words[i] ?? "").split("/").pop() === "env") {
+        i += 1;
+        while (i < words.length && (/^[A-Z_][A-Z0-9_]*=/.test(words[i]) || words[i].startsWith("-"))) i += 1;
+      }
+      const token = (words[i] ?? "").replace(/^['"]|['"]$/g, "");
+      const program = (token.split(/[/\\]/).pop() ?? "").replace(/\.exe$/i, "");
+      if (!program || UNBOUNDED_PROGRAM.test(program)) return false;
+      if (!executableToken) executableToken = token;
+    }
   }
 
-  const absolutePaths = summary.match(/(?:^|[\s='"(])(?:\/(?!\/)[^\s'"`;|&)]+|[A-Za-z]:\\[^\s'"`;|&)]+)/g) ?? [];
+  const absolutePaths = summary.match(/(?:^|[\s='"(])(?:\/[^\s'"`;|&)]+|[A-Za-z]:\\[^\s'"`;|&)]+)/g) ?? [];
   const taskCwd = resolve(scope.taskCwd);
   return absolutePaths.every((raw) => {
     const candidate = raw.trim().replace(/^[='"(]+|[),]+$/g, "");
@@ -249,9 +276,10 @@ export function autoVerdict(
   }
 
   const key = approvalKey(tool, summary, context?.scope);
-  // Host click/type metadata can be too weak to classify safely. Auto mode
-  // remains the explicit opt-in for the user's active desktop.
-  if (context?.scope === "local-computer" && !bot.autoApprove) {
+  // Host CUA crosses cwd and sandbox boundaries, and terse metadata such as
+  // "click" cannot prove reversibility. Never auto-answer it, even when a
+  // legacy Auto toggle or remembered grant is present.
+  if (context?.scope === "local-computer") {
     return {
       behavior: "ask",
       approve: null,

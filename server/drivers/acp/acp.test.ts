@@ -44,8 +44,7 @@ const SELECT_MODEL_SUPPORT: AcpSupport = {
 };
 const SelectModelDriver = createAcpDriver(SELECT_MODEL_SUPPORT);
 
-/** Proves transformEnv can vary with the instance config, which is how the
- *  opencode driver picks its permission policy from `fullAuto`. */
+/** Proves legacy fullAuto is sanitized before any support callback. */
 const EnvPolicyDriver = createAcpDriver({
   ...SELECT_MODEL_SUPPORT,
   driverKind: "envPolicyTest",
@@ -143,22 +142,27 @@ describe("ACP decodeConfig", () => {
     });
     expect(CursorAgentDriver.install?.signInCommand).toBe("cursor-agent login");
   });
-  it("fullAuto only when explicitly true", () => {
+  it("migrates persisted fullAuto off", () => {
     expect(GrokAgentDriver.decodeConfig({ fullAuto: "yes" }).fullAuto).toBe(false);
-    expect(GrokAgentDriver.decodeConfig({ fullAuto: true }).fullAuto).toBe(true);
+    expect(GrokAgentDriver.decodeConfig({ fullAuto: true }).fullAuto).toBe(false);
   });
 
-  it("does not advertise or accept local CUA in full-auto mode", async () => {
+  it("migrates legacy fullAuto through ACP permissions, including local CUA", async () => {
+    ensureDirs();
+    chmodSync(FAKE_CLI, 0o755);
+    const scratch = mkdtempSync(join(tmpdir(), "omb-acp-legacy-auto-"));
+    const dump = join(scratch, "dump.json");
     const fullAuto = await GrokAgentDriver.create({
       instanceId: "grok-full-auto",
       displayName: "Grok Full Auto",
-      environment: {},
+      environment: { FAKE_ACP_MODE: "permission", FAKE_ACP_DUMP: dump },
       enabled: true,
       config: { cli: FAKE_CLI, fullAuto: true },
     });
-    expect(fullAuto.adapter.capabilities.localComputerMcp).toBe(false);
-    await expect(
-      fullAuto.adapter.sendTurn({
+    const recorder = recordEvents(fullAuto.adapter);
+    try {
+      expect(fullAuto.adapter.capabilities.localComputerMcp).toBe(true);
+      await fullAuto.adapter.sendTurn({
         threadId: "t-full-auto-local",
         text: "click",
         integrations: {
@@ -170,9 +174,18 @@ describe("ACP decodeConfig", () => {
             scope: "local-computer",
           },
         },
-      }),
-    ).rejects.toThrow(/interactive provider approvals/);
-    await fullAuto.dispose();
+      });
+      const opened = await recorder.until((event) => event.type === "request.opened");
+      expect(opened).toMatchObject({ approvalScope: "local-computer", workspaceBound: false });
+      expect(JSON.parse(readFileSync(dump, "utf8")).argv).toContain("default");
+      expect(JSON.parse(readFileSync(dump, "utf8")).argv).not.toContain("bypassPermissions");
+      await fullAuto.adapter.respondToRequest("t-full-auto-local", opened.requestId!, { behavior: "deny" });
+      await recorder.until((event) => event.type === "turn.completed");
+    } finally {
+      recorder.stop();
+      await fullAuto.dispose();
+      await removeTempDir(scratch);
+    }
   });
 });
 
@@ -308,7 +321,7 @@ describe("ACP turns (fake CLI)", () => {
     });
   });
 
-  it("droid takes model and autonomy over the wire, never through argv", async () => {
+  it("droid migrates legacy fullAuto to guarded mode over the wire", async () => {
     // `droid exec -m <id> -o acp` ignores the flag (verified against 0.196.0),
     // so a model that only reached argv would silently run the CLI's own pick.
     instance = await DroidAgentDriver.create({
@@ -331,7 +344,7 @@ describe("ACP turns (fake CLI)", () => {
 
     const applied = JSON.parse(readFileSync(`${dump}.config.json`, "utf8"));
     expect(applied).toEqual([
-      { method: "session/set_mode", params: { sessionId: "fake-acp-session", modeId: "auto-high" } },
+      { method: "session/set_mode", params: { sessionId: "fake-acp-session", modeId: "normal" } },
       { method: "session/set_model", params: { sessionId: "fake-acp-session", modelId: "claude-sonnet-5" } },
     ]);
   });
@@ -617,7 +630,7 @@ describe("ACP turns (fake CLI)", () => {
     );
   });
 
-  it("transformEnv sees the instance config", async () => {
+  it("transformEnv cannot reactivate legacy fullAuto", async () => {
     const dump = join(scratch, "policy.json");
     process.env.FAKE_ACP_DUMP = dump;
     instance = await EnvPolicyDriver.create({
@@ -632,7 +645,7 @@ describe("ACP turns (fake CLI)", () => {
     await instance.adapter.sendTurn({ threadId: "t-policy", text: "go" });
     await recorder.until((e) => e.type === "turn.completed");
 
-    expect(JSON.parse(readFileSync(dump, "utf8")).env.TEST_POLICY).toBe("auto");
+    expect(JSON.parse(readFileSync(dump, "utf8")).env.TEST_POLICY).toBe("ask");
   });
 
   it("declares effort levels for Grok only", async () => {

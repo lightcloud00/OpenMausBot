@@ -39,6 +39,11 @@ describe("looksDestructive", () => {
     "git push --force origin main",
     "git push --force-with-lease",
     "git push origin --delete old-branch",
+    "git push origin :main",
+    "git push --mirror origin",
+    "git update-ref -d refs/heads/main",
+    "gh api --method=DELETE repos/acme/prod",
+    "gh api -XDELETE repos/acme/prod",
     "git branch -d old-branch",
     "git reset --hard HEAD~5",
     "DROP TABLE users;",
@@ -163,6 +168,22 @@ describe("autoDecision", () => {
     });
   });
 
+  it("cards traversal, every dynamic command segment, and generic MCP file escape", () => {
+    for (const [tool, summary] of [
+      ["Bash", "cat ../outside/notes.txt"],
+      ["Bash", "cat //etc/passwd"],
+      ["Bash", "git status; python -c pass"],
+      ["Bash", "git status && sh -c true"],
+      ["mcp__openmausbot_connectors__read_file", "/etc/passwd"],
+      ["edit", "update /workspace/project/src/index.ts\nwritable-root /tmp/outside"],
+    ]) {
+      expect(autoVerdict({ autoApprove: true }, tool, summary, scoped()), `${tool}: ${summary}`).toMatchObject({
+        behavior: "ask",
+        source: "unscoped-guard",
+      });
+    }
+  });
+
   it("asks when the provider supplied only a summary prefix", () => {
     expect(autoVerdict({}, "Bash", "echo safe", scoped({ summaryComplete: false }))).toMatchObject({
       behavior: "ask",
@@ -199,8 +220,14 @@ describe("autoDecision", () => {
       ["Bash", "rm output.txt"],
       ["Bash", "/bin/rm output.txt"],
       ["Bash", "git push origin --delete old-branch"],
+      ["Bash", "git push origin :main"],
+      ["Bash", "git push --mirror origin"],
+      ["Bash", "gh api --method=DELETE repos/acme/prod"],
+      ["Bash", "gh api -XDELETE repos/acme/prod"],
+      ["Bash", "git update-ref -d refs/heads/main"],
       ["mcp__filesystem__delete_file", "output.txt"],
       ["remove_path", "build/cache"],
+      ["delete_file", "/workspace/project/obsolete.txt"],
     ]) {
       expect(autoVerdict({}, tool, command, scoped()), `${tool}: ${command}`).toMatchObject({
         behavior: "ask",
@@ -232,6 +259,23 @@ describe("autoDecision", () => {
     }
   });
 
+  it("denies real credential CLIs, null-delimited env dumps, and credential MCP tools", () => {
+    for (const [tool, command] of [
+      ["Bash", "credvault export github/cli"],
+      ["Bash", "cv export github/cli"],
+      ["Bash", "env -0"],
+      ["Bash", "op read op://Private/api/token"],
+      ["Bash", "pass show service/token"],
+      ["mcp__vault__get_api_key", "Return API key"],
+      ["generic_tool", "Return API key"],
+    ]) {
+      expect(autoVerdict({ autoApprove: true }, tool, command, scoped()), `${tool}: ${command}`).toMatchObject({
+        behavior: "deny",
+        source: "sensitive-guard",
+      });
+    }
+  });
+
   it("asks when CredVault does not bind a fixed non-interpreter command", () => {
     expect(autoVerdict({}, "credvault_exec", "github/cli", scoped())).toMatchObject({
       behavior: "ask",
@@ -255,15 +299,19 @@ describe("autoDecision", () => {
         scoped(),
       ),
     ).toMatchObject({ behavior: "allow", source: "guarded-autonomy" });
+    expect(autoVerdict({}, "Bash", "credvault exec github/cli -- gh issue list", scoped())).toMatchObject({
+      behavior: "allow",
+      source: "guarded-autonomy",
+    });
   });
 
-  it("auto-approves a local-computer request when Auto mode is on", () => {
+  it("never auto-approves host computer control, even in legacy Auto mode", () => {
     expect(
-      autoDecision({ autoApprove: true }, "mcp__computer__click", "Click the Submit button", {
+      autoVerdict({ autoApprove: true }, "mcp__computer__click", "Click Delete account and confirm", {
         ...scoped(),
         scope: "local-computer",
       }),
-    ).toBe("auto-approved mcp__computer__click");
+    ).toMatchObject({ behavior: "ask", source: "local-computer-block" });
   });
 
   it("does not let always-allow cover host control without Auto mode", () => {

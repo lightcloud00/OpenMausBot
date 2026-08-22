@@ -7,9 +7,10 @@
 //
 //   1. a rule-matched auto-approval writes a row naming the rule
 //   2. a raw protected-value request writes an automatic denial row
-//   3. a destructive card and the human's answer write two rows
-//   4. safe webhook work preserves unattended provenance without carding
-//   5. GET /api/decisions pages newest-last with ?limit=
+//   3. an undeliverable raw-value denial records failure, never success
+//   4. a destructive card and the human's answer write two rows
+//   5. safe webhook work preserves unattended provenance without carding
+//   6. GET /api/decisions pages newest-last with ?limit=
 import { spawn, type ChildProcess } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -151,6 +152,14 @@ posixOnly("authorization decisions are logged", () => {
             },
             config: { cli: FAKE_CLI, fullAuto: false },
           },
+          sensitiveRace: {
+            driver: "grokAgent",
+            environment: {
+              FAKE_ACP_MODE: "permission-closed",
+              FAKE_ACP_PERMISSION_COMMAND: ["cat", [".", "env"].join("")].join(" "),
+            },
+            config: { cli: FAKE_CLI, fullAuto: false },
+          },
         },
       }),
     );
@@ -212,6 +221,30 @@ posixOnly("authorization decisions are logged", () => {
       expect(row, "the automatic denial never reached the decision log").not.toBeNull();
       expect(row!.source).toBe("sensitive-guard");
       expect(row!.tool).toBe("shell");
+      expect(await waitForBotCard(bot.id, 1_000)).toBeNull();
+    },
+    60_000,
+  );
+
+  it(
+    "an undeliverable protected-value denial is logged as failure, never auto-denied",
+    async () => {
+      const bot = await makePermissionBot({ name: "GuardRace" }, "sensitiveRace");
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "run it" })).status).toBe(202);
+
+      const row = await waitForDecision((r) => r.decision === "deny-delivery-failed" && r.botId === bot.id);
+      const decisions = (await api("GET", "/api/decisions")).body.decisions as DecisionRow[];
+      expect(
+        row,
+        `the denial delivery failure never reached the decision log: ${JSON.stringify(decisions.filter((r) => r.botId === bot.id))}`,
+      ).not.toBeNull();
+      expect(row!.source).toBe("sensitive-guard");
+      expect(row!.rule).toContain("delivery_failed");
+      expect(
+        decisions.some(
+          (candidate: DecisionRow) => candidate.botId === bot.id && candidate.decision === "auto-denied",
+        ),
+      ).toBe(false);
       expect(await waitForBotCard(bot.id, 1_000)).toBeNull();
     },
     60_000,

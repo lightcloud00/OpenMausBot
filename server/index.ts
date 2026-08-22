@@ -826,6 +826,11 @@ bus.subscribe((event: RuntimeEvent) => {
         void (async () => {
           try {
             if (!instance) throw new Error("provider unavailable");
+            // Drain the current protocol batch before answering. A provider
+            // can emit request.opened and turn.completed back-to-back; without
+            // this revalidation point we could log success for an ask that was
+            // already closed later in the same stdout chunk.
+            await new Promise<void>((resolve) => setImmediate(resolve));
             const outcome = await instance.adapter.respondToRequest(event.threadId, requestId, { behavior: "deny" });
             if (outcome === "unavailable") throw new Error("the ask is no longer open");
             pushMessage({
@@ -845,9 +850,20 @@ bus.subscribe((event: RuntimeEvent) => {
               rule: verdict.rule,
               unattended: unattended || undefined,
             });
-          } catch {
+          } catch (error) {
             // Do not fall back to an Allow/Deny card: delivery failure must
-            // not weaken a deny into a prompt that can expose the value.
+            // not weaken a deny into a prompt that can expose the value. Try
+            // to stop the turn, but do not call that attempt an enforced deny.
+            let stopState = "provider unavailable; turn stop not requested";
+            if (instance) {
+              try {
+                await instance.adapter.interruptTurn(event.threadId);
+                stopState = "turn stop requested";
+              } catch {
+                stopState = "turn stop request failed";
+              }
+            }
+            const deliveryError = error instanceof Error ? error.message : String(error);
             appendDecision(DATA_DIR, {
               threadId: event.threadId,
               requestId,
@@ -855,15 +871,15 @@ bus.subscribe((event: RuntimeEvent) => {
               botName: asker.name,
               tool,
               summary,
-              decision: "auto-denied",
+              decision: "deny-delivery-failed",
               source: verdict.source,
-              rule: `${verdict.rule ?? "sensitive-guard"}; delivery_failed`,
+              rule: `${verdict.rule ?? "sensitive-guard"}; delivery_failed: ${deliveryError}; ${stopState}`,
               unattended: unattended || undefined,
             });
             pushMessage({
               role: "bot",
               kind: "activity",
-              tool: { name: `blocked ${tool}: could not deliver protected-value denial`, ok: false },
+              tool: { name: `deny delivery failed for ${tool}; ${stopState}`, ok: false },
             });
           }
         })();

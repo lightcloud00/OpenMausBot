@@ -57,6 +57,74 @@ const DENY_TIMEOUT_NOTE =
 
 type StdioMcpServer = { command: string; args: string[]; env: Record<string, string> };
 
+type ExactFileChange = { operation: string; path: string; movePath?: string };
+
+function exactFileChanges(value: unknown): ExactFileChange[] | null {
+  const rows: Array<[string | null, unknown]> = Array.isArray(value)
+    ? value.map((row) => [null, row])
+    : value && typeof value === "object"
+      ? Object.entries(value as Record<string, unknown>)
+      : [];
+  if (rows.length === 0) return null;
+
+  const changes: ExactFileChange[] = [];
+  for (const [entryPath, value] of rows) {
+    if (!value || typeof value !== "object") return null;
+    const row = value as Record<string, unknown>;
+    const kind = row.kind && typeof row.kind === "object" ? (row.kind as Record<string, unknown>) : null;
+    const operationValue = row.operation ?? (typeof row.kind === "string" ? row.kind : kind?.type) ?? row.type;
+    const operation = typeof operationValue === "string" ? operationValue.toLowerCase() : "";
+    const path = typeof row.path === "string" ? row.path : (entryPath ?? "");
+    if (!/^(?:add|create|write|update|modify|delete|remove)$/.test(operation) || !path) return null;
+    const moveValue = row.movePath ?? row.move_path ?? kind?.move_path;
+    if (moveValue !== undefined && moveValue !== null && typeof moveValue !== "string") return null;
+    changes.push({ operation, path, ...(typeof moveValue === "string" ? { movePath: moveValue } : {}) });
+  }
+  return changes;
+}
+
+function exactFileApproval(params: Record<string, unknown>, observedChanges?: unknown): {
+  summary: string;
+  complete: boolean;
+  deletes: boolean;
+} {
+  const roots: string[] = [];
+  for (const key of ["grantRoot", "writableRoot"] as const) {
+    if (params[key] === undefined || params[key] === null) continue;
+    if (typeof params[key] !== "string") return { summary: "edit", complete: false, deletes: false };
+    roots.push(params[key]);
+  }
+  for (const key of ["writableRoots", "additionalWritableRoots"] as const) {
+    if (params[key] === undefined || params[key] === null) continue;
+    if (!Array.isArray(params[key]) || !(params[key] as unknown[]).every((root) => typeof root === "string")) {
+      return { summary: "edit", complete: false, deletes: false };
+    }
+    roots.push(...(params[key] as string[]));
+  }
+  const changes = exactFileChanges(params.changes ?? params.fileChanges ?? observedChanges);
+  if (!changes) {
+    return {
+      summary: [typeof params.reason === "string" ? params.reason : "edit", ...roots.map((root) => `writable-root ${root}`)].join("\n"),
+      complete: false,
+      deletes: false,
+    };
+  }
+  return {
+    summary: [
+      ...changes.map((change) =>
+        change.movePath
+          ? `move ${change.path} -> ${change.movePath}`
+          : `${change.operation} ${change.path}`,
+      ),
+      ...roots.map((root) => `writable-root ${root}`),
+    ].join("\n"),
+    complete: true,
+    deletes: changes.some(
+      (change) => change.operation === "delete" || change.operation === "remove" || Boolean(change.movePath),
+    ),
+  };
+}
+
 function mountMcpServer(
   appServerArgs: string[],
   env: Record<string, string | undefined>,
@@ -200,6 +268,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         usage: undefined as { input: number; output: number } | undefined,
       };
       const asks = new Map<string, (behavior: "allow" | "deny" | "answer", message?: string, source?: "user" | "timeout" | "system") => void>();
+      // v2 file approval params name only the item; the exact affected paths
+      // and operation arrive on item/started. Retain that full item locally so
+      // a human `reason` can never masquerade as an executable summary.
+      const fileChangesByItemId = new Map<string, unknown>();
       let nextId = 1;
       const rpcPending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
 
@@ -254,15 +326,19 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const params = msg.params ?? {};
         const legacy = method === "execCommandApproval" || method === "applyPatchApproval";
         const isQuestion = method === "item/tool/requestUserInput";
+        const isFileApproval = method === "item/fileChange/requestApproval" || method === "applyPatchApproval";
+        const observedChanges = typeof params.itemId === "string" ? fileChangesByItemId.get(params.itemId) : undefined;
+        const fileApproval = isFileApproval ? exactFileApproval(params, observedChanges) : null;
         const tool =
-          method === "item/fileChange/requestApproval" || method === "applyPatchApproval"
-            ? "edit"
+          isFileApproval
+            ? (fileApproval?.deletes ? "delete_file" : "edit")
             : isQuestion
               ? "ask_user"
               : "shell";
         const requestId = newId();
-        const rawSummary =
-          params.command !== undefined
+        const rawSummary = fileApproval
+          ? fileApproval.summary
+          : params.command !== undefined
             ? params.command
             : Array.isArray(params.questions)
               ? params.questions.map((q: any) => q.question ?? q.header).filter(Boolean).join(" · ")
@@ -275,7 +351,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const summaryState = approvalSummary(
           rawSummary,
           tool,
-          isQuestion || commandReliable || (tool === "edit" && typeof params.reason === "string"),
+          isQuestion || commandReliable || fileApproval?.complete === true,
         );
         const requestCwd = typeof params.cwd === "string" ? params.cwd : turnCwd;
         const choices = isQuestion
@@ -341,6 +417,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           }
           case "item/started": {
             const item = p.item ?? {};
+            if (item.type === "fileChange" && typeof item.id === "string" && item.changes !== undefined) {
+              fileChangesByItemId.set(item.id, item.changes);
+            }
             const title =
               item.type === "commandExecution"
                 ? String(item.command ?? "shell")
