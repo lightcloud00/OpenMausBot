@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { createCapabilityProfileManifest } from "./access-profile.ts";
 import { CapabilityGateway, credentialBackendSpawnSpec } from "./capability-gateway.ts";
+import { FleetCapabilityIndex } from "./fleet-capabilities.ts";
 import type { HostMcpCatalog } from "./host-mcp.ts";
 
 const FAKE = join(dirname(fileURLToPath(import.meta.url)), "testing", "fake-capability-mcp.ts");
@@ -378,6 +379,37 @@ describe("CapabilityGateway", () => {
     expect(shell).toMatchObject({ exitCode: 0 });
     await gateway.callTool(TOKEN, "openmaus-host", "filesystem_delete", { path: "fixture.txt" });
     expect(() => readFileSync(join(cwd, "fixture.txt"))).toThrow();
+  });
+
+  it("discovers fleet metadata and selects one route without eager backend startup", async () => {
+    const root = mkdtempSync(join(tmpdir(), "omb-fleet-gateway-"));
+    temporary.push(root);
+    const indexPath = join(root, "capabilities.v1.json");
+    writeFileSync(indexPath, JSON.stringify({
+      schema: "capabilities.v1",
+      records: [
+        { id: "mcp:test", kind: "mcp", configured: true, compatible_surfaces: ["codex"] },
+        { id: "skill:shared:ios-ui-debug", kind: "skill", configured: true, compatible_surfaces: ["codex"] },
+      ],
+    }));
+    const gateway = new CapabilityGateway({
+      servers: {
+        test: { type: "stdio", command: process.execPath, args: [FAKE], env: {} },
+        "openmaus-fleet": { type: "builtin", family: "fleet" },
+      },
+      manifest: createCapabilityProfileManifest({ toolInventory: ["test", "openmaus-fleet:search_capabilities"] }),
+      sources: { claude: "loaded", codex: "loaded" },
+    }, { fleetIndex: new FleetCapabilityIndex(indexPath) });
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, { botId: "bot", threadId: "thread" });
+
+    const tools = await gateway.listTools(TOKEN, "openmaus-fleet");
+    expect(tools.tools.map((tool: { name: string }) => tool.name)).toContain("select_capability");
+    const search = await gateway.callTool(TOKEN, "openmaus-fleet", "search_capabilities", { query: "test" });
+    expect(search).toMatchObject([{ id: "mcp:test", kind: "mcp" }]);
+    const selected = await gateway.callTool(TOKEN, "openmaus-fleet", "select_capability", { id: "mcp:test" });
+    expect(selected).toMatchObject({ status: "ready", route: { serverNames: ["test"] } });
+    expect(gateway.stats().activeBackends).toEqual([]);
   });
 
   it("rejects whole-repository deletion and scrubs exact canaries before host execution", async () => {

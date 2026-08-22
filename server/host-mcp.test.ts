@@ -3,7 +3,14 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { loadHostMcpCatalog, parseClaudeMcpServers, parseCodexMcpList, writeHostMcpManifest } from "./host-mcp.ts";
+import {
+  loadHostMcpCatalog,
+  parseClaudeMcpServers,
+  parseCodexMcpList,
+  parseHermesMcpServers,
+  parseOpenCodeMcpServers,
+  writeHostMcpManifest,
+} from "./host-mcp.ts";
 
 describe("host MCP catalog", () => {
   it("loads stdio and HTTP Claude servers while excluding CredVault", () => {
@@ -68,6 +75,28 @@ describe("host MCP catalog", () => {
     });
   });
 
+  it("loads enabled OpenCode and Hermes definitions without credential servers", () => {
+    expect(parseOpenCodeMcpServers({
+      mcp: {
+        playwright: { type: "local", command: ["npx", "-y", "playwright-mcp"], enabled: true },
+        remote: { type: "remote", url: "http://127.0.0.1:9000/mcp", enabled: true },
+        credvault: { type: "local", command: ["credvault", "mcp"], enabled: true },
+        off: { type: "local", command: ["off"], enabled: false },
+      },
+    })).toEqual({
+      playwright: { type: "stdio", command: "npx", args: ["-y", "playwright-mcp"], env: {} },
+      remote: { type: "http", url: "http://127.0.0.1:9000/mcp", headers: {} },
+    });
+    expect(parseHermesMcpServers({
+      cupertino: { command: "/opt/homebrew/bin/cupertino", args: ["serve"], enabled: true, lazy: true },
+      memory: { url: "http://127.0.0.1:8767/mcp", enabled: true },
+      off: { command: "/bin/off", enabled: false },
+    })).toEqual({
+      cupertino: { type: "stdio", command: "/opt/homebrew/bin/cupertino", args: ["serve"], env: {} },
+      memory: { type: "http", url: "http://127.0.0.1:8767/mcp", headers: {} },
+    });
+  });
+
   it("merges the two intentional inventories and hashes names only", () => {
     const catalog = loadHostMcpCatalog({
       home: "/does/not/exist",
@@ -78,6 +107,10 @@ describe("host MCP catalog", () => {
         ]),
     });
     expect(catalog.manifest.toolInventory).toEqual([
+      "openmaus-fleet:search_capabilities",
+      "openmaus-fleet:select_capability",
+      "openmaus-fleet:suggest_capabilities",
+      "openmaus-fleet:suggest_role_overlays",
       "openmaus-host:filesystem_delete",
       "openmaus-host:filesystem_read",
       "openmaus-host:filesystem_stat",
@@ -86,8 +119,35 @@ describe("host MCP catalog", () => {
       "sentry",
     ]);
     expect(catalog.servers["openmaus-host"]).toEqual({ type: "builtin" });
+    expect(catalog.servers["openmaus-fleet"]).toEqual({ type: "builtin", family: "fleet" });
     expect(JSON.stringify(catalog.manifest)).not.toContain("/bin/sentry");
-    expect(catalog.sources).toEqual({ claude: "missing", codex: "loaded" });
+    expect(catalog.sources).toEqual({
+      claude: "missing",
+      codex: "loaded",
+      opencode: "missing",
+      hermes: "missing",
+    });
+  });
+
+  it("merges all four surface catalogs while retaining source-qualified conflicts", () => {
+    const catalog = loadHostMcpCatalog({
+      home: "/does/not/exist",
+      runCodexList: () => JSON.stringify([
+        { name: "shared", enabled: true, transport: { type: "stdio", command: "/bin/codex-shared", args: [] } },
+      ]),
+      readOpenCodeConfig: () => JSON.stringify({
+        mcp: { shared: { type: "local", command: ["/bin/opencode-shared"], enabled: true } },
+      }),
+      runHermesList: () => JSON.stringify({
+        shared: { command: "/bin/hermes-shared", args: [], enabled: true },
+      }),
+    });
+    expect(Object.keys(catalog.servers)).toEqual(expect.arrayContaining([
+      "shared",
+      "shared-opencode",
+      "shared-hermes",
+    ]));
+    expect(catalog.sources).toMatchObject({ codex: "loaded", opencode: "loaded", hermes: "loaded" });
   });
 
   it("persists only the value-free manifest and source states", () => {

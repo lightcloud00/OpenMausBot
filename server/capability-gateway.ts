@@ -9,6 +9,7 @@ import { createCapabilityProfileManifest } from "./access-profile.ts";
 import { fullTaskScopedHardDeny } from "./auto-approve.ts";
 import { BUILTIN_CAPABILITY_TOOLS } from "./builtin-capability-tools.ts";
 import { augmentedPath } from "./env-path.ts";
+import type { FleetCapabilityIndex } from "./fleet-capabilities.ts";
 import type { HostMcpCatalog, HostMcpServer } from "./host-mcp.ts";
 import { killCliTree, spawnCli } from "./procs.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
@@ -19,6 +20,7 @@ import {
   redactKnownValues,
   redactSecrets,
 } from "./redact.ts";
+import { suggestRoleOverlays } from "./role-overlays.ts";
 
 type JsonObject = Record<string, any>;
 
@@ -27,6 +29,48 @@ const REQUEST_TIMEOUT_MS = 60_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60_000;
 const MAX_TOOL_RESULT_BYTES = 256 * 1024;
 const MAX_INTERACTIVE_RESULT_BYTES = 8 * 1024 * 1024;
+const FLEET_BUILTIN_TOOLS = [
+  {
+    name: "search_capabilities",
+    description: "Search the metadata-only fleet index for MCPs, skills, scripts, and other capabilities without loading their schemas or instructions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        kind: { type: "string" },
+        surface: { type: "string" },
+        limit: { type: "number", minimum: 1, maximum: 25 },
+      },
+    },
+  },
+  {
+    name: "suggest_capabilities",
+    description: "Suggest a small task-relevant set of fleet capability metadata and advisory role overlays.",
+    inputSchema: {
+      type: "object",
+      properties: { task: { type: "string" }, limit: { type: "number", minimum: 1, maximum: 25 } },
+      required: ["task"],
+    },
+  },
+  {
+    name: "select_capability",
+    description: "Select one exact fleet capability and return its safe lazy route, if this runtime can verify one.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+    },
+  },
+  {
+    name: "suggest_role_overlays",
+    description: "Suggest non-privileged portfolio specialist roles for the current task.",
+    inputSchema: {
+      type: "object",
+      properties: { task: { type: "string" }, limit: { type: "number", minimum: 1, maximum: 5 } },
+      required: ["task"],
+    },
+  },
+] as const;
 const SAFE_ENV_NAMES = [
   "HOME",
   "USERPROFILE",
@@ -422,6 +466,11 @@ export interface CapabilityGatewayOptions {
   now?: () => number;
   listAliases?: () => Promise<string[]>;
   credentialBroker?: CredentialBrokerOptions;
+  fleetIndex?: FleetCapabilityIndex;
+}
+
+function builtinTools(server: Extract<HostMcpServer, { type: "builtin" }>) {
+  return server.family === "fleet" ? FLEET_BUILTIN_TOOLS : BUILTIN_CAPABILITY_TOOLS;
 }
 
 /** App-owned MCP union. The provider sees one small proxy; backend processes
@@ -436,6 +485,7 @@ export class CapabilityGateway {
   private readonly now: () => number;
   private readonly protectedValues: Set<string>;
   private readonly credentialBroker: CredentialBrokerOptions;
+  private readonly fleetIndex?: FleetCapabilityIndex;
 
   constructor(
     catalog: HostMcpCatalog,
@@ -446,6 +496,7 @@ export class CapabilityGateway {
     this.now = options.now ?? Date.now;
     this.listAliasesImpl = options.listAliases ?? listCredentialAliases;
     this.credentialBroker = options.credentialBroker ?? {};
+    this.fleetIndex = options.fleetIndex;
     this.protectedValues = protectedEnvironmentValues();
     this.protectServerValues(catalog.servers);
   }
@@ -532,7 +583,7 @@ export class CapabilityGateway {
 
   private manifestFor(token: string): HostMcpCatalog["manifest"] {
     const inventory = Object.entries(this.serversFor(token)).flatMap(([name, server]) =>
-      server.type === "builtin" ? BUILTIN_CAPABILITY_TOOLS.map((tool) => `${name}:${tool.name}`) : [name],
+      server.type === "builtin" ? builtinTools(server).map((tool) => `${name}:${tool.name}`) : [name],
     );
     return createCapabilityProfileManifest({ toolInventory: inventory });
   }
@@ -662,7 +713,8 @@ export class CapabilityGateway {
 
   async listTools(token: string, serverName: string): Promise<any> {
     this.requireTurn(token);
-    if (this.serverFor(token, serverName)?.type === "builtin") return { tools: BUILTIN_CAPABILITY_TOOLS };
+    const server = this.serverFor(token, serverName);
+    if (server?.type === "builtin") return { tools: builtinTools(server) };
     const backend = this.backend(token, serverName);
     try {
       return this.sanitize(await backend.client.request("tools/list", {}));
@@ -691,7 +743,7 @@ export class CapabilityGateway {
     if (interactiveInput?.commit) turn.interactiveInput = "";
     const safeArgs = this.sanitize(args) as JsonObject;
     if (this.serverFor(token, serverName)?.type === "builtin") {
-      return this.callBuiltin(token, tool, safeArgs);
+      return this.callBuiltin(token, serverName, tool, safeArgs);
     }
     const backend = this.backend(token, serverName);
     try {
@@ -708,9 +760,35 @@ export class CapabilityGateway {
     }
   }
 
-  private async callBuiltin(token: string, tool: string, args: JsonObject): Promise<any> {
+  private async callBuiltin(token: string, serverName: string, tool: string, args: JsonObject): Promise<any> {
     const turn = this.activeTurns.get(token);
     this.requireTurn(token);
+    const server = this.serverFor(token, serverName);
+    if (server?.type !== "builtin") throw new Error("unknown built-in capability server");
+    if (server.family === "fleet") {
+      if (tool === "suggest_role_overlays") {
+        return this.sanitize(suggestRoleOverlays(String(args.task ?? ""), Number(args.limit) || 3));
+      }
+      if (!this.fleetIndex) throw new Error("fleet capability index is unavailable");
+      if (tool === "search_capabilities") {
+        return this.sanitize(this.fleetIndex.search({
+          query: String(args.query ?? ""),
+          kind: String(args.kind ?? ""),
+          surface: String(args.surface ?? ""),
+          limit: Number(args.limit) || 10,
+        }));
+      }
+      if (tool === "suggest_capabilities") {
+        return this.sanitize(this.fleetIndex.suggest(String(args.task ?? ""), Number(args.limit) || 10));
+      }
+      if (tool === "select_capability") {
+        return this.sanitize(this.fleetIndex.select(
+          String(args.id ?? ""),
+          Object.keys(this.serversFor(token)),
+        ));
+      }
+      throw new Error("unknown fleet capability tool");
+    }
     const cwd = boundedPath(args.cwd ?? turn?.cwd ?? process.cwd(), turn?.cwd);
     if (tool === "shell_execute") {
       if (typeof args.command !== "string" || !args.command.trim()) throw new Error("command is required");
