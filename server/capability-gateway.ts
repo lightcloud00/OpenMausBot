@@ -219,8 +219,12 @@ export function credentialBackendSpawnSpec(
   const proxyPath = options.proxyPath ?? SPAWNED_PROXIES.credentialRedactor;
   const prefix = options.prefixArgs ?? [];
   if (hasSecretArgument(prefix)) throw new Error("credential broker argv is not allowed to contain credential-shaped values");
+  const isWindowsNode = platform === "win32"
+    && /^(?:node|nodejs)(?:\.exe)?$/i.test(winPath.basename(executable));
   const launcher = platform === "win32"
-    ? [
+    ? isWindowsNode
+      ? [executable, proxyPath]
+      : [
         process.env.ComSpec || process.env.COMSPEC || "cmd.exe",
         "/d",
         "/v:off",
