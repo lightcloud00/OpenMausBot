@@ -37,6 +37,7 @@ export function isSecretName(name: string): boolean {
 }
 
 const mask = (value: string) => `«redacted ${value.length} chars»`;
+const MIN_KNOWN_VALUE_LENGTH = 16;
 
 // ── content-shaped secrets ────────────────────────────────────────────
 // What a bot's own reply, a tool title, or a permission card can carry —
@@ -120,14 +121,17 @@ export function redactSecrets(input: unknown, depth = 0): unknown {
  * This is the second redaction pass used at capability/telemetry boundaries:
  * key-shaped redaction catches structure, while this catches an arbitrary
  * canary or provider value copied into an otherwise innocuous text field. */
-export function redactKnownValues(input: unknown, protectedValues: Iterable<string>, depth = 0): unknown {
-  const values = [...new Set([...protectedValues].filter((value) => value.length >= 6))].sort(
+function preparedKnownValues(protectedValues: Iterable<string>): string[] {
+  return [...new Set([...protectedValues].filter((value) => value.length >= MIN_KNOWN_VALUE_LENGTH))].sort(
     (a, b) => b.length - a.length,
   );
+}
+
+function redactPreparedKnownValues(input: unknown, values: readonly string[], depth = 0): unknown {
   const visit = (value: unknown, level: number): unknown => {
     if (typeof value === "string") {
       let output = value;
-      for (const secret of values) output = output.split(secret).join(`«redacted ${secret.length} chars»`);
+      for (const secret of values) output = output.split(secret).join(mask(secret));
       return output;
     }
     if (level > 12 || value === null || typeof value !== "object") return value;
@@ -139,13 +143,36 @@ export function redactKnownValues(input: unknown, protectedValues: Iterable<stri
   return visit(input, depth);
 }
 
+/** Compile the sorted protected-value list once for high-frequency streams. */
+export function createKnownValueRedactor(protectedValues: Iterable<string>): (input: unknown) => unknown {
+  const values = preparedKnownValues(protectedValues);
+  return (input: unknown) => redactPreparedKnownValues(input, values);
+}
+
+export function redactKnownValues(input: unknown, protectedValues: Iterable<string>, depth = 0): unknown {
+  return redactPreparedKnownValues(input, preparedKnownValues(protectedValues), depth);
+}
+
+let cachedEnvironmentRedactor: ((input: unknown) => unknown) | null = null;
+
+/** Call after credential environment updates so the next boundary rebuilds
+ * its compiled exact-value matcher. */
+export function invalidateProtectedEnvironmentRedactor(): void {
+  cachedEnvironmentRedactor = null;
+}
+
+export function redactProtectedEnvironmentValues(input: unknown): unknown {
+  cachedEnvironmentRedactor ??= createKnownValueRedactor(protectedEnvironmentValues());
+  return cachedEnvironmentRedactor(input);
+}
+
 /** Values already present in the host process under credential-shaped names.
  * Names and values remain in memory only; callers must never serialize this
  * set or place it in a child process wholesale. */
 export function protectedEnvironmentValues(env: NodeJS.ProcessEnv = process.env): Set<string> {
   return new Set(
     Object.entries(env).flatMap(([name, value]) =>
-      isSecretName(name) && typeof value === "string" && value.length >= 6 ? [value] : [],
+      isSecretName(name) && typeof value === "string" && value.length >= MIN_KNOWN_VALUE_LENGTH ? [value] : [],
     ),
   );
 }

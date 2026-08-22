@@ -79,6 +79,7 @@ beforeAll(async () => {
       instances: {
         ghost: { driver: "not-a-real-driver", displayName: "Ghost" },
         claude: { driver: "claudeAgent", displayName: "Fixture Claude", config: { cli: FAKE_CLAUDE_CLI } },
+        "grok-unsupported": { driver: "grok", displayName: "Fixture unsupported engine" },
       },
     }),
   );
@@ -275,6 +276,26 @@ describe("harness HTTP API", () => {
     expect(body.app).toBe("openmausbot");
     expect(typeof body.pid).toBe("number");
     expect(body.static).toBe(true);
+  });
+
+  it("coalesces duplicate renderer errors and admits at most ten unique signatures per address", async () => {
+    const first = await api("POST", "/api/telemetry/error", { name: "RenderFault", message: "same fault" });
+    const duplicate = await api("POST", "/api/telemetry/error", { name: "RenderFault", message: "same fault" });
+    expect(first).toMatchObject({ status: 202, body: { accepted: true } });
+    expect(duplicate).toMatchObject({ status: 202, body: { accepted: false, coalesced: true } });
+
+    for (let index = 1; index < 10; index += 1) {
+      const admitted = await api("POST", "/api/telemetry/error", {
+        name: "RenderFault",
+        message: `unique fault ${index}`,
+      });
+      expect(admitted).toMatchObject({ status: 202, body: { accepted: true } });
+    }
+    const saturated = await api("POST", "/api/telemetry/error", {
+      name: "RenderFault",
+      message: "unique fault 10",
+    });
+    expect(saturated).toMatchObject({ status: 202, body: { accepted: false, coalesced: true } });
   });
 
   it("owns and traces authenticated external capability turns", async () => {
@@ -569,7 +590,7 @@ describe("harness HTTP API", () => {
     expect((await api("PATCH", `/api/bots/${bot.id}`, { composio: true })).body.bot.composio).toBe(true);
 
     const unsupportedFullProfile = await api("PATCH", `/api/bots/${bot.id}`, {
-      modelSelection: { instanceId: "ghost", model: "ghost-model" },
+      modelSelection: { instanceId: "grok-unsupported", model: "grok-3-mini" },
       accessProfile: "full-task-scoped",
     });
     expect(unsupportedFullProfile.status).toBe(400);
@@ -1019,6 +1040,7 @@ describe("harness HTTP API", () => {
       name: "Reviewer copy",
       title: "Reviewer",
       description: "reads diffs",
+      accessProfile: "full-task-scoped",
       modelSelection: { instanceId: "ghost", model: "ghost-1", effort: "xhigh" },
     });
 
@@ -1027,6 +1049,7 @@ describe("harness HTTP API", () => {
       name: "Reviewer copy",
       title: "Reviewer",
       description: "reads diffs",
+      accessProfile: "full-task-scoped",
       modelSelection: { instanceId: "ghost", model: "ghost-1", effort: "xhigh" },
     });
   });

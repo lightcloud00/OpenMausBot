@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,7 @@ import { createCapabilityProfileManifest } from "./access-profile.ts";
 import { CapabilityGateway, credentialBackendSpawnSpec } from "./capability-gateway.ts";
 import { FleetCapabilityIndex } from "./fleet-capabilities.ts";
 import { loadHostMcpCatalog, type HostMcpCatalog } from "./host-mcp.ts";
+import { invalidateProtectedEnvironmentRedactor } from "./redact.ts";
 
 const FAKE = join(dirname(fileURLToPath(import.meta.url)), "testing", "fake-capability-mcp.ts");
 const FAKE_CREDENTIAL_BROKER = join(dirname(fileURLToPath(import.meta.url)), "testing", "fake-credential-broker.ts");
@@ -25,7 +26,7 @@ function catalog(): HostMcpCatalog {
         env: { TEST_GATEWAY_SECRET: "arbitrary-canary-value-987654" },
       },
     },
-    manifest: createCapabilityProfileManifest({ toolInventory: ["test"] }),
+    manifest: createCapabilityProfileManifest({ toolInventory: ["test"], telemetryMode: "sanitized-content" }),
     sources: { claude: "loaded", codex: "loaded" },
   };
 }
@@ -48,8 +49,26 @@ describe("CapabilityGateway", () => {
     expect(() => gateway.inventory(TOKEN)).toThrow(/no longer active/);
   });
 
+  it("rejects malformed or conflicting turn servers before replacing stored state", () => {
+    const gateway = new CapabilityGateway(catalog());
+    open.push(gateway);
+    gateway.beginTurn(TOKEN, { botId: "original", threadId: "original-thread" });
+
+    expect(() => gateway.beginTurn(TOKEN, {
+      botId: "replacement",
+      threadId: "replacement-thread",
+      servers: { broken: { type: "stdio", command: "", args: [], env: {} } },
+    })).toThrow(/invalid capability server definition/);
+    expect(gateway.ownsTurn(TOKEN)).toBe(true);
+
+    expect(() => gateway.extendTurn(TOKEN, {
+      valid: { type: "stdio", command: process.execPath, args: [FAKE], env: {} },
+      test: { type: "stdio", command: process.execPath, args: [FAKE], env: {} },
+    })).toThrow(/cannot replace a host capability/);
+    expect(gateway.inventory(TOKEN).servers.map((server) => server.name)).not.toContain("valid");
+  });
+
   it("starts a backend lazily, reuses it, and redacts arbitrary protected values", async () => {
-    chmodSync(FAKE, 0o755);
     const gateway = new CapabilityGateway(catalog(), { idleTimeoutMs: 2_000 });
     open.push(gateway);
     gateway.beginTurn(TOKEN, { botId: "bot", threadId: "thread" });
@@ -75,7 +94,7 @@ describe("CapabilityGateway", () => {
           env: {},
         },
       },
-      manifest: createCapabilityProfileManifest({ toolInventory: ["exiting"] }),
+      manifest: createCapabilityProfileManifest({ toolInventory: ["exiting"], telemetryMode: "sanitized-content" }),
       sources: { claude: "missing", codex: "missing" },
     });
     open.push(gateway);
@@ -87,10 +106,9 @@ describe("CapabilityGateway", () => {
   });
 
   it("adds task-owned integrations to the effective manifest and closes them at turn end", async () => {
-    chmodSync(FAKE, 0o755);
     const gateway = new CapabilityGateway({
       servers: { "openmaus-host": { type: "builtin" } },
-      manifest: createCapabilityProfileManifest({ toolInventory: ["openmaus-host:shell_execute"] }),
+      manifest: createCapabilityProfileManifest({ toolInventory: ["openmaus-host:shell_execute"], telemetryMode: "sanitized-content" }),
       sources: { claude: "missing", codex: "missing" },
     }, { idleTimeoutMs: 60_000 });
     open.push(gateway);
@@ -110,10 +128,9 @@ describe("CapabilityGateway", () => {
   });
 
   it("enforces denials across split computer input and withholds credential-store screens", async () => {
-    chmodSync(FAKE, 0o755);
     const gateway = new CapabilityGateway({
       servers: {},
-      manifest: createCapabilityProfileManifest(),
+      manifest: createCapabilityProfileManifest({ telemetryMode: "sanitized-content" }),
       sources: { claude: "missing", codex: "missing" },
     });
     open.push(gateway);
@@ -150,7 +167,7 @@ describe("CapabilityGateway", () => {
   it("blocks a structured Pi credential-store read before touching the host file", async () => {
     const gateway = new CapabilityGateway({
       servers: { "openmaus-host": { type: "builtin" } },
-      manifest: createCapabilityProfileManifest({ toolInventory: ["openmaus-host:filesystem_read"] }),
+      manifest: createCapabilityProfileManifest({ toolInventory: ["openmaus-host:filesystem_read"], telemetryMode: "sanitized-content" }),
       sources: { claude: "missing", codex: "missing" },
     });
     open.push(gateway);
@@ -163,7 +180,6 @@ describe("CapabilityGateway", () => {
   });
 
   it("removes binary payloads and closes idle backends", async () => {
-    chmodSync(FAKE, 0o755);
     const gateway = new CapabilityGateway(catalog(), { idleTimeoutMs: 25 });
     open.push(gateway);
     gateway.beginTurn(TOKEN, { botId: "bot", threadId: "thread" });
@@ -175,12 +191,11 @@ describe("CapabilityGateway", () => {
   });
 
   it("preserves bounded computer screenshots while still blocking credential screens", async () => {
-    chmodSync(FAKE, 0o755);
     const gateway = new CapabilityGateway({
       servers: {
         "openmaus-computer": { type: "stdio", command: process.execPath, args: [FAKE], env: {} },
       },
-      manifest: createCapabilityProfileManifest({ toolInventory: ["openmaus-computer"] }),
+      manifest: createCapabilityProfileManifest({ toolInventory: ["openmaus-computer"], telemetryMode: "sanitized-content" }),
       sources: { claude: "missing", codex: "missing" },
     });
     open.push(gateway);
@@ -268,8 +283,6 @@ describe("CapabilityGateway", () => {
   });
 
   it("scopes selections to a turn, isolates concurrent aliases, and redacts split credential output", async () => {
-    chmodSync(FAKE, 0o755);
-    chmodSync(FAKE_CREDENTIAL_BROKER, 0o755);
     const directory = mkdtempSync(join(tmpdir(), "omb-credential-gateway-"));
     temporary.push(directory);
     const argvReceipt = join(directory, "broker-argv.ndjson");
@@ -331,7 +344,7 @@ describe("CapabilityGateway", () => {
     let listed = false;
     const gateway = new CapabilityGateway({
       servers: { remote: { type: "http", url: "https://example.invalid/mcp", headers: {} } },
-      manifest: createCapabilityProfileManifest({ toolInventory: ["remote"] }),
+      manifest: createCapabilityProfileManifest({ toolInventory: ["remote"], telemetryMode: "sanitized-content" }),
       sources: { claude: "missing", codex: "missing" },
     }, {
       listAliases: async () => {
@@ -362,7 +375,7 @@ describe("CapabilityGateway", () => {
           },
         },
       },
-      manifest: createCapabilityProfileManifest({ toolInventory: ["remote"] }),
+      manifest: createCapabilityProfileManifest({ toolInventory: ["remote"], telemetryMode: "sanitized-content" }),
       sources: { claude: "missing", codex: "missing" },
     });
     open.push(gateway);
@@ -380,7 +393,7 @@ describe("CapabilityGateway", () => {
     temporary.push(cwd);
     const hostCatalog: HostMcpCatalog = {
       servers: { "openmaus-host": { type: "builtin" } },
-      manifest: createCapabilityProfileManifest({ toolInventory: ["openmaus-host:shell_execute"] }),
+      manifest: createCapabilityProfileManifest({ toolInventory: ["openmaus-host:shell_execute"], telemetryMode: "sanitized-content" }),
       sources: { claude: "missing", codex: "missing" },
     };
     const gateway = new CapabilityGateway(hostCatalog);
@@ -414,7 +427,10 @@ describe("CapabilityGateway", () => {
         test: { type: "stdio", command: process.execPath, args: [FAKE], env: {} },
         "openmaus-fleet": { type: "builtin", family: "fleet" },
       },
-      manifest: createCapabilityProfileManifest({ toolInventory: ["test", "openmaus-fleet:search_capabilities"] }),
+      manifest: createCapabilityProfileManifest({
+        toolInventory: ["test", "openmaus-fleet:search_capabilities"],
+        telemetryMode: "sanitized-content",
+      }),
       sources: { claude: "loaded", codex: "loaded" },
     }, { fleetIndex: new FleetCapabilityIndex(indexPath) });
     open.push(gateway);
@@ -431,6 +447,7 @@ describe("CapabilityGateway", () => {
 
   it("keeps host catalog and gateway built-in inventories identical and defined", async () => {
     const hostCatalog = loadHostMcpCatalog({
+      telemetryMode: "sanitized-content",
       home: "/does/not/exist",
       runCodexList: () => "[]",
       readOpenCodeConfig: () => '{"mcp":{}}',
@@ -456,10 +473,11 @@ describe("CapabilityGateway", () => {
     mkdirSync(join(cwd, ".git"));
     const canary = "gateway-canary-exact-927364";
     process.env.GATEWAY_TEST_SECRET = canary;
+    invalidateProtectedEnvironmentRedactor();
     try {
       const hostCatalog: HostMcpCatalog = {
         servers: { "openmaus-host": { type: "builtin" } },
-        manifest: createCapabilityProfileManifest({ toolInventory: ["openmaus-host:shell_execute"] }),
+        manifest: createCapabilityProfileManifest({ toolInventory: ["openmaus-host:shell_execute"], telemetryMode: "sanitized-content" }),
         sources: { claude: "missing", codex: "missing" },
       };
       const gateway = new CapabilityGateway(hostCatalog);
@@ -472,6 +490,7 @@ describe("CapabilityGateway", () => {
       expect(JSON.stringify(echoed)).toContain("redacted");
     } finally {
       delete process.env.GATEWAY_TEST_SECRET;
+      invalidateProtectedEnvironmentRedactor();
     }
   });
 });

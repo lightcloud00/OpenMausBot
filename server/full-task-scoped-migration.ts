@@ -177,11 +177,17 @@ function json<T>(value: T): string {
 }
 
 function readJsonFile<T>(path: string, label: string, schema: z.ZodType<T>): T {
+  let parsed: unknown;
   try {
-    return schema.parse(JSON.parse(readFileSync(path, "utf8")));
+    parsed = JSON.parse(readFileSync(path, "utf8"));
   } catch (error) {
     throw new Error(`${label} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
+  const result = schema.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(`${label} does not match the expected migration schema: ${result.error.message}`);
+  }
+  return result.data;
 }
 
 function assertRegularStateFile(path: string): void {
@@ -409,9 +415,22 @@ function acquireLock(dataDir: string): () => void {
     } catch (error) {
       const parsed = errorCodeSchema.safeParse(error);
       if (!parsed.success || parsed.data.code !== "EEXIST") throw error;
-      const owner = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
+      let owner: number;
+      try {
+        owner = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
+      } catch (readError) {
+        const readFailure = errorCodeSchema.safeParse(readError);
+        if (readFailure.success && readFailure.data.code === "ENOENT") continue;
+        throw readError;
+      }
       if (processIsAlive(owner)) throw new Error(`Another migration process owns ${path} (pid ${owner})`);
-      unlinkSync(path);
+      try {
+        unlinkSync(path);
+      } catch (unlinkError) {
+        const unlinkFailure = errorCodeSchema.safeParse(unlinkError);
+        if (unlinkFailure.success && unlinkFailure.data.code === "ENOENT") continue;
+        throw unlinkError;
+      }
     }
   }
   throw new Error(`Could not acquire migration lock ${path}`);

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { afterEach, describe, expect, it } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,6 +11,11 @@ import {
   parseOpenCodeMcpServers,
   writeHostMcpManifest,
 } from "./host-mcp.ts";
+
+const temporary: string[] = [];
+afterEach(() => {
+  for (const path of temporary.splice(0)) rmSync(path, { recursive: true, force: true });
+});
 
 describe("host MCP catalog", () => {
   it("loads stdio and HTTP Claude servers while excluding CredVault", () => {
@@ -99,6 +104,7 @@ describe("host MCP catalog", () => {
 
   it("merges the two intentional inventories and hashes names only", () => {
     const catalog = loadHostMcpCatalog({
+      telemetryMode: "metadata",
       home: "/does/not/exist",
       runCodexList: () =>
         JSON.stringify([
@@ -118,6 +124,7 @@ describe("host MCP catalog", () => {
       "openmaus-host:shell_execute",
       "sentry",
     ]);
+    expect(catalog.manifest.telemetryMode).toBe("metadata");
     expect(catalog.servers["openmaus-host"]).toEqual({ type: "builtin" });
     expect(catalog.servers["openmaus-fleet"]).toEqual({ type: "builtin", family: "fleet" });
     expect(JSON.stringify(catalog.manifest)).not.toContain("/bin/sentry");
@@ -131,6 +138,7 @@ describe("host MCP catalog", () => {
 
   it("merges all four surface catalogs while retaining source-qualified conflicts", () => {
     const catalog = loadHostMcpCatalog({
+      telemetryMode: "sanitized-content",
       home: "/does/not/exist",
       runCodexList: () => JSON.stringify([
         { name: "shared", enabled: true, transport: { type: "stdio", command: "/bin/codex-shared", args: [] } },
@@ -150,9 +158,35 @@ describe("host MCP catalog", () => {
     expect(catalog.sources).toMatchObject({ codex: "loaded", opencode: "loaded", hermes: "loaded" });
   });
 
+  it("marks malformed source documents invalid without discarding the built-in catalog", () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-host-invalid-"));
+    temporary.push(home);
+    writeFileSync(join(home, ".claude.json"), "{not-json");
+    const catalog = loadHostMcpCatalog({
+      telemetryMode: "off",
+      home,
+      runCodexList: () => "{not-json",
+      readOpenCodeConfig: () => "{not-json",
+      runHermesList: () => "{not-json",
+    });
+
+    expect(catalog.sources).toEqual({
+      claude: "invalid",
+      codex: "invalid",
+      opencode: "invalid",
+      hermes: "invalid",
+    });
+    expect(catalog.servers).toMatchObject({
+      "openmaus-host": { type: "builtin" },
+      "openmaus-fleet": { type: "builtin", family: "fleet" },
+    });
+  });
+
   it("persists only the value-free manifest and source states", () => {
     const dataDir = mkdtempSync(join(tmpdir(), "omb-profile-"));
+    temporary.push(dataDir);
     const catalog = loadHostMcpCatalog({
+      telemetryMode: "off",
       home: "/does/not/exist",
       runCodexList: () =>
         JSON.stringify([

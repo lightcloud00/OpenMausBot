@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -19,12 +20,17 @@ async function eventually(assertion: () => void, timeoutMs = 10_000): Promise<vo
   assertion();
 }
 
-afterEach(() => clearProcessRegistry());
+const temporary: string[] = [];
+
+afterEach(() => {
+  clearProcessRegistry();
+  for (const directory of temporary.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
 
 describe("owned process registry", () => {
   it("records an owned process group and removes it when the turn tree closes", async () => {
-    const directory = join(process.env.HOME!, ".openmausbot", "process-registry-test");
-    mkdirSync(directory, { recursive: true });
+    const directory = mkdtempSync(join(tmpdir(), "omb-process-registry-"));
+    temporary.push(directory);
     await configureProcessRegistry(directory);
 
     const registry = join(directory, `${process.pid}.json`);

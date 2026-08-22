@@ -1,5 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join, win32 as winPath } from "node:path";
 
 import type { ChildProcessByStdio } from "node:child_process";
@@ -8,11 +17,13 @@ import type { Readable, Writable } from "node:stream";
 import type { RuntimeEvent } from "./contracts.ts";
 import { augmentedPath } from "./env-path.ts";
 import { killCliTree, spawnCli } from "./procs.ts";
-import { protectedEnvironmentValues, redactKnownValues, redactSecrets } from "./redact.ts";
+import { redactProtectedEnvironmentValues, redactSecrets } from "./redact.ts";
 import type { TelemetryEnvelope, TelemetryErrorEnvelope, TelemetryToolSpan, TelemetryTraceEnvelope } from "./telemetry-protocol.ts";
 import { windowsCmdCommand } from "./windows-cmd.ts";
 
 const SUMMARY_CHARS = 4_000;
+export const TELEMETRY_JOURNAL_ROLL_BYTES = 8 * 1024 * 1024;
+export const TELEMETRY_JOURNAL_RETAIN_BYTES = 4 * 1024 * 1024;
 
 type SinkKind = "sentry" | "langfuse";
 type SinkChild = ChildProcessByStdio<Writable, Readable, Readable>;
@@ -188,7 +199,6 @@ export class TelemetryManager {
   private readonly turnByIdentity = new Map<string, string>();
   private readonly turnsByThread = new Map<string, string[]>();
   private readonly sinks = new Map<SinkKind, SinkChild>();
-  private protectedValues = protectedEnvironmentValues();
   private readonly healthState: Record<SinkKind, TelemetryHealth> = {
     sentry: { configured: true, running: false, degraded: false },
     langfuse: { configured: true, running: false, degraded: false },
@@ -268,8 +278,7 @@ export class TelemetryManager {
   }
 
   private sanitize<T>(input: T): T {
-    this.protectedValues = protectedEnvironmentValues();
-    return redactKnownValues(redactSecrets(input), this.protectedValues) as T;
+    return redactProtectedEnvironmentValues(redactSecrets(input)) as T;
   }
 
   health(): Record<SinkKind, TelemetryHealth> {
@@ -428,7 +437,7 @@ export class TelemetryManager {
       tools: state.completedTools.slice(0, 200),
       usage: state.usage,
       outcome,
-      errorSummary: error ? summary(String(this.sanitize(error)), 1_000) : state.errorSummary,
+      errorSummary: error ? summary(error, 1_000) : state.errorSummary,
     });
     this.writeJournal(envelope);
     this.send("langfuse", envelope);
@@ -480,7 +489,7 @@ export class TelemetryManager {
     for (const [rawKey, rawValue] of Object.entries(input).slice(0, 16)) {
       const key = summary(rawKey, 80).replace(/[^A-Za-z0-9_.-]/g, "_");
       if (!key) continue;
-      if (typeof rawValue === "string") diagnostics[key] = summary(String(this.sanitize(rawValue)), 1_000);
+      if (typeof rawValue === "string") diagnostics[key] = summary(rawValue, 1_000);
       else if (typeof rawValue === "number" && Number.isFinite(rawValue)) diagnostics[key] = rawValue;
       else if (typeof rawValue === "boolean") diagnostics[key] = rawValue;
     }
@@ -489,7 +498,30 @@ export class TelemetryManager {
 
   private writeJournal(envelope: TelemetryTraceEnvelope): void {
     try {
-      appendFileSync(this.journalPath, `${JSON.stringify(this.sanitize(envelope))}\n`, { mode: 0o600 });
+      const line = `${JSON.stringify(envelope)}\n`;
+      let currentBytes = 0;
+      try {
+        currentBytes = statSync(this.journalPath).size;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      if (currentBytes + Buffer.byteLength(line) > TELEMETRY_JOURNAL_ROLL_BYTES) {
+        const retainBytes = Math.min(currentBytes, TELEMETRY_JOURNAL_RETAIN_BYTES);
+        const buffer = Buffer.alloc(retainBytes);
+        const fd = openSync(this.journalPath, "r");
+        try {
+          readSync(fd, buffer, 0, retainBytes, currentBytes - retainBytes);
+        } finally {
+          closeSync(fd);
+        }
+        const retained = buffer.toString("utf8");
+        const firstNewline = retained.indexOf("\n");
+        const completeRows = currentBytes > retainBytes
+          ? firstNewline >= 0 ? retained.slice(firstNewline + 1) : ""
+          : retained;
+        writeFileSync(this.journalPath, completeRows, { mode: 0o600 });
+      }
+      appendFileSync(this.journalPath, line, { mode: 0o600 });
     } catch {
       this.degrade("langfuse", "sanitized telemetry journal could not be written");
     }
@@ -502,7 +534,7 @@ export class TelemetryManager {
       return;
     }
     try {
-      child.stdin.write(`${JSON.stringify(this.sanitize(envelope))}\n`);
+      child.stdin.write(`${JSON.stringify(envelope)}\n`);
     } catch {
       this.degrade(kind, "telemetry sink write failed");
     }

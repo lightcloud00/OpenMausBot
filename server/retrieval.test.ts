@@ -3,7 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { OpenMausRetriever, PRIOR_TURN_CHUNK_LIMIT, RETRIEVAL_CONTEXT_CHAR_LIMIT, SOURCE_CHUNK_LIMIT } from "./retrieval.ts";
+import { invalidateProtectedEnvironmentRedactor } from "./redact.ts";
+import {
+  JOURNAL_TAIL_BYTES,
+  OpenMausRetriever,
+  PRIOR_TURN_CHUNK_LIMIT,
+  RETRIEVAL_CONTEXT_CHAR_LIMIT,
+  SOURCE_CHUNK_LIMIT,
+} from "./retrieval.ts";
 
 function tmpDir(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -34,8 +41,8 @@ describe("OpenMausRetriever", () => {
       })) }),
     });
     const result = await retriever.retrieve("OpenMaus gateway request");
-    expect(result.sourceCount).toBeLessThanOrEqual(SOURCE_CHUNK_LIMIT);
-    expect(result.priorTurnCount).toBeLessThanOrEqual(PRIOR_TURN_CHUNK_LIMIT);
+    expect(result.sourceCount).toBe(Math.min(SOURCE_CHUNK_LIMIT, 9));
+    expect(result.priorTurnCount).toBe(Math.min(PRIOR_TURN_CHUNK_LIMIT, 8));
     expect(result.charCount).toBeLessThanOrEqual(RETRIEVAL_CONTEXT_CHAR_LIMIT);
     expect(new Set(result.chunks.map((chunk) => chunk.text.toLowerCase())).size).toBe(result.chunks.length);
     expect(JSON.stringify(result)).not.toContain("sk-abcdefghijklmnop");
@@ -64,6 +71,28 @@ describe("OpenMausRetriever", () => {
     expect(result.degraded).toBe(true);
     expect(result.sourceCount).toBe(0);
     expect(result.priorTurnCount).toBe(1);
+  });
+
+  it("reads at most the newest one MiB of the turn journal", async () => {
+    const dataDir = tmpDir("retrieval-tail-bound-");
+    mkdirSync(join(dataDir, "telemetry"), { recursive: true });
+    const trace = (traceId: string, promptSummary: string) => JSON.stringify({
+      kind: "trace",
+      application: "openmausbot",
+      sourceSha: "abc",
+      traceId,
+      threadId: traceId,
+      promptSummary,
+      responseSummary: `${promptSummary} response`,
+    });
+    writeFileSync(
+      join(dataDir, "telemetry", "turns.ndjson"),
+      `${trace("outside-window", "needle outside window")}\n${"x".repeat(JOURNAL_TAIL_BYTES + 1_024)}\n${trace("inside-window", "newest turn")}\n`,
+    );
+    const retriever = new OpenMausRetriever({ dataDir, sourceSha: "abc" });
+
+    const result = await retriever.retrieve("needle outside window");
+    expect(result.chunks.map((chunk) => chunk.traceId)).toEqual(["inside-window"]);
   });
 
   it("rejects stale or unidentified source chunks instead of advertising them as the exact snapshot", async () => {
@@ -165,10 +194,12 @@ describe("OpenMausRetriever", () => {
       sourceRetrieve: async () => ({ results: [{ text: `source ${canary}`, source_sha: "source-sha" }] }),
     });
     process.env.POST_BOOT_RETRIEVAL_TOKEN = canary;
+    invalidateProtectedEnvironmentRedactor();
     try {
       expect(JSON.stringify(await retriever.retrieve(canary))).not.toContain(canary);
     } finally {
       delete process.env.POST_BOOT_RETRIEVAL_TOKEN;
+      invalidateProtectedEnvironmentRedactor();
     }
   });
 });

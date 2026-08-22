@@ -6,7 +6,7 @@ import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { NATIVE_DIR } from "../config.ts";
-import { protectedEnvironmentValues, redactKnownValues, redactSecrets } from "../redact.ts";
+import { redactProtectedEnvironmentValues, redactSecrets } from "../redact.ts";
 
 export function appendNative(threadId: string, entry: { dir: "in" | "out"; source: string; msg: unknown }) {
   try {
@@ -20,7 +20,7 @@ export function appendNative(threadId: string, entry: { dir: "in" | "out"; sourc
       JSON.stringify({
         at: new Date().toISOString(),
         ...entry,
-        msg: redactKnownValues(redactSecrets(entry.msg), protectedEnvironmentValues()),
+        msg: redactProtectedEnvironmentValues(redactSecrets(entry.msg)),
       }) + "\n",
       { mode: 0o600 },
     );

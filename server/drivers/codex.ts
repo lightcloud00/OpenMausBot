@@ -234,10 +234,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         );
       }
       if (turn.integrations?.composio && !fullTaskScoped) {
-        mountMcpServer(appServerArgs, env, "openmausbot_connectors", turn.integrations.composio, fullTaskScoped ? "prompt" : "auto");
+        mountMcpServer(appServerArgs, env, "openmausbot_connectors", turn.integrations.composio, "auto");
       }
       if (turn.integrations?.agents && !fullTaskScoped) {
-        mountMcpServer(appServerArgs, env, "agents", turn.integrations.agents, fullTaskScoped ? "prompt" : "auto");
+        mountMcpServer(appServerArgs, env, "agents", turn.integrations.agents, "auto");
       }
       if (turn.integrations?.computer && !fullTaskScoped) {
         const proxyEnv = computerProxyEnv(turn.integrations.computer);
@@ -253,11 +253,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             OMB_CONTROL_URL: proxyEnv.OMB_CONTROL_URL ?? "",
             OMB_CONTROL_TOKEN: proxyEnv.OMB_CONTROL_TOKEN ?? "",
           },
-        }, fullTaskScoped ? "prompt" : "auto");
+        }, "auto");
       } else if (turn.integrations?.localComputer && !fullTaskScoped) {
         // The host daemon and isolated Local VM both arrive as a direct Cua
         // Driver stdio MCP server. Codex sees the same computer tool surface.
-        mountMcpServer(appServerArgs, env, "computer", turn.integrations.localComputer, fullTaskScoped ? "prompt" : "auto");
+        mountMcpServer(appServerArgs, env, "computer", turn.integrations.localComputer, "auto");
       }
       if (turn.integrations?.phone && !fullTaskScoped) {
         const bridge = turn.integrations.phone;
@@ -267,7 +267,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           "-c", `${prefix}.command=${JSON.stringify(bridge.command)}`,
           "-c", `${prefix}.args=${JSON.stringify(bridge.args)}`,
           "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(bridge.env))}`,
-          "-c", `${prefix}.default_tools_approval_mode=${JSON.stringify(fullTaskScoped ? "prompt" : "auto")}`,
+          "-c", `${prefix}.default_tools_approval_mode=${JSON.stringify("auto")}`,
         );
       }
 
@@ -365,7 +365,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                   ? params.reason
                   : tool;
         if (fullTaskScoped && !isQuestion) {
-          const denial = fullTaskScopedHardDeny(tool, summary, { cwd: turn.cwd });
+          const nestedGatewayTool =
+            isMcpElicitation &&
+            params.tool === "call_capability" &&
+            typeof params.arguments?.tool === "string"
+              ? params.arguments.tool
+              : tool;
+          const denial = fullTaskScopedHardDeny(nestedGatewayTool, summary, { cwd: turn.cwd });
           if (denial) {
             emit({
               ...base(threadId, turnId),

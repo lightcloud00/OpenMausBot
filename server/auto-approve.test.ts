@@ -217,12 +217,19 @@ describe("full-task-scoped hard denials", () => {
     mkdirSync(join(repo, ".git"), { recursive: true });
     mkdirSync(subdir);
     const link = join(root, "repo-link");
-    symlinkSync(repo, link);
+    let linked = true;
+    try {
+      symlinkSync(repo, link, "junction");
+    } catch {
+      linked = false;
+    }
     try {
       expect(fullTaskScopedHardDeny("Bash", "rm -rf .", { cwd: repo })).toBe("catastrophic-destruction");
       expect(fullTaskScopedHardDeny("Bash", "rm -rf *", { cwd: repo })).toBe("catastrophic-destruction");
       expect(fullTaskScopedHardDeny("Bash", `rm -rf '${repo}'`, { cwd: root })).toBe("catastrophic-destruction");
-      expect(fullTaskScopedHardDeny("delete_directory", JSON.stringify({ path: link }), { cwd: root })).toBe("catastrophic-destruction");
+      if (linked) {
+        expect(fullTaskScopedHardDeny("delete_directory", JSON.stringify({ path: link }), { cwd: root })).toBe("catastrophic-destruction");
+      }
       expect(fullTaskScopedHardDeny("filesystem_delete", JSON.stringify({ path: "/", recursive: true }), { cwd: root })).toBe("catastrophic-destruction");
       expect(fullTaskScopedHardDeny("filesystem_delete", JSON.stringify({ path: homedir(), recursive: true }), { cwd: root })).toBe("catastrophic-destruction");
       expect(fullTaskScopedHardDeny("Bash", "rm -rf build", { cwd: repo })).toBeNull();

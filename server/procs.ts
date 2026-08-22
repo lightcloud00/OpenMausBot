@@ -106,7 +106,13 @@ export async function processIdentity(pid: number): Promise<ProcessIdentityProbe
 
 function ownerAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 1) return false;
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM proves the process exists; only ESRCH proves that it is gone.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 function registryFile(ownerPid = process.pid): string | null {

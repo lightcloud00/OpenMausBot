@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import { createRendererErrorAdmission } from "./lib/renderer-error-admission";
 import { applySkin, readSkin } from "./lib/skins";
 import "./styles.css";
 
@@ -15,6 +16,8 @@ interface RendererErrorContext {
   column?: number;
 }
 
+const admitRendererError = createRendererErrorAdmission();
+
 function safeRendererLocation(value: string | undefined): string | undefined {
   if (!value) return undefined;
   try {
@@ -27,6 +30,15 @@ function safeRendererLocation(value: string | undefined): string | undefined {
 
 function reportRendererError(value: unknown, context: RendererErrorContext) {
   const error = value instanceof Error ? value : new Error(String(value));
+  const signature = [
+    context.source,
+    error.name,
+    error.message.slice(0, 2_000),
+    safeRendererLocation(context.filename) ?? "",
+    context.line ?? "",
+    context.column ?? "",
+  ].join("|");
+  if (!admitRendererError(signature)) return;
   void fetch("/api/telemetry/error", {
     method: "POST",
     headers: { "content-type": "application/json" },

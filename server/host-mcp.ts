@@ -3,7 +3,11 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { createCapabilityProfileManifest, type CapabilityProfileManifest } from "./access-profile.ts";
+import {
+  createCapabilityProfileManifest,
+  type CapabilityProfileManifest,
+  type TelemetryCaptureMode,
+} from "./access-profile.ts";
 import { augmentedPath } from "./env-path.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { BUILTIN_CAPABILITY_TOOLS, FLEET_BUILTIN_TOOLS } from "./builtin-capability-tools.ts";
@@ -244,12 +248,13 @@ function readHermesMcpJson(userHome: string): string {
 }
 
 export function loadHostMcpCatalog(options: {
+  telemetryMode: TelemetryCaptureMode;
   home?: string;
   env?: NodeJS.ProcessEnv;
   runCodexList?: () => string;
   readOpenCodeConfig?: () => string;
   runHermesList?: () => string;
-} = {}): HostMcpCatalog {
+}): HostMcpCatalog {
   const userHome = options.home ?? homedir();
   const env = options.env ?? process.env;
   let claude: Record<string, HostMcpServer> = {};
@@ -320,7 +325,10 @@ export function loadHostMcpCatalog(options: {
   );
   return {
     servers,
-    manifest: createCapabilityProfileManifest({ toolInventory: inventory }),
+    manifest: createCapabilityProfileManifest({
+      toolInventory: inventory,
+      telemetryMode: options.telemetryMode,
+    }),
     sources: {
       claude: claudeState,
       codex: codexState,

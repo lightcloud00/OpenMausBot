@@ -358,7 +358,7 @@ function isWholeRepository(path: string): boolean {
   return existsSync(join(path, ".git"));
 }
 
-function isBroadFilesystemRoot(path: string): boolean {
+const BROAD_FILESYSTEM_ROOTS = (() => {
   const canonical = (candidate: string): string => {
     const absolute = resolve(candidate);
     try {
@@ -367,13 +367,19 @@ function isBroadFilesystemRoot(path: string): boolean {
       return absolute;
     }
   };
-  const absolute = canonical(path);
-  const roots = new Set([
-    canonical("/"),
-    canonical(homedir()),
-    ...["/Applications", "/Library", "/System", "/Users", "/Volumes", "/etc", "/opt", "/private", "/tmp", "/usr", "/var"].map(canonical),
-  ]);
-  if (roots.has(absolute)) return true;
+  return {
+    canonical,
+    roots: new Set([
+      canonical("/"),
+      canonical(homedir()),
+      ...["/Applications", "/Library", "/System", "/Users", "/Volumes", "/etc", "/opt", "/private", "/tmp", "/usr", "/var"].map(canonical),
+    ]),
+  };
+})();
+
+function isBroadFilesystemRoot(path: string): boolean {
+  const absolute = BROAD_FILESYSTEM_ROOTS.canonical(path);
+  if (BROAD_FILESYSTEM_ROOTS.roots.has(absolute)) return true;
   if (/^\/Volumes\/[^/]+$/.test(absolute)) return true;
   return /^[A-Za-z]:[\\/]?$/.test(absolute) || /^\\\\[^\\]+\\[^\\]+[\\/]?$/.test(absolute);
 }

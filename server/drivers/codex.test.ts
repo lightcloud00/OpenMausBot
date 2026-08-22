@@ -5,7 +5,7 @@
 //
 // The fake is a shebang script — the same constraint codex.cmd itself
 // hits on Windows. resolveCliSpawn covers both, so these run everywhere.
-import { chmodSync, mkdtempSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -60,6 +60,8 @@ describe("CodexDriver turns (fake app-server)", () => {
     delete process.env.OMB_TTS_KEY;
     delete process.env.AOS_STARTUP_DIRECTIVE;
     delete process.env.FAKE_CODEX_APPROVAL_COMMAND;
+    delete process.env.FAKE_CODEX_APPROVAL_PATH;
+    delete process.env.FAKE_CODEX_APPROVAL_RECURSIVE;
     delete process.env.FAKE_CODEX_APPROVAL_KIND;
     delete process.env.FAKE_CODEX_APPROVAL_SERVER_NAME;
     delete process.env.FAKE_CODEX_APPROVAL_FALLBACK_SERVER;
@@ -209,7 +211,8 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(config).toContain("hooks = false");
     expect(config).not.toContain(`[permissions.openmaus-gateway-only.filesystem]`);
     expect(config).not.toContain('":minimal"');
-    expect(config).toContain("enabled = false");
+    expect(config).toContain("[agents]\nenabled = false");
+    expect(config).toContain("[permissions.openmaus-gateway-only.network]\nenabled = false");
     const argv = seen.argv.join(" ");
     expect(argv).toContain("mcp_servers.openmaus_capabilities.command");
     expect(argv).toContain('mcp_servers.openmaus_capabilities.default_tools_approval_mode="auto"');
@@ -470,6 +473,27 @@ describe("CodexDriver turns (fake app-server)", () => {
     await recorder.until((event) => event.type === "turn.completed");
     expect(recorder.events.some((event) => event.type === "request.opened")).toBe(false);
     expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ action: "accept" });
+  });
+
+  it("declines a recursive whole-repository delete routed through the gateway", async () => {
+    await create({ mode: "approval" });
+    mkdirSync(join(scratch, ".git"));
+    const dump = join(scratch, "full-repository-delete.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    process.env.FAKE_CODEX_APPROVAL_KIND = "gateway";
+    process.env.FAKE_CODEX_APPROVAL_PATH = scratch;
+    process.env.FAKE_CODEX_APPROVAL_RECURSIVE = "1";
+
+    await instance.adapter.sendTurn({
+      threadId: "t-full-repository-delete",
+      turnToken: "turn-token-123456789012345678901234",
+      text: "delete the repository",
+      cwd: scratch,
+      accessProfile: "full-task-scoped",
+      autoApprove: true,
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ action: "decline" });
   });
 
   it("keeps auto-approval independent from the full-task-scoped capability profile", async () => {

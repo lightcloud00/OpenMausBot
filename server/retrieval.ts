@@ -2,13 +2,13 @@ import { createHash } from "node:crypto";
 import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-import { protectedEnvironmentValues, redactKnownValues, redactSecrets } from "./redact.ts";
+import { redactProtectedEnvironmentValues, redactSecrets } from "./redact.ts";
 import type { TelemetryTraceEnvelope } from "./telemetry-protocol.ts";
 
 export const SOURCE_CHUNK_LIMIT = 6;
 export const PRIOR_TURN_CHUNK_LIMIT = 4;
 export const RETRIEVAL_CONTEXT_CHAR_LIMIT = 16_000;
-const JOURNAL_TAIL_BYTES = 4 * 1024 * 1024;
+export const JOURNAL_TAIL_BYTES = 1024 * 1024;
 
 export interface RetrievalChunk {
   kind: "source" | "prior-turn";
@@ -135,7 +135,6 @@ function sourceCandidates(input: unknown): RetrievalChunk[] {
 export class OpenMausRetriever {
   private readonly options: RetrieverOptions;
   private readonly journalPath: string;
-  private protectedValues = protectedEnvironmentValues();
 
   constructor(options: RetrieverOptions) {
     this.options = options;
@@ -143,34 +142,43 @@ export class OpenMausRetriever {
   }
 
   private sanitize(value: string): string {
-    return normalized(String(redactKnownValues(redactSecrets(value), this.protectedValues)));
+    return normalized(String(redactProtectedEnvironmentValues(redactSecrets(value))));
   }
 
   private priorTurns(query: string): RetrievalChunk[] {
-    const rows: Array<{ chunk: RetrievalChunk; recency: number }> = [];
+    const rows: Array<{
+      rawText: string;
+      trace: TelemetryTraceEnvelope;
+      score: number;
+      recency: number;
+    }> = [];
     for (const [index, line] of tail(this.journalPath).split(/\r?\n/).entries()) {
       if (!line.trim()) continue;
       let trace: TelemetryTraceEnvelope;
       try { trace = JSON.parse(line) as TelemetryTraceEnvelope; } catch { continue; }
       if (trace.kind !== "trace" || trace.application !== "openmausbot") continue;
-      const text = this.sanitize(`User: ${trace.promptSummary}\nAssistant: ${trace.responseSummary}`);
-      if (!text) continue;
+      const rawText = `User: ${trace.promptSummary}\nAssistant: ${trace.responseSummary}`;
       rows.push({
         recency: index,
-        chunk: {
-          kind: "prior-turn",
-          text,
-          sourceSha: trace.sourceSha,
-          traceId: trace.traceId,
-          threadId: trace.threadId,
-          score: lexicalScore(query, text),
-        },
+        rawText,
+        trace,
+        score: lexicalScore(query, rawText),
       });
     }
     return rows
-      .sort((a, b) => (b.chunk.score ?? 0) - (a.chunk.score ?? 0) || b.recency - a.recency)
+      .sort((a, b) => b.score - a.score || b.recency - a.recency)
       .slice(0, PRIOR_TURN_CHUNK_LIMIT)
-      .map((row) => row.chunk);
+      .flatMap((row): RetrievalChunk[] => {
+        const text = this.sanitize(row.rawText);
+        return text ? [{
+          kind: "prior-turn",
+          text,
+          sourceSha: row.trace.sourceSha,
+          traceId: row.trace.traceId,
+          threadId: row.trace.threadId,
+          score: row.score,
+        }] : [];
+      });
   }
 
   private async source(query: string, cwd?: string, turnToken?: string): Promise<{ chunks: RetrievalChunk[]; warnings: string[] }> {
@@ -192,7 +200,16 @@ export class OpenMausRetriever {
       const warnings: string[] = [];
       if (mismatched) warnings.push(`discarded ${mismatched} project-source chunk(s) from a different source snapshot`);
       if (unidentified) warnings.push(`discarded ${unidentified} project-source chunk(s) without an exact source SHA`);
-      return { chunks: exact.slice(0, SOURCE_CHUNK_LIMIT), warnings };
+      const unique: RetrievalChunk[] = [];
+      const seen = new Set<string>();
+      for (const chunk of exact) {
+        const key = hash(normalized(chunk.text).toLowerCase());
+        if (seen.has(key)) continue;
+        seen.add(key);
+        unique.push(chunk);
+        if (unique.length === SOURCE_CHUNK_LIMIT) break;
+      }
+      return { chunks: unique, warnings };
     } catch (error) {
       return { chunks: [], warnings: [error instanceof Error ? error.message : "project-source retrieval failed"] };
     } finally {
@@ -201,7 +218,6 @@ export class OpenMausRetriever {
   }
 
   async retrieve(query: string, cwd?: string, turnToken?: string): Promise<RetrievalResult> {
-    this.protectedValues = protectedEnvironmentValues();
     const cleanQuery = this.sanitize(query).slice(0, 8_000);
     const source = await this.source(cleanQuery, cwd, turnToken);
     const candidates = [...source.chunks, ...this.priorTurns(cleanQuery)];
@@ -209,7 +225,7 @@ export class OpenMausRetriever {
     const seen = new Set<string>();
     let chars = 0;
     for (const candidate of candidates) {
-      const text = this.sanitize(candidate.text);
+      const text = candidate.kind === "prior-turn" ? normalized(candidate.text) : this.sanitize(candidate.text);
       const key = hash(text.toLowerCase());
       if (!text || seen.has(key)) continue;
       seen.add(key);

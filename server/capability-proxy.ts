@@ -68,15 +68,22 @@ async function api(path: string, init?: RequestInit): Promise<Json> {
   const response = await fetch(`${HARNESS}${path}`, {
     ...init,
     headers: {
+      ...init?.headers,
       "content-type": "application/json",
       authorization: `Bearer ${AUTH_TOKEN}`,
       "x-openmaus-turn-token": TURN_TOKEN,
-      ...init?.headers,
     },
     signal: AbortSignal.timeout(65_000),
   });
   const body = (await response.json().catch(() => ({}))) as Json;
-  if (!response.ok) throw new Error(String(body.error ?? `capability gateway returned HTTP ${response.status}`));
+  if (!response.ok) {
+    const detail = typeof body.error === "string"
+      ? body.error
+      : body.error !== undefined
+        ? JSON.stringify(body.error)
+        : `capability gateway returned HTTP ${response.status}`;
+    throw new Error(detail);
+  }
   return body;
 }
 

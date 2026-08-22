@@ -6,7 +6,7 @@ import { LangfuseSpanProcessor } from "@langfuse/otel";
 import { propagateAttributes, startObservation } from "@langfuse/tracing";
 import * as Sentry from "@sentry/node";
 
-import { protectedEnvironmentValues, redactKnownValues, redactSecrets } from "./redact.ts";
+import { redactProtectedEnvironmentValues, redactSecrets } from "./redact.ts";
 import type { TelemetryEnvelope, TelemetryErrorEnvelope, TelemetryTraceEnvelope } from "./telemetry-protocol.ts";
 
 interface RuntimeConfig {
@@ -33,10 +33,8 @@ function loadRuntimeConfig(): RuntimeConfig {
 
 const runtime = loadRuntimeConfig();
 const kind = runtime.kind;
-const protectedValues = protectedEnvironmentValues();
-
 function sanitize<T>(input: T): T {
-  return redactKnownValues(redactSecrets(input), protectedValues) as T;
+  return redactProtectedEnvironmentValues(redactSecrets(input)) as T;
 }
 
 function status(value: Record<string, unknown>): void {

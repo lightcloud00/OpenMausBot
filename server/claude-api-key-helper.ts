@@ -8,6 +8,8 @@
  * logs, transcripts, telemetry, or the capability gateway.
  */
 import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 function validAlias(value: string | undefined): string {
@@ -39,10 +41,13 @@ export function claudeApiKeyHelperChildEnv(
   };
 }
 
-export function readClaudeApiKey(aliasValue: string | undefined): string {
+export function readClaudeApiKey(
+  aliasValue: string | undefined,
+  run: typeof spawnSync = spawnSync,
+): string {
   const alias = validAlias(aliasValue);
   const self = fileURLToPath(import.meta.url);
-  const result = spawnSync(
+  const result = run(
     "credvault",
     ["exec", alias, "ANTHROPIC_API_KEY", "--", process.execPath, self, "--emit-injected"],
     {
@@ -60,6 +65,23 @@ export function readClaudeApiKey(aliasValue: string | undefined): string {
   return value;
 }
 
+export function isClaudeApiKeyHelperEntrypoint(
+  argvPath: string | undefined = process.argv[1],
+  modulePath: string = fileURLToPath(import.meta.url),
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (!argvPath) return false;
+  try {
+    const moduleRealPath = realpathSync(modulePath);
+    const argvRealPath = realpathSync(resolve(argvPath));
+    return platform === "win32"
+      ? moduleRealPath.toLowerCase() === argvRealPath.toLowerCase()
+      : moduleRealPath === argvRealPath;
+  } catch {
+    return false;
+  }
+}
+
 function main(): number {
   try {
     process.stdout.write(process.argv[2] === "--emit-injected" ? injectedCredential() : readClaudeApiKey(process.argv[2]));
@@ -72,4 +94,4 @@ function main(): number {
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) process.exitCode = main();
+if (isClaudeApiKeyHelperEntrypoint()) process.exitCode = main();

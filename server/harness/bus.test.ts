@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { EVENTS_DIR, ensureDirs } from "../config.ts";
 import type { RuntimeEvent } from "../contracts.ts";
+import { invalidateProtectedEnvironmentRedactor } from "../redact.ts";
 import { makeFakeDriver } from "../testing/fake-driver.ts";
 import { EventBus } from "./bus.ts";
 
@@ -90,6 +91,7 @@ describe("EventBus", () => {
   it("redacts exact protected values before logging or transcript delivery", () => {
     const canary = "exact-canary-value-847263";
     process.env.BUS_TEST_API_KEY = canary;
+    invalidateProtectedEnvironmentRedactor();
     try {
       const bus = new EventBus();
       const seen: RuntimeEvent[] = [];
@@ -107,6 +109,27 @@ describe("EventBus", () => {
       expect(logged).toContain("redacted");
     } finally {
       delete process.env.BUS_TEST_API_KEY;
+      invalidateProtectedEnvironmentRedactor();
+    }
+  });
+
+  it("does not permanently rewrite ordinary short protected values", () => {
+    process.env.BUS_TEST_API_KEY = "ordinary";
+    invalidateProtectedEnvironmentRedactor();
+    try {
+      const bus = new EventBus();
+      const seen: RuntimeEvent[] = [];
+      bus.subscribe((event) => seen.push(event));
+      bus.publish(testEvent({
+        threadId: "short-known-value",
+        type: "item.completed",
+        itemType: "assistant_text",
+        text: "an ordinary sentence",
+      }));
+      expect(JSON.stringify(seen)).toContain("ordinary");
+    } finally {
+      delete process.env.BUS_TEST_API_KEY;
+      invalidateProtectedEnvironmentRedactor();
     }
   });
 

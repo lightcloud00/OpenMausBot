@@ -161,7 +161,10 @@ process.stdin.on("data", (chunk) => {
                   arguments: {
                     server: process.env.FAKE_CODEX_APPROVAL_FALLBACK_SERVER ?? "openmaus-host",
                     tool: "filesystem_delete",
-                    arguments: { path: process.env.FAKE_CODEX_APPROVAL_COMMAND ?? "scratch" },
+                    arguments: {
+                      path: process.env.FAKE_CODEX_APPROVAL_PATH ?? "scratch",
+                      recursive: process.env.FAKE_CODEX_APPROVAL_RECURSIVE === "1",
+                    },
                   },
                 }
               : { command: approvalCommand },

@@ -15,9 +15,9 @@ import { killCliTree, spawnCli } from "./procs.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { windowsCmdCommand } from "./windows-cmd.ts";
 import {
+  createKnownValueRedactor,
   isSecretName,
   protectedEnvironmentValues,
-  redactKnownValues,
   redactSecrets,
 } from "./redact.ts";
 import { suggestRoleOverlays } from "./role-overlays.ts";
@@ -451,6 +451,7 @@ export class CapabilityGateway {
   private readonly idleTimeoutMs: number;
   private readonly now: () => number;
   private readonly protectedValues: Set<string>;
+  private knownValueRedactor: (input: unknown) => unknown;
   private readonly credentialBroker: CredentialBrokerOptions;
   private readonly fleetIndex?: FleetCapabilityIndex;
 
@@ -465,10 +466,44 @@ export class CapabilityGateway {
     this.credentialBroker = options.credentialBroker ?? {};
     this.fleetIndex = options.fleetIndex;
     this.protectedValues = protectedEnvironmentValues();
+    this.knownValueRedactor = createKnownValueRedactor(this.protectedValues);
     this.protectServerValues(catalog.servers);
   }
 
   private readonly listAliasesImpl: () => Promise<string[]>;
+
+  private validateTurnServers(servers: Record<string, HostMcpServer>): void {
+    if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+      throw new Error("invalid capability server definitions");
+    }
+    for (const [name, server] of Object.entries(servers)) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/.test(name) || /cred(?:ential)?vault/i.test(name)) {
+        throw new Error("invalid capability server name");
+      }
+      if (this.catalog.servers[name] && JSON.stringify(this.catalog.servers[name]) !== JSON.stringify(server)) {
+        throw new Error("turn capability cannot replace a host capability");
+      }
+      const valid = Boolean(server && typeof server === "object" && (
+        (server.type === "stdio" &&
+          typeof server.command === "string" && server.command.length > 0 && !server.command.includes("\0") &&
+          Array.isArray(server.args) && server.args.every((arg) => typeof arg === "string") &&
+          server.env && typeof server.env === "object" && !Array.isArray(server.env) &&
+          Object.entries(server.env).every(([key, value]) => /^[A-Z_][A-Z0-9_]*$/.test(key) && typeof value === "string") &&
+          (server.cwd === undefined || typeof server.cwd === "string")) ||
+        (server.type === "http" && (() => {
+          try {
+            const url = new URL(server.url);
+            return /^https?:$/.test(url.protocol) &&
+              server.headers && typeof server.headers === "object" && !Array.isArray(server.headers) &&
+              Object.values(server.headers).every((value) => typeof value === "string");
+          } catch {
+            return false;
+          }
+        })())
+      ));
+      if (!valid) throw new Error("invalid capability server definition");
+    }
+  }
 
   beginTurn(token: string, turn: {
     botId: string;
@@ -478,16 +513,18 @@ export class CapabilityGateway {
     servers?: Record<string, HostMcpServer>;
   }): void {
     if (!token || token.length < 24) throw new Error("invalid capability turn token");
+    const servers = turn.servers ?? {};
+    this.validateTurnServers(servers);
     if (this.activeTurns.has(token)) this.endTurn(token);
     this.activeTurns.set(token, {
       botId: turn.botId,
       threadId: turn.threadId,
       cwd: turn.cwd,
       expiresAt: this.now() + (turn.ttlMs ?? 24 * 60 * 60_000),
-      servers: { ...turn.servers },
+      servers: { ...servers },
       interactiveInput: "",
     });
-    this.protectServerValues(turn.servers ?? {});
+    this.protectServerValues(servers);
   }
 
   endTurn(token: string): void {
@@ -526,16 +563,9 @@ export class CapabilityGateway {
 
   extendTurn(token: string, servers: Record<string, HostMcpServer>): void {
     this.requireTurn(token);
+    this.validateTurnServers(servers);
     const turn = this.activeTurns.get(token)!;
-    for (const [name, server] of Object.entries(servers)) {
-      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$/.test(name) || /cred(?:ential)?vault/i.test(name)) {
-        throw new Error("invalid capability server name");
-      }
-      if (this.catalog.servers[name] && JSON.stringify(this.catalog.servers[name]) !== JSON.stringify(server)) {
-        throw new Error("turn capability cannot replace a host capability");
-      }
-      turn.servers[name] = server;
-    }
+    Object.assign(turn.servers, servers);
     this.protectServerValues(servers);
   }
 
@@ -552,7 +582,10 @@ export class CapabilityGateway {
     const inventory = Object.entries(this.serversFor(token)).flatMap(([name, server]) =>
       server.type === "builtin" ? builtinTools(server).map((tool) => `${name}:${tool.name}`) : [name],
     );
-    return createCapabilityProfileManifest({ toolInventory: inventory });
+    return createCapabilityProfileManifest({
+      toolInventory: inventory,
+      telemetryMode: this.catalog.manifest.telemetryMode,
+    });
   }
 
   inventory(token: string): { manifest: HostMcpCatalog["manifest"]; servers: Array<{ name: string; type: string }> } {
@@ -649,7 +682,7 @@ export class CapabilityGateway {
   }
 
   private sanitize(value: unknown, options: { preserveImages?: boolean } = {}): any {
-    const withoutSecrets = redactKnownValues(redactSecrets(value), this.protectedValues);
+    const withoutSecrets = this.knownValueRedactor(redactSecrets(value));
     const stripBinary = (input: any, depth = 0): any => {
       if (depth > 12 || input === null || typeof input !== "object") return input;
       if (Array.isArray(input)) return input.map((item) => stripBinary(item, depth + 1));
@@ -844,6 +877,7 @@ export class CapabilityGateway {
   }
 
   private protectServerValues(servers: Record<string, HostMcpServer>): void {
+    const previousSize = this.protectedValues.size;
     for (const server of Object.values(servers)) {
       if (server.type === "stdio") {
         for (const [name, value] of Object.entries(server.env)) {
@@ -856,6 +890,9 @@ export class CapabilityGateway {
           if (protectedValue) this.protectedValues.add(protectedValue);
         }
       }
+    }
+    if (this.protectedValues.size !== previousSize) {
+      this.knownValueRedactor = createKnownValueRedactor(this.protectedValues);
     }
   }
 }

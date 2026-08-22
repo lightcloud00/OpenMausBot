@@ -8,7 +8,7 @@ import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { EVENTS_DIR } from "../config.ts";
-import { protectedEnvironmentValues, redactKnownValues, redactSecrets } from "../redact.ts";
+import { redactProtectedEnvironmentValues, redactSecrets } from "../redact.ts";
 import type { ProviderInstance, RuntimeEvent, RuntimeEventListener } from "../contracts.ts";
 
 export class EventBus {
@@ -34,10 +34,7 @@ export class EventBus {
     // Redact before BOTH persistence and delivery. The message-store fold is
     // a listener, so logging-only redaction would still leave a canary copied
     // by a provider in the durable transcript and subsequent replay context.
-    const sanitized = redactKnownValues(
-      redactSecrets(event),
-      protectedEnvironmentValues(),
-    ) as RuntimeEvent;
+    const sanitized = redactProtectedEnvironmentValues(redactSecrets(event)) as RuntimeEvent;
     try {
       // the canonical log is a file people paste into bug reports; scrub
       // credential-shaped content (tool titles, request summaries, reply

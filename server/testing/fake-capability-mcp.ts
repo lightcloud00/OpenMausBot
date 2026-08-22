@@ -71,9 +71,9 @@ input.on("line", (line) => {
           }],
         };
     const response = { jsonrpc: "2.0", id: message.id, result };
-    if (name === "credential-split" && selected) {
-      const wire = JSON.stringify(response);
-      const secretAt = wire.indexOf(selected);
+    const wire = JSON.stringify(response);
+    const secretAt = name === "credential-split" && selected ? wire.indexOf(selected) : -1;
+    if (secretAt !== -1 && selected) {
       const splitAt = secretAt + Math.floor(selected.length / 2);
       process.stdout.write(wire.slice(0, splitAt));
       setTimeout(() => process.stdout.write(`${wire.slice(splitAt)}\n`), 5);

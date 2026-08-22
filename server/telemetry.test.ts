@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -7,8 +7,11 @@ import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { RuntimeEvent } from "./contracts.ts";
+import { invalidateProtectedEnvironmentRedactor } from "./redact.ts";
 import {
   TelemetryManager,
+  TELEMETRY_JOURNAL_RETAIN_BYTES,
+  TELEMETRY_JOURNAL_ROLL_BYTES,
   telemetrySinkRuntimeConfig,
   telemetrySinkSpawnSpec,
 } from "./telemetry.ts";
@@ -17,6 +20,7 @@ const dirs: string[] = [];
 afterEach(() => {
   delete process.env.TEST_API_KEY;
   delete process.env.POST_BOOT_TELEMETRY_TOKEN;
+  invalidateProtectedEnvironmentRedactor();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -131,6 +135,7 @@ describe("TelemetryManager", () => {
     dirs.push(dir);
     const canary = "canary-secret-value-928374";
     process.env.TEST_API_KEY = canary;
+    invalidateProtectedEnvironmentRedactor();
     const sinks = { sentry: fakeSink(), langfuse: fakeSink() };
     const manager = new TelemetryManager({
       dataDir: dir,
@@ -192,6 +197,7 @@ describe("TelemetryManager", () => {
     });
     const canary = "post-boot-telemetry-secret-572983";
     process.env.POST_BOOT_TELEMETRY_TOKEN = canary;
+    invalidateProtectedEnvironmentRedactor();
     manager.registerTurn({
       botId: "finch",
       botName: "Finch",
@@ -209,6 +215,45 @@ describe("TelemetryManager", () => {
     manager.shutdown();
   });
 
+  it("rolls the journal at eight MiB and retains only the newest four MiB", () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-telemetry-retention-"));
+    dirs.push(dir);
+    const telemetryDir = join(dir, "telemetry");
+    const journalPath = join(telemetryDir, "turns.ndjson");
+    const sinks = { sentry: fakeSink(), langfuse: fakeSink() };
+    const manager = new TelemetryManager({
+      dataDir: dir,
+      sinkPath: "/unused",
+      sourceSha: "b".repeat(40),
+      release: "dev",
+      spawnSink: (kind) => sinks[kind].child,
+    });
+    const oldest = `${JSON.stringify({ sequence: "oldest", pad: "o".repeat(1_000) })}\n`;
+    const filler = `${JSON.stringify({ sequence: "middle", pad: "m".repeat(1_000) })}\n`;
+    const newest = `${JSON.stringify({ sequence: "newest", pad: "n".repeat(1_000) })}\n`;
+    const copies = Math.ceil((TELEMETRY_JOURNAL_ROLL_BYTES + 1 - oldest.length - newest.length) / filler.length);
+    writeFileSync(journalPath, oldest + filler.repeat(copies) + newest, { mode: 0o600 });
+
+    manager.registerTurn({
+      botId: "retention",
+      botName: "Retention",
+      threadId: "retention-thread",
+      engine: "codex",
+      model: "gpt-5",
+      prompt: "complete retention turn",
+    });
+    manager.handleRuntimeEvent(event("turn.started", { threadId: "retention-thread" }));
+    manager.handleRuntimeEvent(event("turn.completed", { threadId: "retention-thread", ok: true }));
+
+    const retained = readFileSync(journalPath, "utf8");
+    expect(statSync(journalPath).size).toBeLessThanOrEqual(TELEMETRY_JOURNAL_RETAIN_BYTES + 20_000);
+    expect(retained).not.toContain('"sequence":"oldest"');
+    expect(retained).toContain('"sequence":"newest"');
+    expect(retained).toContain('"threadId":"retention-thread"');
+    for (const line of retained.trim().split("\n")) expect(() => JSON.parse(line)).not.toThrow();
+    manager.shutdown();
+  });
+
   it("redacts protected values from degraded sink health", () => {
     const dir = mkdtempSync(join(tmpdir(), "omb-telemetry-health-secret-"));
     dirs.push(dir);
@@ -222,6 +267,7 @@ describe("TelemetryManager", () => {
     });
     const canary = "post-boot-health-secret-493827";
     process.env.POST_BOOT_TELEMETRY_TOKEN = canary;
+    invalidateProtectedEnvironmentRedactor();
 
     sinks.sentry.child.stdout.write(
       `${JSON.stringify({ kind: "error", message: `sink rejected ${canary}` })}\n`,
@@ -348,6 +394,7 @@ describe("TelemetryManager", () => {
     dirs.push(dir);
     const canary = "renderer-secret-canary-83746";
     process.env.TEST_API_KEY = canary;
+    invalidateProtectedEnvironmentRedactor();
     const sinks = { sentry: fakeSink(), langfuse: fakeSink() };
     const manager = new TelemetryManager({
       dataDir: dir,

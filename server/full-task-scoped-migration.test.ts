@@ -1,12 +1,16 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { FULL_TASK_SCOPED_SYSTEM_PROMPT } from "./access-profile.ts";
 import { removeTempDir } from "./testing/cleanup.ts";
-import { FULL_TASK_SCOPED_MIGRATION_TITLE, migrateFullTaskScopedData } from "./full-task-scoped-migration.ts";
+import {
+  FULL_TASK_SCOPED_MIGRATION_TITLE,
+  migrateFullTaskScopedData,
+  recoverFullTaskScopedMigration,
+} from "./full-task-scoped-migration.ts";
 
 const roots: string[] = [];
 const sha = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
@@ -230,6 +234,48 @@ describe("full-task-scoped bot migration", () => {
       expect(readFileSync(join(dataDir, name))).toEqual(contents);
     }
     expect(existsSync(join(dataDir, "migration-full-task-scoped.v1.json"))).toBe(false);
+    expect(existsSync(join(dataDir, ".full-task-scoped-migration.transaction.json"))).toBe(false);
+  });
+
+  it("recovers a prepared transaction by restoring checksum-verified snapshots", () => {
+    const { dataDir, bots: originalBots } = fixture();
+    const ids = ["prepared-finch", "prepared-cogs"];
+    const receipt = migrateFullTaskScopedData({ dataDir, newId: () => ids.shift()! });
+    const backupDirectory = receipt.backupDirectory!;
+    const backup = join(dataDir, "backups", backupDirectory);
+    const manifest = JSON.parse(readFileSync(join(backup, "manifest.json"), "utf8")) as { files: unknown[] };
+    writeFileSync(join(dataDir, ".full-task-scoped-migration.transaction.json"), JSON.stringify({
+      schema: "openmaus.full-task-scoped-migration-transaction.v1",
+      status: "prepared",
+      backupDirectory,
+      files: manifest.files,
+      receipt,
+    }));
+
+    expect(recoverFullTaskScopedMigration(dataDir)).toBe("rolled-back");
+    expect(JSON.parse(readFileSync(join(dataDir, "bots.json"), "utf8"))).toEqual(originalBots);
+    expect(existsSync(join(dataDir, "migration-full-task-scoped.v1.json"))).toBe(false);
+    expect(existsSync(join(dataDir, ".full-task-scoped-migration.transaction.json"))).toBe(false);
+  });
+
+  it("recovers a committed transaction by replaying its receipt", () => {
+    const { dataDir } = fixture();
+    const ids = ["committed-finch", "committed-cogs"];
+    const receipt = migrateFullTaskScopedData({ dataDir, newId: () => ids.shift()! });
+    const backupDirectory = receipt.backupDirectory!;
+    const backup = join(dataDir, "backups", backupDirectory);
+    const manifest = JSON.parse(readFileSync(join(backup, "manifest.json"), "utf8")) as { files: unknown[] };
+    unlinkSync(join(dataDir, "migration-full-task-scoped.v1.json"));
+    writeFileSync(join(dataDir, ".full-task-scoped-migration.transaction.json"), JSON.stringify({
+      schema: "openmaus.full-task-scoped-migration-transaction.v1",
+      status: "committed",
+      backupDirectory,
+      files: manifest.files,
+      receipt,
+    }));
+
+    expect(recoverFullTaskScopedMigration(dataDir)).toBe("committed");
+    expect(JSON.parse(readFileSync(join(dataDir, "migration-full-task-scoped.v1.json"), "utf8"))).toEqual(receipt);
     expect(existsSync(join(dataDir, ".full-task-scoped-migration.transaction.json"))).toBe(false);
   });
 

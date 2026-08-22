@@ -59,14 +59,21 @@ function stableManifestPayload(input: {
 
 export function createCapabilityProfileManifest(input: {
   toolInventory?: string[];
-  telemetryMode?: TelemetryCaptureMode;
-} = {}): CapabilityProfileManifest {
+  telemetryMode: TelemetryCaptureMode;
+}): CapabilityProfileManifest {
   const payload = stableManifestPayload({
     toolInventory: input.toolInventory ?? [],
-    telemetryMode: input.telemetryMode ?? "sanitized-content",
+    telemetryMode: input.telemetryMode,
   });
   const sha256 = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
   return { ...payload, sha256 };
+}
+
+/** The profile advertises what this process actually captures. Keep this
+ * derived from the same runtime switch that controls TelemetryManager rather
+ * than silently defaulting manifests to a more permissive mode. */
+export function telemetryCaptureMode(env: NodeJS.ProcessEnv = process.env): TelemetryCaptureMode {
+  return env.OMB_TELEMETRY_DISABLED === "1" ? "off" : "sanitized-content";
 }
 
 export const FULL_TASK_SCOPED_SYSTEM_PROMPT =

@@ -1,7 +1,7 @@
 // OpenMausBot server — the harness host. Clients hold no transports
 // (upstream rule): the React app dispatches typed commands over HTTP and
 // folds one SSE event stream; every provider process runs here.
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { isIP } from "node:net";
@@ -20,6 +20,7 @@ import {
   PROTECTED_COMPUTER_INPUT_PROMPT,
   renderFullTaskScopedSystemPrompt,
   supportsFullTaskScopedBotDriver,
+  telemetryCaptureMode,
   UNTRUSTED_WEBHOOK_PROMPT,
 } from "./access-profile.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
@@ -141,10 +142,31 @@ const MIME: Record<string, string> = {
   ".woff2": "font/woff2",
 };
 
+const RENDERER_ERROR_WINDOW_MS = 60_000;
+const RENDERER_ERROR_SIGNATURE_LIMIT = 10;
+const rendererErrorAdmissions = new Map<string, { startedAt: number; signatures: Set<string> }>();
+
+function admitRendererError(remoteAddress: string | undefined, name: string, message: string, now = Date.now()): boolean {
+  const address = remoteAddress || "unknown";
+  let window = rendererErrorAdmissions.get(address);
+  if (!window || now - window.startedAt >= RENDERER_ERROR_WINDOW_MS) {
+    window = { startedAt: now, signatures: new Set() };
+    rendererErrorAdmissions.set(address, window);
+  }
+  const signature = createHash("sha256").update(`${name}\0${message}`).digest("hex");
+  if (window.signatures.has(signature) || window.signatures.size >= RENDERER_ERROR_SIGNATURE_LIMIT) return false;
+  window.signatures.add(signature);
+  for (const [candidate, state] of rendererErrorAdmissions) {
+    if (now - state.startedAt >= RENDERER_ERROR_WINDOW_MS) rendererErrorAdmissions.delete(candidate);
+  }
+  return true;
+}
+
 ensureDirs();
 await configureProcessRegistry(join(DATA_DIR, "runtime", "owned-process-groups"));
 const cfg = loadConfig();
-const hostMcpCatalog = loadHostMcpCatalog();
+const telemetryMode = telemetryCaptureMode();
+const hostMcpCatalog = loadHostMcpCatalog({ telemetryMode });
 writeHostMcpManifest(DATA_DIR, hostMcpCatalog);
 const fleetCapabilityIndex = new FleetCapabilityIndex();
 const capabilityGateway = new CapabilityGateway(hostMcpCatalog, { fleetIndex: fleetCapabilityIndex });
@@ -3137,9 +3159,14 @@ const server = createServer(async (req, res) => {
       const diagnostics = bodyRecord.diagnostics && typeof bodyRecord.diagnostics === "object" && !Array.isArray(bodyRecord.diagnostics)
         ? bodyRecord.diagnostics as Record<string, unknown>
         : undefined;
+      const errorName = typeof body.name === "string" ? body.name.slice(0, 120) : "RendererError";
+      const errorMessage = String(body.message ?? "renderer error").slice(0, 2_000);
+      if (!admitRendererError(req.socket.remoteAddress, errorName, errorMessage)) {
+        return json(res, 202, { accepted: false, correlated: Boolean(active), coalesced: true });
+      }
       telemetry.captureError(
-        Object.assign(new Error(String(body.message ?? "renderer error").slice(0, 2_000)), {
-          name: typeof body.name === "string" ? body.name.slice(0, 120) : "RendererError",
+        Object.assign(new Error(errorMessage), {
+          name: errorName,
           stack: typeof body.stack === "string" ? body.stack.slice(0, 8_000) : undefined,
         }),
         {
@@ -3925,7 +3952,7 @@ const server = createServer(async (req, res) => {
         const effectiveInstanceId = body.modelSelection?.instanceId ?? existingBot?.modelSelection.instanceId;
         if (effectiveAccessProfile === "full-task-scoped") {
           const target = effectiveInstanceId ? registry.get(effectiveInstanceId) : null;
-          if (!target || !supportsFullTaskScopedBotDriver(target.driverKind)) {
+          if (target && !supportsFullTaskScopedBotDriver(target.driverKind)) {
             return json(res, 400, {
               error: "full-task-scoped is available only for Claude and Codex bot engines",
             });
@@ -4556,11 +4583,11 @@ const server = createServer(async (req, res) => {
         // but writing the resolved map keeps disk and runtime in lockstep
         saveConfig({ instances: result.config.instances });
         Object.assign(cfg, loadConfig());
-        const instances = await reloadProviders();
         // rescan BEFORE describe(): the response's cliCandidates are computed
         // from the memoized PATH, so resetting after would answer this request
         // with the pre-reset cache
         resetPathCache();
+        const instances = await reloadProviders();
         return json(res, 200, { instances });
       } finally {
         providerConfigBusy = false;

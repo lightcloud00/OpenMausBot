@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { ensureDirs, NATIVE_DIR } from "../config.ts";
+import { invalidateProtectedEnvironmentRedactor } from "../redact.ts";
 import { appendNative } from "./native.ts";
 
 beforeAll(() => ensureDirs());
@@ -51,6 +52,7 @@ describe("appendNative", () => {
   it("masks an exact protected canary even when it has no recognizable prefix", () => {
     const canary = "native-canary-value-193746";
     process.env.NATIVE_TEST_SECRET = canary;
+    invalidateProtectedEnvironmentRedactor();
     try {
       appendNative("t-known", { dir: "in", source: "codex", msg: { text: `copied ${canary}` } });
       const log = readFileSync(join(NATIVE_DIR, "t-known.ndjson"), "utf8");
@@ -58,6 +60,7 @@ describe("appendNative", () => {
       expect(log).toContain("redacted");
     } finally {
       delete process.env.NATIVE_TEST_SECRET;
+      invalidateProtectedEnvironmentRedactor();
     }
   });
 

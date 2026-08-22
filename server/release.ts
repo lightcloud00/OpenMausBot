@@ -11,24 +11,28 @@ function cleanSha(value: unknown): string | null {
   return /^[0-9a-f]{40}$/.test(trimmed) ? trimmed : null;
 }
 
+let cachedSourceSha: string | undefined;
+
 /** Exact source identity compiled into packaged server entries. Development
  * falls back to the current checkout; an unknown value is explicit rather
  * than being confused with the installed application's version. */
 export function runtimeSourceSha(): string {
+  if (cachedSourceSha !== undefined) return cachedSourceSha;
   const fromEnv = cleanSha(process.env.OMB_SOURCE_SHA);
-  if (fromEnv) return fromEnv;
+  if (fromEnv) return (cachedSourceSha = fromEnv);
   const compiled = typeof __OMB_SOURCE_SHA__ === "undefined" ? null : cleanSha(__OMB_SOURCE_SHA__);
-  if (compiled) return compiled;
+  if (compiled) return (cachedSourceSha = compiled);
   try {
-    return cleanSha(execFileSync("git", ["rev-parse", "HEAD"], {
+    cachedSourceSha = cleanSha(execFileSync("git", ["rev-parse", "HEAD"], {
       cwd: dirname(fileURLToPath(import.meta.url)),
       encoding: "utf8",
       timeout: 2_000,
       stdio: ["ignore", "pipe", "ignore"],
     })) ?? "unknown";
   } catch {
-    return "unknown";
+    cachedSourceSha = "unknown";
   }
+  return cachedSourceSha;
 }
 
 export function runtimeRelease(): string {
