@@ -22,6 +22,7 @@ import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
+const FAKE_CODEX = join(SERVER_DIR, "testing", "fake-codex-app-server.ts");
 const PORT = 18800 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
 const posixOnly = describe.skipIf(process.platform === "win32");
@@ -105,7 +106,7 @@ async function makePermissionBot(patch: Record<string, unknown>, instanceId = "g
   const bot = created.body.bot;
   const patched = await api("PATCH", `/api/bots/${bot.id}`, {
     ...patch,
-    modelSelection: { instanceId, model: "fake-model" },
+    modelSelection: { instanceId, model: instanceId === "codex" ? "gpt-fake-default" : "fake-model" },
   });
   expect(patched.status).toBe(200);
   return patched.body.bot ?? bot;
@@ -114,6 +115,7 @@ async function makePermissionBot(patch: Record<string, unknown>, instanceId = "g
 posixOnly("authorization decisions are logged", () => {
   beforeAll(async () => {
     chmodSync(FAKE_CLI, 0o755);
+    chmodSync(FAKE_CODEX, 0o755);
     home = mkdtempSync(join(tmpdir(), "omb-decisions-e2e-"));
     mkdirSync(join(home, ".openmausbot"), { recursive: true });
     writeFileSync(
@@ -124,6 +126,14 @@ posixOnly("authorization decisions are logged", () => {
             driver: "grokAgent",
             environment: { FAKE_ACP_MODE: "permission" },
             config: { cli: FAKE_CLI, fullAuto: false },
+          },
+          codex: {
+            driver: "codex",
+            environment: {
+              FAKE_CODEX_MODE: "approval",
+              FAKE_CODEX_APPROVAL_COMMAND: "echo hi",
+            },
+            config: { cli: FAKE_CODEX, fullAuto: true },
           },
           destructive: {
             driver: "grokAgent",
@@ -176,7 +186,7 @@ posixOnly("authorization decisions are logged", () => {
   it(
     "a rule-matched auto-approval writes a row naming the rule",
     async () => {
-      const bot = await makePermissionBot({ name: "Granted", alwaysAllow: ["shell:echo"] });
+      const bot = await makePermissionBot({ name: "Granted", alwaysAllow: ["shell:echo"] }, "codex");
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "run it" })).status).toBe(202);
 
       const row = await waitForDecision((r) => r.decision === "auto-approved" && r.botId === bot.id);
@@ -258,7 +268,10 @@ posixOnly("authorization decisions are logged", () => {
   it(
     "a safe webhook turn keeps its approval provenance",
     async () => {
-      const bot = await makePermissionBot({ name: "Nightshift", autoApprove: true, alwaysAllow: ["shell:echo"] });
+      const bot = await makePermissionBot(
+        { name: "Nightshift", autoApprove: true, alwaysAllow: ["shell:echo"] },
+        "codex",
+      );
 
       const hook = await api("POST", "/api/webhooks", {
         name: "Nightly build",

@@ -39,6 +39,7 @@ import {
 } from "./local-inject.ts";
 import { appendNative } from "./native.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
+import { approvalSummary, type ApprovalSummary } from "./approval-summary.ts";
 
 /** Whether `claude` has been signed in.
  *
@@ -215,13 +216,18 @@ function systemEndedReply(kind: Ask["kind"]): { behavior: AskBehavior; message: 
 }
 
 /** One human-readable line for an ask — what the card subtitle shows. */
-function askSummary(ask: Ask): string {
+function askSummary(ask: Ask): ApprovalSummary {
   const input = ask.input ?? {};
-  if (typeof input.question === "string") return input.question.slice(0, 300);
-  if (typeof input.command === "string") return input.command.slice(0, 200);
-  if (typeof input.url === "string") return input.url.slice(0, 200);
-  const text = JSON.stringify(input);
-  return text === "{}" ? (ask.tool ?? "tool") : text.slice(0, 200);
+  if (typeof input.question === "string") return approvalSummary(input.question, ask.tool ?? "question");
+  if (input.command !== undefined) {
+    const reliable =
+      typeof input.command === "string" ||
+      (Array.isArray(input.command) && input.command.every((part: unknown) => typeof part === "string"));
+    return approvalSummary(input.command, ask.tool ?? "tool", reliable);
+  }
+  if (typeof input.url === "string") return approvalSummary(input.url, ask.tool ?? "tool");
+  if (Object.keys(input).length === 0) return approvalSummary(undefined, ask.tool ?? "tool");
+  return approvalSummary(input, ask.tool ?? "tool");
 }
 
 export function permissionSocketPath(threadId: string) {
@@ -664,13 +670,17 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           isActive: () => Boolean(sessions.get(threadId)?.turn),
           onAsk: (ask) => {
             const eventTurnId = sessions.get(threadId)?.turn?.turnId ?? turnId;
+            const summaryState = askSummary(ask);
             emit({
               ...base(threadId, eventTurnId),
               type: "request.opened",
               requestId: ask.id,
               requestType: ask.kind,
               tool: ask.tool,
-              summary: askSummary(ask),
+              summary: summaryState.summary,
+              summaryComplete: summaryState.summaryComplete,
+              cwd,
+              workspaceBound: false,
               approvalScope: controlsHost ? "local-computer" : undefined,
               choices: Array.isArray(ask.input?.choices) ? (ask.input.choices as string[]).slice(0, 5) : undefined,
             });

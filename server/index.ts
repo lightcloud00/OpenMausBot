@@ -793,8 +793,27 @@ bus.subscribe((event: RuntimeEvent) => {
       // and raw protected-value access is denied without showing a card.
       const asker = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
       const unattended = permission && asker && event.requestId ? isUnattended(asker.id) : false;
+      const taskBoundary = bot
+        ? store.taskByThread(bot.id, event.threadId)
+        : group
+          ? { threadId: group.threadId, cwd: group.pinnedCwd }
+          : undefined;
       const verdict = permission && asker && event.requestId
-        ? autoVerdict(asker, event.tool, event.summary, { unattended, scope: event.approvalScope })
+        ? autoVerdict(asker, event.tool, event.summary, {
+            unattended,
+            scope: event.approvalScope,
+            summaryComplete: event.summaryComplete === true,
+            taskScope:
+              taskBoundary && typeof taskBoundary.cwd === "string" && typeof event.cwd === "string"
+                ? {
+                    taskThreadId: taskBoundary.threadId,
+                    requestThreadId: event.threadId,
+                    taskCwd: taskBoundary.cwd,
+                    requestCwd: event.cwd,
+                    workspaceBound: event.workspaceBound === true,
+                  }
+                : undefined,
+          })
         : null;
       if (verdict?.behavior === "deny" && asker && event.requestId) {
         const instance = event.providerInstanceId
@@ -829,6 +848,18 @@ bus.subscribe((event: RuntimeEvent) => {
           } catch {
             // Do not fall back to an Allow/Deny card: delivery failure must
             // not weaken a deny into a prompt that can expose the value.
+            appendDecision(DATA_DIR, {
+              threadId: event.threadId,
+              requestId,
+              botId: asker.id,
+              botName: asker.name,
+              tool,
+              summary,
+              decision: "auto-denied",
+              source: verdict.source,
+              rule: `${verdict.rule ?? "sensitive-guard"}; delivery_failed`,
+              unattended: unattended || undefined,
+            });
             pushMessage({
               role: "bot",
               kind: "activity",
@@ -936,6 +967,12 @@ bus.subscribe((event: RuntimeEvent) => {
               ? "Broad irreversible destruction requires confirmation."
               : permission && verdict?.source === "local-computer-block"
                 ? "Local computer control needs explicit Auto mode."
+                : permission && verdict?.source === "credential-scope-guard"
+                  ? "CredVault execution must name one fixed non-output command."
+                  : permission && verdict?.source === "incomplete-summary"
+                    ? "The provider did not supply the complete executable request."
+                    : permission && verdict?.source === "unscoped-guard"
+                      ? "Automatic approval requires an exact task and workspace boundary."
                 : undefined,
           approvalScope: event.approvalScope,
         },

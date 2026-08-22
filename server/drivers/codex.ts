@@ -30,6 +30,7 @@ import { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from
 import { codexLocalProviderArgs } from "./local-inject.ts";
 import { augmentedPath } from "../env-path.ts";
 import { appendNative } from "./native.ts";
+import { approvalSummary } from "./approval-summary.ts";
 
 export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 
@@ -37,6 +38,8 @@ const DRIVER_KIND = "codex";
 
 export interface CodexConfig {
   cli: string;
+  /** Legacy persisted toggle. It may shape UI intent, but never bypasses
+   * app-server approvals or the workspace sandbox inside this driver. */
   fullAuto: boolean;
 }
 
@@ -68,7 +71,7 @@ function mountMcpServer(
     // Values stay in the child environment; argv contains names only so
     // credentials never appear in process listings or diagnostics.
     "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(server.env))}`,
-    "-c", `${prefix}.default_tools_approval_mode="auto"`,
+    "-c", `${prefix}.default_tools_approval_mode="prompt"`,
   );
 }
 
@@ -140,6 +143,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       const { threadId } = turn;
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
+      const turnCwd = turn.cwd ?? homedir();
 
       const env = childEnv();
       const appServerArgs = ["app-server", ...codexLocalProviderArgs(env, turn.model)];
@@ -177,12 +181,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           "-c", `${prefix}.command=${JSON.stringify(bridge.command)}`,
           "-c", `${prefix}.args=${JSON.stringify(bridge.args)}`,
           "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(bridge.env))}`,
-          "-c", `${prefix}.default_tools_approval_mode="auto"`,
+          "-c", `${prefix}.default_tools_approval_mode="prompt"`,
         );
       }
 
       const child = spawnCli(config.cli, appServerArgs, {
-        cwd: turn.cwd ?? homedir(),
+        cwd: turnCwd,
         env,
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -256,18 +260,24 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             : isQuestion
               ? "ask_user"
               : "shell";
-        if (config.fullAuto && !isQuestion) {
-          return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "approved" : "accept" } });
-        }
         const requestId = newId();
-        const summary =
-          typeof params.command === "string"
+        const rawSummary =
+          params.command !== undefined
             ? params.command
             : Array.isArray(params.questions)
               ? params.questions.map((q: any) => q.question ?? q.header).filter(Boolean).join(" · ")
               : typeof params.reason === "string"
                 ? params.reason
-                : tool;
+                : undefined;
+        const commandReliable =
+          typeof params.command === "string" ||
+          (Array.isArray(params.command) && params.command.every((part: unknown) => typeof part === "string"));
+        const summaryState = approvalSummary(
+          rawSummary,
+          tool,
+          isQuestion || commandReliable || (tool === "edit" && typeof params.reason === "string"),
+        );
+        const requestCwd = typeof params.cwd === "string" ? params.cwd : turnCwd;
         const choices = isQuestion
           ? (params.questions?.[0]?.options ?? []).map((o: any) => o.label).slice(0, 5)
           : undefined;
@@ -301,7 +311,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           requestId,
           requestType: isQuestion ? "question" : "permission",
           tool,
-          summary,
+          summary: summaryState.summary,
+          summaryComplete: summaryState.summaryComplete,
+          cwd: requestCwd,
+          workspaceBound: true,
           choices,
           approvalScope: controlsHost ? "local-computer" : undefined,
         });
@@ -463,7 +476,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           let startedModel: string | null = null;
           if (cursor) {
             try {
-              const resumed = await request("thread/resume", { threadId: cursor });
+              const resumed = await request("thread/resume", {
+                threadId: cursor,
+                cwd: turnCwd,
+                runtimeWorkspaceRoots: [turnCwd],
+                approvalPolicy: "on-request",
+                sandbox: "workspace-write",
+              });
               codexThreadId = resumed?.thread?.id ?? cursor;
             } catch {
               /* resume unsupported or thread gone — start fresh below */
@@ -472,11 +491,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           if (!codexThreadId) {
             const selection = decodeCodexSelection(turn.model);
             const started = await request("thread/start", {
-              cwd: turn.cwd ?? homedir(),
+              cwd: turnCwd,
+              runtimeWorkspaceRoots: [turnCwd],
               model: selection.model,
               ...(selection.modelProvider ? { modelProvider: selection.modelProvider } : {}),
-              sandbox: config.fullAuto ? "danger-full-access" : "workspace-write",
-              approvalPolicy: config.fullAuto ? "never" : "on-request",
+              sandbox: "workspace-write",
+              approvalPolicy: "on-request",
               ephemeral: false,
             });
             codexThreadId = started?.thread?.id ?? null;
@@ -486,6 +506,16 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           await request("turn/start", {
             threadId: codexThreadId,
             input: [{ type: "text", text: turn.system ? `${turn.system}\n\n${turn.text}` : turn.text }],
+            cwd: turnCwd,
+            runtimeWorkspaceRoots: [turnCwd],
+            approvalPolicy: "on-request",
+            sandboxPolicy: {
+              type: "workspaceWrite",
+              writableRoots: [turnCwd],
+              networkAccess: true,
+              excludeTmpdirEnvVar: false,
+              excludeSlashTmp: false,
+            },
             // Spread, not `effort: turn.effort ?? null`. Probed against
             // codex-cli 0.146.0: null is indistinguishable from an absent key
             // — both leave the thread's current effort alone, emitting no

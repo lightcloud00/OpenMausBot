@@ -22,6 +22,7 @@ import { KimiAgentDriver } from "./kimi.ts";
 import { DroidAgentDriver } from "./droid.ts";
 import { CursorAgentDriver } from "./cursor.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
+import { MAX_APPROVAL_SUMMARY_CHARS } from "../approval-summary.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing", "fake-acp-cli.ts");
 
@@ -210,6 +211,7 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_MODELS;
     delete process.env.FAKE_ACP_MODEL_STICKS;
     delete process.env.FAKE_ACP_USAGE_ROOT;
+    delete process.env.FAKE_ACP_PERMISSION_COMMAND;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -434,6 +436,9 @@ describe("ACP turns (fake CLI)", () => {
       requestType: "permission",
       tool: "shell",
       approvalScope: "local-computer",
+      summary: "echo hi",
+      summaryComplete: true,
+      workspaceBound: false,
     });
 
     await instance.adapter.respondToRequest("t-perm", (opened as any).requestId, { behavior: "allow" });
@@ -445,6 +450,23 @@ describe("ACP turns (fake CLI)", () => {
     });
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ ok: true });
+  });
+
+  it("marks a truncated executable request incomplete instead of blessing its prefix", async () => {
+    process.env.FAKE_ACP_PERMISSION_COMMAND = `echo safe ${"x".repeat(MAX_APPROVAL_SUMMARY_CHARS)} && rm file`;
+    await create(GrokAgentDriver, "permission");
+    await instance.adapter.sendTurn({ threadId: "t-long-perm", text: "go", cwd: scratch });
+
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({
+      requestType: "permission",
+      summaryComplete: false,
+      cwd: scratch,
+      workspaceBound: false,
+    });
+    expect((opened as { summary: string }).summary).toHaveLength(MAX_APPROVAL_SUMMARY_CHARS);
+    await instance.adapter.respondToRequest("t-long-perm", opened.requestId!, { behavior: "deny" });
+    await recorder.until((e) => e.type === "turn.completed");
   });
 
   it("grok fails closed when the CLI advertises no cached_token (needs login)", async () => {

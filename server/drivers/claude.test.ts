@@ -614,13 +614,17 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       conn.on("connect", resolve);
       conn.on("error", reject);
     });
-    conn.write(JSON.stringify({ t: "ask", id: "ask-1", tool: "Bash", input: { command: "rm -rf scratch" } }) + "\n");
+    const command = `echo ${"x".repeat(240)} && rm scratch`;
+    expect(command.length).toBeGreaterThan(200);
+    conn.write(JSON.stringify({ t: "ask", id: "ask-1", tool: "Bash", input: { command } }) + "\n");
 
     const opened = await recorder.until((e) => e.type === "request.opened");
     expect(opened).toMatchObject({
       requestType: "permission",
       tool: "Bash",
-      summary: "rm -rf scratch",
+      summary: command,
+      summaryComplete: true,
+      workspaceBound: false,
       requestId: "ask-1",
       approvalScope: "local-computer",
     });

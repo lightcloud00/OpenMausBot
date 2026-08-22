@@ -41,6 +41,7 @@ import { augmentedPath } from "../../env-path.ts";
 const COMPUTER_PROXY_PATH = SPAWNED_PROXIES.computer;
 import { appendNative } from "../native.ts";
 import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
+import { approvalSummary } from "../approval-summary.ts";
 
 export interface AcpConfig {
   cli: string;
@@ -365,7 +366,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
           const kind = String(toolCall.kind ?? "");
           const tool = kind === "execute" ? "shell" : kind === "edit" ? "edit" : kind || "tool";
-          const summary = String(toolCall.rawInput?.command ?? toolCall.title ?? tool).slice(0, 200);
+          const rawCommand = toolCall.rawInput?.command;
+          const commandReliable =
+            typeof rawCommand === "string" ||
+            (Array.isArray(rawCommand) && rawCommand.every((part: unknown) => typeof part === "string"));
+          const summaryState = approvalSummary(
+            rawCommand ?? toolCall.rawInput ?? toolCall.title,
+            tool,
+            kind !== "execute" || commandReliable,
+          );
           const requestId = newId();
           const finish = (behavior: string, source: "user" | "timeout" | "system" = "user") => {
             if (!asks.delete(requestId)) return;
@@ -399,7 +408,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             requestId,
             requestType: "permission",
             tool,
-            summary,
+            summary: summaryState.summary,
+            summaryComplete: summaryState.summaryComplete,
+            cwd,
+            // ACP harnesses do not expose a portable OS sandbox contract.
+            // The server may card the request, but must not auto-approve it.
+            workspaceBound: false,
             approvalScope: controlsHost ? "local-computer" : undefined,
           });
         };

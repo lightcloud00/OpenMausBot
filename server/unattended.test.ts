@@ -13,6 +13,7 @@ import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
+const FAKE_CODEX = join(SERVER_DIR, "testing", "fake-codex-app-server.ts");
 const PORT = 18800 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
 const posixOnly = describe.skipIf(process.platform === "win32");
@@ -87,6 +88,7 @@ async function waitForBotAutoApproval(botId: string, ms = 40_000) {
 posixOnly("unattended safe work keeps moving", () => {
   beforeAll(async () => {
     chmodSync(FAKE_CLI, 0o755);
+    chmodSync(FAKE_CODEX, 0o755);
     home = mkdtempSync(join(tmpdir(), "omb-unattended-"));
     mkdirSync(join(home, ".openmausbot"), { recursive: true });
     writeFileSync(
@@ -99,6 +101,14 @@ posixOnly("unattended safe work keeps moving", () => {
             driver: "grokAgent",
             environment: { FAKE_ACP_MODE: "permission" },
             config: { cli: FAKE_CLI, fullAuto: false },
+          },
+          codex: {
+            driver: "codex",
+            environment: {
+              FAKE_CODEX_MODE: "approval",
+              FAKE_CODEX_APPROVAL_COMMAND: "echo hi",
+            },
+            config: { cli: FAKE_CODEX, fullAuto: true },
           },
           // hands its work to a teammate, so the gate has to cross the hop
           delegator: {
@@ -155,7 +165,7 @@ posixOnly("unattended safe work keeps moving", () => {
         (
           await api("PATCH", `/api/bots/${bot.id}`, {
             autoApprove: true,
-            modelSelection: { instanceId: "grok", model: "fake-model" },
+            modelSelection: { instanceId: "codex", model: "gpt-fake-default" },
           })
         ).status,
       ).toBe(200);
@@ -194,7 +204,11 @@ posixOnly("unattended safe work keeps moving", () => {
       // crosses the hop for audit without turning safe work into a card.
       const created = await api("POST", "/api/bots");
       const teammate = created.body.bot;
-      await api("PATCH", `/api/bots/${teammate.id}`, { name: "Teammate", autoApprove: true });
+      await api("PATCH", `/api/bots/${teammate.id}`, {
+        name: "Teammate",
+        autoApprove: true,
+        modelSelection: { instanceId: "codex", model: "gpt-fake-default" },
+      });
 
       const delegator = (await api("POST", "/api/bots")).body.bot;
       await api("PATCH", `/api/bots/${delegator.id}`, {
@@ -242,7 +256,7 @@ posixOnly("unattended safe work keeps moving", () => {
       await api("PATCH", `/api/bots/${target.id}`, {
         name: "Answerer",
         autoApprove: true,
-        modelSelection: { instanceId: "grok", model: "fake-model" },
+        modelSelection: { instanceId: "codex", model: "gpt-fake-default" },
       });
 
       const asker = (await api("POST", "/api/bots")).body.bot;
