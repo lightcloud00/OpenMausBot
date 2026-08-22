@@ -125,8 +125,8 @@ import { readCuaConnection } from "./local-computer.ts";
 import { LocalVmIdleTimer } from "./local-vm-idle.ts";
 import { LocalVmLease, LocalVmLeasePool } from "./local-vm-lease.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
-import { createRetrievalRequest, OpenMausRetriever } from "./retrieval.ts";
-import { recordRetrievalReceipt } from "./retrieval-receipt.ts";
+import { createRetrievalRequest, OpenMausRetriever, type OpenMausRetrievalReceipt } from "./retrieval.ts";
+import { finalizeRetrievalReceipt, recordRetrievalReceipt } from "./retrieval-receipt.ts";
 import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
 import { fetchGithubTeam, fetchLibraryTeam, fetchTeamCatalog } from "./team-library.ts";
@@ -384,7 +384,7 @@ const telemetry = new TelemetryManager({
   release,
   ...(process.env.OMB_TELEMETRY_DISABLED === "1" ? { spawnSink: () => null } : {}),
 });
-const retriever = new OpenMausRetriever();
+const retriever = new OpenMausRetriever({ trustedPriorTurnRoot: DATA_DIR });
 const improvementObserver = new ObserverTaskPresenceAdapter();
 bus.subscribe((event) => telemetry.handleRuntimeEvent(event));
 
@@ -1828,6 +1828,9 @@ async function startTurn(
     let capabilityToken: string | undefined;
     let graphCancelledBeforeDispatch = false;
     let retrievalContext = "";
+    let retrievalReceipt: OpenMausRetrievalReceipt | null = null;
+    let adapterDispatchAttempted = false;
+    let retrievalReceiptFinalized = false;
     let capabilityManifest = hostMcpCatalog.manifest;
     const rejectCancelledGraphDispatch = (): void => {
       if (!opts?.graphDispatchControl || opts.graphDispatchControl.isDispatchAllowed()) return;
@@ -1898,7 +1901,7 @@ async function startTurn(
           }),
         );
         retrievalContext = outcome.context;
-        recordRetrievalReceipt(DATA_DIR, outcome.receipt);
+        retrievalReceipt = outcome.receipt;
       }
       // dweb is opt-in: without an explicit daemon URL, do not advertise
       // tools that would fail on every call or spawn an unnecessary proxy.
@@ -2091,6 +2094,7 @@ async function startTurn(
       ) {
         throw new Error("the graph workspace identity changed before provider start");
       }
+      adapterDispatchAttempted = true;
       const dispatched = await instance.adapter.sendTurn({
         threadId,
         text: turnText,
@@ -2150,6 +2154,17 @@ async function startTurn(
         turnToken: capabilityToken,
       });
       opts?.onDispatched?.(dispatched.turnId);
+      if (retrievalReceipt) {
+        retrievalReceiptFinalized = true;
+        recordRetrievalReceipt(DATA_DIR, finalizeRetrievalReceipt(retrievalReceipt, {
+          status: "accepted",
+          instanceId,
+          driverKind: instance.driverKind,
+          model,
+          turnId: dispatched.turnId,
+          context: retrievalContext,
+        }));
+      }
       // dispatched: the rewind is spent, and the old cursors are dead
       if (rewound) store.patchBot(bot.id, { rewound: false, resumeCursors: {} });
       // and this engine now owns the thread's most recent turn
@@ -2169,6 +2184,17 @@ async function startTurn(
       if (activeVpsThreads.get(bot.id) === threadId) activeVpsThreads.delete(bot.id);
       watchdog.settle(threadId);
       turnUsage.delete(threadId);
+      if (retrievalReceipt && !retrievalReceiptFinalized) {
+        retrievalReceiptFinalized = true;
+        recordRetrievalReceipt(DATA_DIR, finalizeRetrievalReceipt(retrievalReceipt, {
+          status: "failed",
+          failureStage: adapterDispatchAttempted ? "adapter-rejected" : "before-adapter",
+          instanceId,
+          driverKind: instance.driverKind,
+          model,
+          context: retrievalContext,
+        }));
+      }
       const message = e instanceof Error ? e.message : String(e);
       if (!graphCancelledBeforeDispatch) {
         store.appendMessage(threadId, {
@@ -2614,6 +2640,7 @@ async function runGroupMemberTurn(
   const latestUserText = [...store.messagesFor(group.threadId)]
     .reverse()
     .find((message) => message.role === "user" && message.kind === "text" && message.text)?.text ?? "";
+  let retrievalReceipt: OpenMausRetrievalReceipt | null = null;
   if (fullTaskScoped) {
     try {
       capabilityToken = openCapabilityTurn(bot.id, group.threadId, cwd);
@@ -2651,8 +2678,9 @@ async function runGroupMemberTurn(
       }),
     );
     retrievalContext = outcome.context;
-    recordRetrievalReceipt(DATA_DIR, outcome.receipt);
+    retrievalReceipt = outcome.receipt;
   }
+  const turnSelection = memberTurnSelection(bot.modelSelection);
   const roomSystem =
     fullTaskScoped
       ? `${system}${roleOverlayInstructions}\n${renderFullTaskScopedSystemPrompt(capabilityManifest, { retrievalContext })}`
@@ -2714,12 +2742,33 @@ async function runGroupMemberTurn(
         accessProfile: bot.accessProfile,
         autoApprove: bot.autoApprove,
         turnToken: capabilityToken,
-        ...memberTurnSelection(bot.modelSelection),
+        ...turnSelection,
+      })
+      .then((turnStart) => {
+        if (!retrievalReceipt) return;
+        recordRetrievalReceipt(DATA_DIR, finalizeRetrievalReceipt(retrievalReceipt, {
+          status: "accepted",
+          instanceId: instance.instanceId,
+          driverKind: instance.driverKind,
+          model: turnSelection.model,
+          turnId: turnStart.turnId,
+          context: retrievalContext,
+        }));
       })
       .catch((err) => {
         telemetry.failTurn(group.threadId, err);
         activeRendererTurns.delete(group.threadId);
         if (capabilityToken) closeCapabilityTurn(group.threadId, capabilityToken);
+        if (retrievalReceipt) {
+          recordRetrievalReceipt(DATA_DIR, finalizeRetrievalReceipt(retrievalReceipt, {
+            status: "failed",
+            failureStage: "adapter-rejected",
+            instanceId: instance.instanceId,
+            driverKind: instance.driverKind,
+            model: turnSelection.model,
+            context: retrievalContext,
+          }));
+        }
         store.appendMessage(group.threadId, {
           role: "bot",
           kind: "activity",
@@ -3307,11 +3356,24 @@ const server = createServer(async (req, res) => {
                     cwd: turn.cwd!,
                   }),
                 );
-                recordRetrievalReceipt(DATA_DIR, outcome.receipt);
+                const active = activeRendererTurns.get(turn.threadId);
+                let receipt = outcome.receipt;
+                if (active?.botId === turn.botId && active.turnId) {
+                  const finalized = finalizeRetrievalReceipt(outcome.receipt, {
+                    status: "accepted",
+                    instanceId: active.instanceId,
+                    driverKind: active.engine,
+                    model: active.model,
+                    turnId: active.turnId,
+                    context: outcome.context,
+                  });
+                  recordRetrievalReceipt(DATA_DIR, finalized);
+                  receipt = finalized;
+                }
                 return {
                   schema: "openmaus.retrieval-context.v1" as const,
                   context: outcome.context,
-                  receipt: outcome.receipt,
+                  receipt,
                 };
               },
             ),

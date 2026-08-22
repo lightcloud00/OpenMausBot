@@ -5,10 +5,26 @@ import { join } from "node:path";
 import { writeFileAtomic } from "./atomic.ts";
 import type { OpenMausRetrievalReceipt } from "./retrieval.ts";
 
+export type FinalizedOpenMausRetrievalReceipt = Omit<OpenMausRetrievalReceipt, "native_dispatch_proof"> & {
+  native_dispatch_proof: NonNullable<OpenMausRetrievalReceipt["native_dispatch_proof"]>;
+};
+
+interface RetrievalDispatchBinding {
+  instanceId: string;
+  driverKind: string;
+  model: string;
+  context: string;
+}
+
+export type RetrievalDispatchOutcome = RetrievalDispatchBinding & (
+  | { status: "accepted"; turnId: string }
+  | { status: "failed"; failureStage: "before-adapter" | "adapter-rejected" }
+);
+
 export interface StoredRetrievalReceipt {
   schema: "openmaus.retrieval-receipt-record.v1";
   recorded_at: string;
-  receipt: OpenMausRetrievalReceipt;
+  receipt: FinalizedOpenMausRetrievalReceipt;
 }
 
 function identityDigest(receipt: OpenMausRetrievalReceipt): string {
@@ -26,12 +42,42 @@ export function retrievalReceiptPath(dataDir: string, receipt: OpenMausRetrieval
   return join(dataDir, "retrieval-receipts", `${identityDigest(receipt)}.json`);
 }
 
+/** Bind a retrieval outcome to the exact native adapter dispatch without
+ * retaining the context itself. The session identity comes from the request
+ * receipt so callers cannot accidentally bind one bot's evidence to another
+ * bot's turn. */
+export function finalizeRetrievalReceipt(
+  receipt: OpenMausRetrievalReceipt,
+  dispatch: RetrievalDispatchOutcome,
+): FinalizedOpenMausRetrievalReceipt {
+  const session = receipt.native_session_proof;
+  const contextBytes = Buffer.byteLength(dispatch.context, "utf8");
+  const contextSha256 = `sha256:${createHash("sha256").update(dispatch.context, "utf8").digest("hex")}`;
+  return {
+    ...receipt,
+    native_session_proof: { ...session },
+    native_dispatch_proof: {
+      status: dispatch.status,
+      botId: session.botId,
+      threadId: session.threadId,
+      taskId: session.taskId,
+      instanceId: dispatch.instanceId,
+      driverKind: dispatch.driverKind,
+      model: dispatch.model,
+      turnId: dispatch.status === "accepted" ? dispatch.turnId : null,
+      contextBytes,
+      contextSha256,
+      failureStage: dispatch.status === "failed" ? dispatch.failureStage : null,
+    },
+  };
+}
+
 /** Persist only bounded receipt metadata. Retrieval queries and excerpts are
  * deliberately absent, and an unavailable receipt sink must never block a
  * model turn. */
 export function recordRetrievalReceipt(
   dataDir: string,
-  receipt: OpenMausRetrievalReceipt,
+  receipt: FinalizedOpenMausRetrievalReceipt,
   now: Date = new Date(),
 ): string | null {
   try {
@@ -51,6 +97,7 @@ export function recordRetrievalReceipt(
         skip_reason: receipt.skip_reason,
         accepted_hits: receipt.accepted_hits,
         native_session_proof: { ...receipt.native_session_proof },
+        native_dispatch_proof: { ...receipt.native_dispatch_proof },
       },
     };
     writeFileAtomic(path, JSON.stringify(record, null, 2), { mode: 0o600 });

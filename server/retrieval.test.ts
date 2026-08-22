@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -13,11 +13,23 @@ import {
   type OpenMausRetrievalRequest,
 } from "./retrieval.ts";
 
-const digest = (value: string): string =>
-  `sha256:${createHash("sha256").update(value).digest("hex")}`;
+const normalizedFleetText = (value: string): string => {
+  const lines = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  return `${lines.map((line) => line.trimEnd()).join("\n").trim()}\n`;
+};
 
-function fixtureFile(content = "Verified OpenMausBot source context") {
-  const root = mkdtempSync(join(tmpdir(), "openmaus-retrieval-"));
+const digest = (value: string): string =>
+  `sha256:${createHash("sha256").update(normalizedFleetText(value)).digest("hex")}`;
+
+const TEST_WORKSPACE_ROOT = mkdtempSync(join(tmpdir(), "openmaus-retrieval-workspace-"));
+mkdirSync(join(TEST_WORKSPACE_ROOT, ".git"));
+writeFileSync(
+  join(TEST_WORKSPACE_ROOT, ".git", "config"),
+  "[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = https://github.com/acme/test-workspace.git\n",
+);
+
+function fixtureFile(content = "Verified OpenMausBot source context", parent = TEST_WORKSPACE_ROOT) {
+  const root = mkdtempSync(join(parent, "source-"));
   const path = join(root, "source.md");
   writeFileSync(path, content);
   return { root, path, content, hash: digest(content) };
@@ -30,7 +42,7 @@ function request(overrides: Partial<OpenMausRetrievalRequest> = {}): OpenMausRet
       threadId: "thread-ada",
       taskId: "thread-ada",
       query: "Find the prior OpenMausBot project decision in source",
-      cwd: process.cwd(),
+      cwd: TEST_WORKSPACE_ROOT,
     }),
     ...overrides,
   };
@@ -55,6 +67,9 @@ function evidence(req: OpenMausRetrievalRequest, file = fixtureFile(), hit: Reco
       cwd: req.cwd,
       surface: "openmausbot",
       session: retrievalSession(req),
+      botId: req.botId,
+      threadId: req.threadId,
+      taskId: req.taskId,
       project_hint: null,
       active_only: true,
       hit_limit: 5,
@@ -81,7 +96,8 @@ function evidence(req: OpenMausRetrievalRequest, file = fixtureFile(), hit: Reco
     answerability: "answerable",
     truth: "working_set",
     windows_served: false,
-    manifest_digest: "sha256:" + "a".repeat(64),
+    windows_active_generation: null,
+    local_manifest_digest: "sha256:" + "a".repeat(64),
     hits: [{
       canonical_path: file.path,
       content_hash: file.hash,
@@ -142,6 +158,9 @@ describe("OpenMausRetriever", () => {
       { ...evidence(req, file), content_trust: "trusted" },
       { ...evidence(req, file), hits: [{ ...evidence(req, file).hits[0], content_trust: "trusted" }] },
       { ...evidence(req, file), request: { ...evidence(req, file).request, session: "openmausbot:other:thread:task" } },
+      { ...evidence(req, file), request: { ...evidence(req, file).request, botId: "other-bot" } },
+      { ...evidence(req, file), request: { ...evidence(req, file).request, threadId: "other-thread" } },
+      { ...evidence(req, file), request: { ...evidence(req, file).request, taskId: "other-task" } },
     ];
     for (const variant of variants) {
       const result = await new OpenMausRetriever({ sourceRetrieve: async () => variant }).retrieve("task-scoped", req);
@@ -150,9 +169,87 @@ describe("OpenMausRetriever", () => {
     }
   });
 
+  it("uses Fleet's normalized-text hash and normalized multi-line snippet contract", async () => {
+    const content = "\r\n# Retrieval decision  \r\nKeep Windows optional.   \r\nVerify every Mac source hit.\t \r\n\r\n";
+    const file = fixtureFile(content);
+    const req = request();
+    const liveEvidence = evidence(req, file, {
+      snippet: "Keep Windows optional.\n  Verify every Mac source hit.",
+    });
+
+    const accepted = await new OpenMausRetriever({ sourceRetrieve: async () => liveEvidence })
+      .retrieve("task-scoped", req);
+
+    expect(file.hash).toBe(digest("# Retrieval decision\nKeep Windows optional.\nVerify every Mac source hit.\n"));
+    expect(accepted.receipt).toMatchObject({ accepted_hits: 1, skip_reason: null });
+    expect(accepted.context).toContain("Keep Windows optional.");
+    expect(accepted.context).toContain("Verify every Mac source hit.");
+
+    const rawByteHash = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+    const rawHashClaim = evidence(req, file);
+    rawHashClaim.hits[0]!.content_hash = rawByteHash;
+    rawHashClaim.hits[0]!.current_source_verification.content_hash = rawByteHash;
+    const rejected = await new OpenMausRetriever({ sourceRetrieve: async () => rawHashClaim })
+      .retrieve("task-scoped", req);
+    expect(rejected).toMatchObject({ context: "", receipt: { accepted_hits: 0 } });
+  });
+
+  it("confines ordinary source hits to the server-derived cwd repository", async () => {
+    const req = request();
+    const validSource = fixtureFile("Valid source from the requested repository");
+    const valid = await new OpenMausRetriever({ sourceRetrieve: async () => evidence(req, validSource) })
+      .retrieve("task-scoped", req);
+    expect(valid.context).toContain("Valid source from the requested repository");
+
+    const unrelatedRepository = mkdtempSync(join(tmpdir(), "openmaus-unrelated-repository-"));
+    mkdirSync(join(unrelatedRepository, ".git"));
+    const wrongRepositorySource = fixtureFile("Unrelated repository source", unrelatedRepository);
+    const rejected = await new OpenMausRetriever({
+      sourceRetrieve: async () => evidence(req, wrongRepositorySource),
+    }).retrieve("task-scoped", req);
+    expect(rejected).toMatchObject({ context: "", receipt: { accepted_hits: 0, skip_reason: "no-verified-hits" } });
+
+    const nonGitWorkspace = mkdtempSync(join(tmpdir(), "openmaus-non-git-workspace-"));
+    const nonGitSource = fixtureFile("Valid source from an exact non-git cwd", nonGitWorkspace);
+    const nonGitRequest = request({ cwd: nonGitWorkspace, taskId: "non-git-task" });
+    const fallbackAccepted = await new OpenMausRetriever({
+      sourceRetrieve: async () => evidence(nonGitRequest, nonGitSource),
+    }).retrieve("task-scoped", nonGitRequest);
+    expect(fallbackAccepted.context).toContain("Valid source from an exact non-git cwd");
+  });
+
+  it("admits only the exact cwd repository's server-derived Fleet snapshot alias", async () => {
+    const req = request({ taskId: "snapshot-task" });
+    const snapshotRoot = mkdtempSync(join(tmpdir(), "openmaus-fleet-snapshots-"));
+    const generation = "a".repeat(40);
+    const sameRepositoryGeneration = join(snapshotRoot, "acme__current-repo", generation);
+    mkdirSync(sameRepositoryGeneration, { recursive: true });
+    const sameRepositorySource = fixtureFile("Canonical same-repository snapshot source", sameRepositoryGeneration);
+    const sameRepository = await new OpenMausRetriever({
+      sourceRetrieve: async () => evidence(req, sameRepositorySource),
+      trustedSnapshotRoot: snapshotRoot,
+      readRepositoryOrigin: async () => "https://github.com/acme/current-repo.git",
+    }).retrieve("task-scoped", req);
+    expect(sameRepository.context).toContain("Canonical same-repository snapshot source");
+
+    const differentRepositoryGeneration = join(snapshotRoot, "acme__different-repo", generation);
+    mkdirSync(differentRepositoryGeneration, { recursive: true });
+    const differentRepositorySource = fixtureFile("Different repository snapshot source", differentRepositoryGeneration);
+    const differentRepository = await new OpenMausRetriever({
+      sourceRetrieve: async () => evidence(req, differentRepositorySource),
+      trustedSnapshotRoot: snapshotRoot,
+      readRepositoryOrigin: async () => "git@github.com:acme/current-repo.git",
+    }).retrieve("task-scoped", req);
+    expect(differentRepository).toMatchObject({
+      context: "",
+      receipt: { accepted_hits: 0, skip_reason: "no-verified-hits" },
+    });
+  });
+
   it("rejects an in-root symlink that resolves outside the verified repository", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openmaus-retrieval-root-"));
-    const outside = fixtureFile("OUTSIDE SECRET SOURCE");
+    const root = mkdtempSync(join(TEST_WORKSPACE_ROOT, "symlink-root-"));
+    const outsideRoot = mkdtempSync(join(tmpdir(), "openmaus-retrieval-outside-"));
+    const outside = fixtureFile("OUTSIDE SECRET SOURCE", outsideRoot);
     const linkedPath = join(root, "linked-secret.md");
     writeFileSync(linkedPath, outside.content);
     const linked = { root, path: linkedPath, content: outside.content, hash: outside.hash };
@@ -197,6 +294,46 @@ describe("OpenMausRetriever", () => {
     });
     const accepted = await new OpenMausRetriever({ sourceRetrieve: async () => exact }).retrieve("task-scoped", req);
     expect(accepted.context).toContain("Exact prior turn source");
+
+    const journalRoot = mkdtempSync(join(tmpdir(), "openmaus-retrieval-data-dir-"));
+    const journalContent = "Exact task journal source";
+    const journalPath = join(journalRoot, "journal.md");
+    writeFileSync(journalPath, journalContent);
+    const journal = {
+      root: journalRoot, path: journalPath, content: journalContent,
+      hash: digest(journalContent),
+    };
+    const unscopedJournal = await new OpenMausRetriever({
+      sourceRetrieve: async () => evidence(req, journal),
+      trustedPriorTurnRoot: journalRoot,
+    }).retrieve("task-scoped", req);
+    expect(unscopedJournal.context).toBe("");
+
+    const arbitraryRoot = mkdtempSync(join(tmpdir(), "openmaus-retrieval-arbitrary-"));
+    const arbitraryJournalContent = "Exact identity outside the trusted data directory";
+    const arbitraryJournalPath = join(arbitraryRoot, "journal.md");
+    writeFileSync(arbitraryJournalPath, arbitraryJournalContent);
+    const arbitraryJournal = {
+      root: arbitraryRoot,
+      path: arbitraryJournalPath,
+      content: arbitraryJournalContent,
+      hash: digest(arbitraryJournalContent),
+    };
+    const exactButArbitrary = await new OpenMausRetriever({
+      sourceRetrieve: async () => evidence(req, arbitraryJournal, {
+        kind: "journal", botId: req.botId, threadId: req.threadId, taskId: req.taskId,
+      }),
+      trustedPriorTurnRoot: journalRoot,
+    }).retrieve("task-scoped", req);
+    expect(exactButArbitrary.context).toBe("");
+
+    const exactJournal = await new OpenMausRetriever({
+      sourceRetrieve: async () => evidence(req, journal, {
+        kind: "journal", botId: req.botId, threadId: req.threadId, taskId: req.taskId,
+      }),
+      trustedPriorTurnRoot: journalRoot,
+    }).retrieve("task-scoped", req);
+    expect(exactJournal.context).toContain("Exact task journal source");
   });
 
   it("fails open on timeout and no-answer evidence without leaking an in-flight request", async () => {
@@ -220,6 +357,59 @@ describe("OpenMausRetriever", () => {
     expect(noAnswer.context).toBe("");
     expect(noAnswer.receipt.skip_reason).toBe("insufficient_evidence");
     expect(retriever.activeRequests()).toBe(0);
+  });
+
+  it("applies the retrieval ceiling to current-source readback and isolates late completion", async () => {
+    const req = request({ taskId: "slow-readback-task" });
+    const file = fixtureFile("Verified source whose current-byte readback is delayed");
+    const retriever = new OpenMausRetriever({
+      sourceRetrieve: async () => evidence(req, file),
+      readSource: async () => new Promise<Buffer>((resolvePromise) => {
+        setTimeout(() => resolvePromise(Buffer.from(file.content)), 25);
+      }),
+      sourceTimeoutMs: 5,
+    });
+
+    const timed = await retriever.retrieve("task-scoped", req);
+    expect(timed).toMatchObject({
+      context: "",
+      receipt: { skip_reason: "retrieval-unavailable", accepted_hits: 0, windows_served: false },
+    });
+    expect(retriever.activeRequests()).toBe(0);
+
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 35));
+    expect(timed).toMatchObject({
+      context: "",
+      receipt: { skip_reason: "retrieval-unavailable", accepted_hits: 0, windows_served: false },
+    });
+  });
+
+  it("accepts an empty live insufficient-evidence response with no verified source", async () => {
+    const req = request();
+    const emptyLiveEvidence = {
+      ...evidence(req),
+      current_source_verified: false,
+      answerability: "insufficient_evidence",
+      hits: [],
+    };
+    const accepted = await new OpenMausRetriever({ sourceRetrieve: async () => emptyLiveEvidence })
+      .retrieve("task-scoped", req);
+    expect(accepted).toMatchObject({
+      context: "",
+      receipt: { accepted_hits: 0, skip_reason: "insufficient_evidence", windows_served: false },
+    });
+
+    const file = fixtureFile();
+    const hitWithoutTopLevelVerification = {
+      ...evidence(req, file),
+      current_source_verified: false,
+    };
+    const rejected = await new OpenMausRetriever({ sourceRetrieve: async () => hitWithoutTopLevelVerification })
+      .retrieve("task-scoped", req);
+    expect(rejected).toMatchObject({
+      context: "",
+      receipt: { accepted_hits: 0, skip_reason: "invalid-evidence", windows_served: false },
+    });
   });
 
   it("claims Windows service only for a digest-bound generation with a Mac-verified hit", async () => {
