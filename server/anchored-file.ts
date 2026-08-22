@@ -299,7 +299,12 @@ export async function writeAnchoredFile(
       try { finish(undefined, parseResponse(stdout, code === 0)); }
       catch (error) { finish(error as Error); }
     });
-    hooks.beforeStdinWrite?.(child.stdin);
-    child.stdin.end(request.serialized);
+    try {
+      hooks.beforeStdinWrite?.(child.stdin);
+      child.stdin.end(request.serialized);
+    } catch {
+      child.stdin.destroy();
+      finish(new AnchoredFileError("anchored file worker stdin failed closed"));
+    }
   });
 }

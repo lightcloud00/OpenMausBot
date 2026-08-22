@@ -118,4 +118,21 @@ describe("anchored file writes", () => {
     })).rejects.toThrow(/stdin failed closed/);
     expect(() => readFileSync(path)).toThrow();
   });
+
+  it("closes the worker stdin when a pre-write hook throws", async () => {
+    const root = directory();
+    const parent = lstatSync(root);
+    const path = join(root, "hook-failure.txt");
+
+    await expect(writeAnchoredFile({
+      path,
+      parent: { dev: parent.dev, ino: parent.ino },
+      mode: "create",
+      content: "must-not-land",
+      maximumBytes: 1024,
+    }, {
+      beforeStdinWrite: () => { throw new Error("forced hook failure"); },
+    })).rejects.toThrow(/stdin failed closed/);
+    expect(() => readFileSync(path)).toThrow();
+  });
 });
