@@ -466,6 +466,25 @@ async function pathWithinRoots(
   }
 }
 
+async function pathMatchesExactFiles(
+  path: string,
+  files: string[],
+  realpathSource: (path: string) => Promise<string>,
+): Promise<boolean> {
+  if (!isAbsolute(path) || files.some((file) => !isAbsolute(file))) return false;
+  const candidate = resolve(path);
+  if (!files.some((file) => resolve(file) === candidate)) return false;
+  try {
+    const [realCandidate, realParent] = await Promise.all([
+      realpathSource(candidate),
+      realpathSource(dirname(candidate)),
+    ]);
+    return dirname(realCandidate) === realParent;
+  } catch {
+    return false;
+  }
+}
+
 async function pathWithinSnapshotNamespace(
   path: string,
   snapshotRoot: string,
@@ -533,7 +552,8 @@ async function acceptHit(
   request: OpenMausRetrievalRequest,
   options: Required<Pick<OpenMausRetrieverOptions, "readSource" | "statSource" | "realpathSource">> & {
     workspaceRoot: string;
-    trustedPriorTurnBoundaries: string[];
+    trustedPriorTurnRoot: string | null;
+    trustedPriorTurnPaths: string[];
     trustedSnapshotRoot: string | null;
     repositoryIdentity: RepositoryIdentity | null;
   },
@@ -555,9 +575,14 @@ async function acceptHit(
   const priorTurn = isPriorTurnHit(hit, sourceTruth, canonicalPath);
   const serverOwnedRoots = [
     options.workspaceRoot,
-    ...(priorTurn ? options.trustedPriorTurnBoundaries : []),
+    ...(priorTurn && options.trustedPriorTurnRoot ? [options.trustedPriorTurnRoot] : []),
   ];
   const isWithinServerRoots = await pathWithinRoots(canonicalPath, serverOwnedRoots, options.realpathSource);
+  const isExactPriorTurnPath = priorTurn && await pathMatchesExactFiles(
+    canonicalPath,
+    options.trustedPriorTurnPaths,
+    options.realpathSource,
+  );
   const isSameRepositorySnapshot = !priorTurn &&
     options.trustedSnapshotRoot !== null && options.repositoryIdentity !== null &&
     await pathWithinSnapshotNamespace(
@@ -566,7 +591,7 @@ async function acceptHit(
       options.repositoryIdentity,
       options.realpathSource,
     );
-  if (!isWithinServerRoots && !isSameRepositorySnapshot) return null;
+  if (!isWithinServerRoots && !isExactPriorTurnPath && !isSameRepositorySnapshot) return null;
   if (
     verification.verified !== true ||
     verification.canonical_path !== canonicalPath ||
@@ -748,19 +773,17 @@ export class OpenMausRetriever {
 
         const candidates = evidence.hits.slice(0, RETRIEVAL_HIT_LIMIT);
         const repositoryIdentity = await repositoryIdentityPromise;
-        const trustedPriorTurnBoundaries = [
-          ...(this.trustedPriorTurnRoot ? [this.trustedPriorTurnRoot] : []),
-          ...this.trustedPriorTurnPaths(request)
-            .filter((path) => isAbsolute(path))
-            .map((path) => resolve(path)),
-        ];
+        const trustedPriorTurnPaths = this.trustedPriorTurnPaths(request)
+          .filter((path) => isAbsolute(path))
+          .map((path) => resolve(path));
         const verified = (await Promise.all(
           candidates.map((hit) => acceptHit(hit, request, {
             readSource: this.readSource,
             statSource: this.statSource,
             realpathSource: this.realpathSource,
             workspaceRoot: workspaceBoundary.root,
-            trustedPriorTurnBoundaries,
+            trustedPriorTurnRoot: this.trustedPriorTurnRoot,
+            trustedPriorTurnPaths,
             trustedSnapshotRoot: this.trustedSnapshotRoot,
             repositoryIdentity,
           })),

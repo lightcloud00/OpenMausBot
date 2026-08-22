@@ -383,6 +383,24 @@ describe("OpenMausRetriever", () => {
       context: "",
       receipt: { accepted_hits: 0, skip_reason: "no-verified-hits" },
     });
+
+    const redirectedFile = {
+      root: dataRoot,
+      path: eventPath,
+      content: configContent,
+      hash: digest(configContent),
+    };
+    const redirected = await new OpenMausRetriever({
+      sourceRetrieve: async () => evidence(req, redirectedFile, exactIdentity),
+      trustedPriorTurnPaths: () => [eventPath],
+      realpathSource: async (path) => path === eventPath ? configPath : path,
+      readSource: async () => Buffer.from(configContent),
+      statSource: async () => ({ isFile: () => true, size: Buffer.byteLength(configContent) }),
+    }).retrieve("task-scoped", req);
+    expect(redirected).toMatchObject({
+      context: "",
+      receipt: { accepted_hits: 0, skip_reason: "no-verified-hits" },
+    });
   });
 
   it("fails open on timeout and no-answer evidence without leaking an in-flight request", async () => {
