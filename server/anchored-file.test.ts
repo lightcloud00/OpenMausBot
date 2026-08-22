@@ -101,4 +101,21 @@ describe("anchored file writes", () => {
     })).rejects.toThrow(/content changed/);
     expect(readFileSync(path, "utf8")).toBe("current");
   });
+
+  it("fails closed when the worker stdin rejects the bounded request", async () => {
+    const root = directory();
+    const parent = lstatSync(root);
+    const path = join(root, "must-not-land.txt");
+
+    await expect(writeAnchoredFile({
+      path,
+      parent: { dev: parent.dev, ino: parent.ino },
+      mode: "create",
+      content: "must-not-land",
+      maximumBytes: 1024,
+    }, {
+      beforeStdinWrite: (stdin) => stdin.destroy(new Error("forced stdin failure")),
+    })).rejects.toThrow(/stdin failed closed/);
+    expect(() => readFileSync(path)).toThrow();
+  });
 });

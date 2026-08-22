@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { basename, dirname, resolve } from "node:path";
+import type { Writable } from "node:stream";
 
 const MAX_WORKER_OUTPUT_BYTES = 32 * 1024;
 
@@ -264,7 +265,10 @@ export function writeAnchoredFileSync(
 
 export async function writeAnchoredFile(
   input: AnchoredFileWriteInput,
-  hooks: { beforeSpawn?: () => void | Promise<void> } = {},
+  hooks: {
+    beforeSpawn?: () => void | Promise<void>;
+    beforeStdinWrite?: (stdin: Writable) => void;
+  } = {},
 ): Promise<AnchoredFileIdentity> {
   const request = requestFor(input);
   await hooks.beforeSpawn?.();
@@ -287,6 +291,7 @@ export async function writeAnchoredFile(
     // termination between truncate and rollback could turn a rejected write
     // into persistent partial content.
     child.once("error", () => finish(new AnchoredFileError("anchored file worker could not start")));
+    child.stdin.once("error", () => finish(new AnchoredFileError("anchored file worker stdin failed closed")));
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString("utf8");
     });
@@ -294,6 +299,7 @@ export async function writeAnchoredFile(
       try { finish(undefined, parseResponse(stdout, code === 0)); }
       catch (error) { finish(error as Error); }
     });
+    hooks.beforeStdinWrite?.(child.stdin);
     child.stdin.end(request.serialized);
   });
 }

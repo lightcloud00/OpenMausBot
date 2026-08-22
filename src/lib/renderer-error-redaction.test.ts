@@ -20,4 +20,24 @@ describe("renderer error redaction", () => {
   it("bounds renderer error text", () => {
     expect(redactRendererErrorText("x".repeat(20_000))).toHaveLength(8_000);
   });
+
+  it("redacts camel-case identifiers and common credential query parameters", () => {
+    const value = [
+      "userId=customer-camel accountId=account-camel",
+      "https://example.test/fail?token=token-value&api_key=underscore-value&apiKey=camel-value",
+    ].join("\n");
+    const redacted = redactRendererErrorText(value)!;
+
+    for (const secret of [
+      "customer-camel",
+      "account-camel",
+      "token-value",
+      "underscore-value",
+      "camel-value",
+    ]) {
+      expect(redacted).not.toContain(secret);
+    }
+    expect(redacted.match(/redacted-id/g)).toHaveLength(2);
+    expect(redacted.match(/redacted-value/g)).toHaveLength(3);
+  });
 });
