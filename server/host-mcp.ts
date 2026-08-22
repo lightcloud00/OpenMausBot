@@ -11,6 +11,7 @@ import {
 import { augmentedPath } from "./env-path.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { BUILTIN_CAPABILITY_TOOLS } from "./builtin-capability-tools.ts";
+import { FLEET_CAPABILITY_TOOL_DEFINITIONS } from "./fleet-capabilities.ts";
 
 export type HostMcpServer =
   | { type: "builtin"; family?: "host" | "fleet" }
@@ -37,12 +38,6 @@ const FLEET_BRIDGE_CODEX_DUPLICATE = /^aos-fleet-bridge-codex(?:-\d+)?$/;
 const FLEET_BRIDGE_SCRIPT = /(?:^|[\\/])aos_fleet_bridge_mcp\.py$/;
 const OPENMAUS_SURFACE = "openmausbot";
 const BRIDGE_VALUE_FLAGS = new Set(["--surface", "--state-dir", "--ledger", "--ledger-timeout", "--inbox"]);
-const FLEET_BUILTIN_TOOLS = [
-  "search_capabilities",
-  "suggest_capabilities",
-  "select_capability",
-  "suggest_role_overlays",
-] as const;
 
 function safeName(value: unknown): string | null {
   return typeof value === "string" && NAME.test(value) && !BLOCKED_SERVER.test(value) ? value : null;
@@ -388,7 +383,7 @@ export function loadHostMcpCatalogs(options: HostMcpCatalogOptions = {}): {
   const fullInventory = Object.entries(fullServers).flatMap(([name, server]) =>
     server.type === "builtin"
       ? server.family === "fleet"
-        ? FLEET_BUILTIN_TOOLS.map((tool) => `${name}:${tool}`)
+        ? FLEET_CAPABILITY_TOOL_DEFINITIONS.map((tool) => `${name}:${tool.name}`)
         : BUILTIN_CAPABILITY_TOOLS.map((tool) => `${name}:${tool.name}`)
       : [name],
   );

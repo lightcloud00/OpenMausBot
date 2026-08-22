@@ -48,6 +48,16 @@ function fixture() {
 }
 
 describe("fleet capability metadata index", () => {
+  it("returns one bounded error when the index is absent", () => {
+    const missing = join(tmpdir(), "omb-fleet-caps-missing", "capabilities.v1.json");
+    expect(() => new FleetCapabilityIndex(missing).summary()).toThrow("fleet capability index is unavailable or oversized");
+    try {
+      new FleetCapabilityIndex(missing).summary();
+    } catch (error) {
+      expect(String(error)).not.toContain(missing);
+    }
+  });
+
   it("loads only bounded metadata for search and summary", () => {
     const index = new FleetCapabilityIndex(fixture());
     expect(index.summary()).toMatchObject({ recordCount: 3, policy: "metadata-only-and-task-lazy" });

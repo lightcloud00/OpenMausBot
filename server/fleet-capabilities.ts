@@ -5,6 +5,50 @@ import { isAbsolute, join, resolve } from "node:path";
 
 import { suggestRoleOverlays } from "./role-overlays.ts";
 
+/** One canonical declaration shared by host inventory and runtime dispatch. */
+export const FLEET_CAPABILITY_TOOL_DEFINITIONS = [
+  {
+    name: "search_capabilities",
+    description: "Search the metadata-only fleet index for MCPs, skills, scripts, and other capabilities without loading their schemas or instructions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        kind: { type: "string" },
+        surface: { type: "string" },
+        limit: { type: "number", minimum: 1, maximum: 25 },
+      },
+    },
+  },
+  {
+    name: "suggest_capabilities",
+    description: "Suggest a small task-relevant set of fleet capability metadata and advisory role overlays.",
+    inputSchema: {
+      type: "object",
+      properties: { task: { type: "string" }, limit: { type: "number", minimum: 1, maximum: 25 } },
+      required: ["task"],
+    },
+  },
+  {
+    name: "select_capability",
+    description: "Select one exact fleet capability and return its safe lazy route, if this runtime can verify one.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+    },
+  },
+  {
+    name: "suggest_role_overlays",
+    description: "Suggest non-privileged portfolio specialist roles for the current task.",
+    inputSchema: {
+      type: "object",
+      properties: { task: { type: "string" }, limit: { type: "number", minimum: 1, maximum: 5 } },
+      required: ["task"],
+    },
+  },
+] as const;
+
 const DEFAULT_INDEX = join(
   homedir(),
   ".local",
@@ -140,7 +184,12 @@ export class FleetCapabilityIndex {
   }
 
   private catalog(): LoadedCatalog {
-    const info = statSync(this.path);
+    let info;
+    try {
+      info = statSync(this.path);
+    } catch {
+      throw new Error("fleet capability index is unavailable or oversized");
+    }
     if (!info.isFile() || info.size <= 0 || info.size > MAX_INDEX_BYTES) {
       throw new Error("fleet capability index is unavailable or oversized");
     }

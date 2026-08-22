@@ -1,11 +1,11 @@
 import { execFile } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import { augmentedPath } from "./env-path.ts";
 
-const DEFAULT_GOAL_CONTROL = "/Users/gus/Desktop/Claudecode/scripts/aos_goal_control.py";
+const DEFAULT_GOAL_CONTROL = join(homedir(), ".local", "lib", "aos", "fleet-memory", "aos_goal_control.py");
 const MAX_OUTPUT_BYTES = 256 * 1024;
 const COMMAND_TIMEOUT_MS = 15_000;
 
@@ -104,8 +104,15 @@ function minimalEnvironment(): NodeJS.ProcessEnv {
 
 function defaultRunner(scriptPath: string): Runner {
   return (args, options) => new Promise((resolveResult) => {
+    let settled = false;
+    const finish = (result: ProcessResult) => {
+      if (settled) return;
+      settled = true;
+      resolveResult(result);
+    };
+    const python = process.env.OMB_GOAL_PYTHON_PATH?.trim() || (process.platform === "win32" ? "python.exe" : "python3");
     const child = execFile(
-      "/usr/bin/python3",
+      python,
       [scriptPath, ...args],
       {
         cwd: options.cwd,
@@ -116,7 +123,7 @@ function defaultRunner(scriptPath: string): Runner {
         windowsHide: true,
       },
       (error, stdout, stderr) => {
-        resolveResult({
+        finish({
           exitCode: typeof (error as { code?: unknown } | null)?.code === "number"
             ? (error as { code: number }).code
             : error
@@ -127,6 +134,11 @@ function defaultRunner(scriptPath: string): Runner {
         });
       },
     );
+    child.stdin?.on("error", () => finish({
+      exitCode: 1,
+      stdout: "",
+      stderr: "goal control input failed",
+    }));
     if (options.input !== undefined) child.stdin?.end(options.input);
   });
 }
@@ -165,7 +177,7 @@ export class GoalCommandAdapter {
   private readonly run: Runner;
 
   constructor(options: { scriptPath?: string; run?: Runner } = {}) {
-    const scriptPath = options.scriptPath ?? process.env.OMB_GOAL_CONTROL_PATH ?? DEFAULT_GOAL_CONTROL;
+    const scriptPath = options.scriptPath ?? process.env.OMB_GOAL_CONTROL_PATH ?? process.env.AOS_GOAL_CONTROL_PATH ?? DEFAULT_GOAL_CONTROL;
     this.run = options.run ?? defaultRunner(scriptPath);
   }
 

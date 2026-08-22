@@ -65,4 +65,13 @@ describe("OpenMaus /goal adapter", () => {
     const outcome = await adapter.execute("/goal status", context);
     expect(outcome?.response).toBe("No shared goal is active.");
   });
+
+  it("fails missing portable goal controls without leaking paths or crashing on stdin", async () => {
+    const missing = join(tmpdir(), "omb-missing-goal-control", "aos_goal_control.py");
+    const adapter = new GoalCommandAdapter({ scriptPath: missing });
+    const outcome = await adapter.execute("/goal Keep the bounded objective", context);
+    expect(outcome).toMatchObject({ handled: true, ok: false, status: 409 });
+    expect(outcome?.response).not.toContain(missing);
+    expect(outcome?.response).not.toContain("/Users/gus/Desktop");
+  });
 });
