@@ -13,7 +13,7 @@ let recorder: EventRecorder | null = null;
 const requests: Array<{ url: string; body: JsonValue | null }> = [];
 const chatRequestSchema = z.object({ model: z.string() }).passthrough();
 
-async function fakeHost(): Promise<string> {
+async function fakeHost(finalFrameWithoutNewline = false): Promise<string> {
   server = createServer((request, response) => {
     let raw = "";
     request.on("data", (chunk) => raw += chunk);
@@ -30,6 +30,10 @@ async function fakeHost(): Promise<string> {
       });
       if (request.url === "/v1/chat/completions") {
         response.writeHead(200, { "content-type": "text/event-stream" });
+        if (finalFrameWithoutNewline) {
+          response.end(`data: ${JSON.stringify({ choices: [{ delta: { content: "tail" } }] })}`);
+          return;
+        }
         response.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "hello" } }] })}\n\n`);
         response.end("data: [DONE]\n\n");
         return;
@@ -50,7 +54,12 @@ afterEach(async () => {
   recorder = null;
   await instance?.dispose();
   instance = null;
-  await new Promise<void>((resolve) => server ? server.close(() => resolve()) : resolve());
+  const running = server;
+  await new Promise<void>((resolve) => {
+    if (!running) return resolve();
+    running.closeIdleConnections();
+    running.close(() => resolve());
+  });
   server = null;
   requests.length = 0;
 });
@@ -84,5 +93,23 @@ describe("fleet local selectors", () => {
     const chatRequest = requests.find((request) => request.url === "/v1/chat/completions");
     expect(chatRequestSchema.parse(chatRequest?.body).model).toBe("qwen3.8:27b-mlx");
     expect(recorder.events).toContainEqual(expect.objectContaining({ type: "item.completed", text: "hello" }));
+  });
+
+  it("processes a final SSE frame without a trailing newline", async () => {
+    instance = await LocalDriver.create({
+      instanceId: "localMac",
+      displayName: "Mac M5 models",
+      environment: {},
+      enabled: true,
+      config: { host: "custom", url: await fakeHost(true), fleetHost: "mac" },
+    });
+    recorder = recordEvents(instance.adapter);
+    await instance.adapter.sendTurn({
+      threadId: "local-tail-turn",
+      text: "hi",
+      model: "ollama-mac/qwen3.8:27b-mlx",
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(recorder.events).toContainEqual(expect.objectContaining({ type: "item.completed", text: "tail" }));
   });
 });

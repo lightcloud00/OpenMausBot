@@ -12,5 +12,6 @@ describe("hermes fleet model translation", () => {
   it("keeps local host injection syntax and rejects malformed ids", () => {
     expect(hermesAcpModelId("ollama::qwen3:14b")).toBe("custom:ollama:qwen3:14b");
     expect(hermesAcpModelId("bad model\nnext")).toBeNull();
+    expect(hermesAcpModelId("litellm-local:qwen\n")).toBeNull();
   });
 });

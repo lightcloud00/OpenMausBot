@@ -6,6 +6,7 @@
 // stable canonical id to the native id understood by a concrete driver.
 import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { z } from "zod";
@@ -13,8 +14,13 @@ import { z } from "zod";
 import type { ModelOption, ModelRuntimeStatus } from "./contracts.ts";
 import { parseJson, schemaIssue } from "./schema.ts";
 
-export const DEFAULT_AOS_MODEL_CATALOG_PATH =
-  "/Users/gus/.local/share/aos-model-catalog/current/openmausbot-models.v1.json";
+const AOS_DATA_HOME = process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share");
+export const DEFAULT_AOS_MODEL_CATALOG_PATH = join(
+  AOS_DATA_HOME,
+  "aos-model-catalog",
+  "current",
+  "openmausbot-models.v1.json",
+);
 
 const MAX_CATALOG_BYTES = 2 * 1024 * 1024;
 const ID = /^[a-z0-9][a-z0-9._:/+-]{0,191}$/i;

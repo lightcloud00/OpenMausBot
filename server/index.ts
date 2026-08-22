@@ -3799,13 +3799,16 @@ const server = createServer(async (req, res) => {
       ) {
         return json(res, 200, { bot: botWithThread(bot), task: null, changed: false });
       }
-      const updated = store.patchBot(bot.id, { modelSelection: selection });
-      if (!updated) return json(res, 404, { error: "no such bot" });
-      const task = store.createTask(bot.id);
-      if (!task) return json(res, 500, { error: "couldn't create a fresh task for that model" });
-      const fresh = botWithThread(store.bot(bot.id)!);
+      let transition: ReturnType<typeof store.switchModelAndCreateTask>;
+      try {
+        transition = store.switchModelAndCreateTask(bot.id, selection);
+      } catch {
+        return json(res, 500, { error: "couldn't create a fresh task for that model" });
+      }
+      if (!transition) return json(res, 404, { error: "no such bot" });
+      const fresh = botWithThread(transition.bot);
       broadcast({ kind: "bot", bot: fresh });
-      return json(res, 201, { bot: fresh, task: wireTask(task), changed: true });
+      return json(res, 201, { bot: fresh, task: wireTask(transition.task), changed: true });
     }
 
     m = path.match(/^\/api\/bots\/([\w-]+)\/tasks$/);

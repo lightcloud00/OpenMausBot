@@ -58,21 +58,27 @@ export class ProviderRegistry {
   }
 
   async load(configs: InstanceConfigMap) {
-    for (const [instanceId, entry] of Object.entries(configs)) {
+    const loaded = await Promise.all(Object.entries(configs).map(async ([instanceId, entry]): Promise<{
+      instanceId: InstanceId;
+      registryEntry: RegistryEntry;
+      rawCli?: string;
+    }> => {
       const driver = this.driversByKind.get(entry.driver);
       if (!driver) {
-        this.byId.set(instanceId, {
+        return {
           instanceId,
-          shadow: {
+          registryEntry: {
             instanceId,
-            driverKind: entry.driver,
-            displayName: entry.displayName,
-            cli: cliOfRaw(entry.config),
-            shadow: true,
-            reason: `unknown driver "${entry.driver}" — kept as configured, unavailable here`,
+            shadow: {
+              instanceId,
+              driverKind: entry.driver,
+              displayName: entry.displayName,
+              cli: cliOfRaw(entry.config),
+              shadow: true,
+              reason: `unknown driver "${entry.driver}" — kept as configured, unavailable here`,
+            },
           },
-        });
-        continue;
+        };
       }
       try {
         const config = entry.config === undefined ? driver.defaultConfig() : driver.decodeConfig(entry.config);
@@ -80,7 +86,6 @@ export class ProviderRegistry {
         // decodeConfig fills in the driver default ("claude", "codex", …),
         // so reading `cli` there would flag every instance as overridden.
         const rawCli = cliOfRaw(entry.config);
-        if (rawCli) this.cliByInstance.set(instanceId, rawCli);
         const live = await driver.create({
           instanceId,
           displayName: entry.displayName ?? driver.metadata.displayName,
@@ -88,20 +93,29 @@ export class ProviderRegistry {
           enabled: entry.enabled ?? true,
           config,
         });
-        this.byId.set(instanceId, { instanceId, live });
+        return { instanceId, registryEntry: { instanceId, live }, rawCli };
       } catch (e) {
-        this.byId.set(instanceId, {
+        return {
           instanceId,
-          shadow: {
+          registryEntry: {
             instanceId,
-            driverKind: entry.driver,
-            displayName: entry.displayName ?? driver.metadata.displayName,
-            cli: cliOfRaw(entry.config),
-            shadow: true,
-            reason: e instanceof Error ? e.message : String(e),
+            shadow: {
+              instanceId,
+              driverKind: entry.driver,
+              displayName: entry.displayName ?? driver.metadata.displayName,
+              cli: cliOfRaw(entry.config),
+              shadow: true,
+              reason: e instanceof Error ? e.message : String(e),
+            },
           },
-        });
+        };
       }
+    }));
+    // Promise.all preserves config order while allowing slow provider probes
+    // to overlap. Commit the completed rows only after every create settles.
+    for (const row of loaded) {
+      if (row.rawCli) this.cliByInstance.set(row.instanceId, row.rawCli);
+      this.byId.set(row.instanceId, row.registryEntry);
     }
   }
 

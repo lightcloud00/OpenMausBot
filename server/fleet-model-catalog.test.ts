@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { ModelOption } from "./contracts.ts";
 import {
+  DEFAULT_AOS_MODEL_CATALOG_PATH,
   FleetModelCatalogRegistry,
   parseFleetModelCatalog,
   projectFleetModels,
@@ -240,6 +241,16 @@ describe("parseFleetModelCatalog", () => {
 });
 
 describe("FleetModelCatalogRegistry", () => {
+  it("derives the default catalog path from XDG data home or the current user home", () => {
+    const dataHome = process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share");
+    expect(DEFAULT_AOS_MODEL_CATALOG_PATH).toBe(join(
+      dataHome,
+      "aos-model-catalog",
+      "current",
+      "openmausbot-models.v1.json",
+    ));
+  });
+
   it("keeps the last inventory visible but fail-closes it after an invalid refresh", () => {
     const dir = mkdtempSync(join(tmpdir(), "omb-fleet-catalog-"));
     dirs.push(dir);

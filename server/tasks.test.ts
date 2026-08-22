@@ -56,11 +56,16 @@ describe("tasks", () => {
     const bot = store.createBot();
     const firstThread = bot.threadId;
     store.setResumeCursor(bot.id, "claude", "old-provider-session");
-    store.patchBot(bot.id, {
-      modelSelection: { instanceId: "hermes", model: "litellm-local:minimax-m3-light" },
+    const changes: string[] = [];
+    store.onChange((change) => {
+      if (change.type === "bot") changes.push(change.botId);
     });
 
-    const task = store.createTask(bot.id)!;
+    const transition = store.switchModelAndCreateTask(bot.id, {
+      instanceId: "hermes",
+      model: "litellm-local:minimax-m3-light",
+    })!;
+    const task = transition.task;
     expect(task.threadId).not.toBe(firstThread);
     expect(store.bot(bot.id)?.modelSelection).toEqual({
       instanceId: "hermes",
@@ -68,6 +73,26 @@ describe("tasks", () => {
     });
     expect(store.activeTask(bot.id)?.resumeCursors).toEqual({});
     expect(store.taskByThread(bot.id, firstThread)?.resumeCursors.claude).toBe("old-provider-session");
+    expect(changes).toEqual([bot.id]);
+  });
+
+  it("rolls back the model and active task when atomic persistence fails", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const before = structuredClone(bot);
+    // SAFETY: the test deliberately replaces the store's private persistence
+    // seam to prove rollback; it restores that exact method before returning.
+    const persistableStore = store as { saveBots: () => void };
+    const save = vi.spyOn(persistableStore, "saveBots").mockImplementationOnce(() => {
+      throw new Error("disk unavailable");
+    });
+
+    expect(() => store.switchModelAndCreateTask(bot.id, {
+      instanceId: "hermes",
+      model: "litellm-local:MiniMax-M3",
+    })).toThrow("disk unavailable");
+    expect(store.bot(bot.id)).toEqual(before);
+    save.mockRestore();
   });
 
   it("can create a detached routine task without changing the visible conversation", async () => {

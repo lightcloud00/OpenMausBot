@@ -22,7 +22,7 @@ const DRIVER_KIND = "local";
 // admission remains the authoritative longer-running health signal.
 const PROBE_MS = 750;
 const TURN_MS = 10 * 60_000;
-const MODEL_ID = /^[\w][\w./:+-]*$/;
+const MODEL_ID = /^(?![\s\S]*[\r\n])[\w][\w./:+-]*$/;
 
 export interface LocalConfig {
   host: string;
@@ -41,20 +41,20 @@ const localConfigSchema = z.object({
     (value) => value === "custom" || LOCAL_HOSTS.some((host) => host.id === value),
     "unknown local host",
   ),
-  url: z.string().url().refine((value) => value.startsWith("http://") || value.startsWith("https://"), {
+  url: z.url().refine((value) => value.startsWith("http://") || value.startsWith("https://"), {
     message: "local server url must be http(s)",
   }).optional(),
   fleetHost: z.enum(["mac", "windows"]).optional(),
 });
-const streamChunkSchema = z.object({
-  choices: z.array(z.object({
-    delta: z.object({ content: z.string().optional() }).passthrough(),
-  }).passthrough()).optional(),
+const streamChunkSchema = z.looseObject({
+  choices: z.array(z.looseObject({
+    delta: z.looseObject({ content: z.string().optional() }),
+  })).optional(),
   usage: z.object({
     prompt_tokens: z.number().optional(),
     completion_tokens: z.number().optional(),
   }).nullable().optional(),
-}).passthrough();
+});
 
 const CUSTOM: LocalHost = {
   id: "custom",
@@ -179,38 +179,44 @@ export const LocalDriver: ProviderDriver<LocalConfig> = {
       if (!reader) throw new Error(`${host.label} returned no response body`);
       const decoder = new TextDecoder();
       let buffer = "";
+      const consumeLine = (rawLine: string) => {
+        const line = rawLine.trim();
+        if (!line.startsWith("data:")) return;
+        const data = line.slice(5).trim();
+        if (!data || data === "[DONE]") return;
+        let decoded: unknown;
+        try {
+          decoded = JSON.parse(data);
+        } catch {
+          return;
+        }
+        const parsed = streamChunkSchema.safeParse(decoded);
+        if (!parsed.success) return;
+        const chunk = parsed.data;
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (delta) {
+          text += delta;
+          onDelta(delta);
+        }
+        if (chunk.usage) usage = {
+          input: chunk.usage.prompt_tokens ?? 0,
+          output: chunk.usage.completion_tokens ?? 0,
+        };
+      };
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         let newline = buffer.indexOf("\n");
         while (newline >= 0) {
-          const line = buffer.slice(0, newline).trim();
+          const line = buffer.slice(0, newline);
           buffer = buffer.slice(newline + 1);
           newline = buffer.indexOf("\n");
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (!data || data === "[DONE]") continue;
-          let decoded: unknown;
-          try {
-            decoded = JSON.parse(data);
-          } catch {
-            continue;
-          }
-          const parsed = streamChunkSchema.safeParse(decoded);
-          if (!parsed.success) continue;
-          const chunk = parsed.data;
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) {
-            text += delta;
-            onDelta(delta);
-          }
-          if (chunk.usage) usage = {
-            input: chunk.usage.prompt_tokens ?? 0,
-            output: chunk.usage.completion_tokens ?? 0,
-          };
+          consumeLine(line);
         }
       }
+      buffer += decoder.decode();
+      if (buffer) consumeLine(buffer);
       return { text, usage };
     };
 

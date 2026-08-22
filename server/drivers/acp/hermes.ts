@@ -16,7 +16,7 @@ const EMPTY: ModelCatalog = { default: "", options: [] };
 // Canonical fleet routes use Hermes' provider:model dialect. Keep ordinary
 // provider slugs on the existing ACP default path; only a producer-owned
 // route alias (or a guarded local inject id below) is sent to set_model.
-const HERMES_FLEET_MODEL_ID = /^[\w][\w./+-]*:[\w][\w./:+-]*$/;
+const HERMES_FLEET_MODEL_ID = /^(?![\s\S]*[\r\n])[\w][\w./+-]*:[\w][\w./:+-]*$/;
 
 function hermesHome(env: Record<string, string | undefined>): string {
   return env.HERMES_HOME || join(env.HOME || env.USERPROFILE || homedir(), ".hermes");
