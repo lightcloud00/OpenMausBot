@@ -281,6 +281,7 @@ export async function writeAnchoredFile(
     });
     let stdout = "";
     let settled = false;
+    let stdinFailure: AnchoredFileError | null = null;
     const finish = (error?: Error, identity?: AnchoredFileIdentity) => {
       if (settled) return;
       settled = true;
@@ -291,11 +292,14 @@ export async function writeAnchoredFile(
     // termination between truncate and rollback could turn a rejected write
     // into persistent partial content.
     child.once("error", () => finish(new AnchoredFileError("anchored file worker could not start")));
-    child.stdin.once("error", () => finish(new AnchoredFileError("anchored file worker stdin failed closed")));
+    child.stdin.once("error", () => {
+      stdinFailure ??= new AnchoredFileError("anchored file worker stdin failed closed");
+    });
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString("utf8");
     });
     child.once("close", (code) => {
+      if (stdinFailure) return finish(stdinFailure);
       try { finish(undefined, parseResponse(stdout, code === 0)); }
       catch (error) { finish(error as Error); }
     });
@@ -303,8 +307,8 @@ export async function writeAnchoredFile(
       hooks.beforeStdinWrite?.(child.stdin);
       child.stdin.end(request.serialized);
     } catch {
+      stdinFailure ??= new AnchoredFileError("anchored file worker stdin failed closed");
       child.stdin.destroy();
-      finish(new AnchoredFileError("anchored file worker stdin failed closed"));
     }
   });
 }
