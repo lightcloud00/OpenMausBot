@@ -103,6 +103,24 @@ declare global {
         open(url: string, title: string, contextId: string): Promise<boolean>;
         onState(cb: (state: { open: boolean; contextId: string | null }) => void): () => void;
       };
+      /** Two Local VM viewers embedded in one app window. URLs are accepted
+       * only by main-process validation and never return over this bridge. */
+      desktopWorkspace?: {
+        open(input: {
+          contextId: string;
+          url: string;
+          title: string;
+          bounds: DesktopWorkspaceBounds;
+        }): Promise<DesktopWorkspaceState>;
+        layout(items: Array<{
+          contextId: string;
+          bounds: DesktopWorkspaceBounds;
+          visible: boolean;
+        }>): Promise<boolean>;
+        setInteractive(contextId: string | null): Promise<boolean>;
+        close(contextId?: string): Promise<boolean>;
+        onState(cb: (state: DesktopWorkspaceState) => void): () => void;
+      };
       /** Native folder picker; resolves null when the user cancels. */
       pickFolder?(current?: string): Promise<string | null>;
       /** Writes the redacted diagnostics report to a user-chosen file;
