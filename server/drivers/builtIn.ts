@@ -6,6 +6,7 @@ import { BoxAgentDriver } from "./boxagent.ts";
 import { ClaudeDriver } from "./claude.ts";
 import { CodexDriver } from "./codex.ts";
 import { GrokDriver } from "./grok.ts";
+import { LocalDriver } from "./local.ts";
 import { GrokAgentDriver } from "./acp/grok.ts";
 import { GeminiAgentDriver } from "./acp/gemini.ts";
 import { KimiAgentDriver } from "./acp/kimi.ts";
@@ -14,6 +15,7 @@ import { CursorAgentDriver } from "./acp/cursor.ts";
 import { OpenCodeGoDriver } from "./acp/opencode-go.ts";
 import { QwenAgentDriver } from "./acp/qwen.ts";
 import { HermesAgentDriver } from "./acp/hermes.ts";
+import { OpenAICompatDriver } from "./openai-compat.ts";
 import { PiDriver } from "./pi.ts";
 
 export const BUILT_IN_DRIVERS: readonly AnyProviderDriver[] = [
@@ -27,8 +29,10 @@ export const BUILT_IN_DRIVERS: readonly AnyProviderDriver[] = [
   QwenAgentDriver,
   HermesAgentDriver,
   PiDriver,
+  OpenAICompatDriver,
   ClaudeDriver,
   CodexDriver,
   AntigravityDriver,
   BoxAgentDriver,
+  LocalDriver,
 ];

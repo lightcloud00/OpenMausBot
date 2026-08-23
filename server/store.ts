@@ -103,6 +103,9 @@ export interface Message {
    * them; a true stranded by a restart is inert because the client only
    * shows the affordance while the bot is busy. */
   queued?: boolean;
+  /** steer-queue entry this drained user line came from. The client pending
+   * chip matches on this id, not on equal text. Absent on ordinary sends. */
+  queueId?: string;
 }
 
 export type GroupDefaultResponder =
@@ -139,6 +142,9 @@ export interface GroupRecord {
   /** the one message pinned to the top of this room's transcript. A pin id
    * that no longer resolves (edited away, deleted) simply renders nothing. */
   pinnedMessageId?: string;
+  /** sidebar section heading this room is filed under; shares the bots'
+   * namespace so one heading can hold a project's room and its people */
+  section?: string;
 }
 
 /** One task = one conversation with its own context.
@@ -585,7 +591,7 @@ export class Store {
     );
   }
 
-  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd">>): GroupRecord | null {
+  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "section">>): GroupRecord | null {
     const group = this.group(id);
     if (!group) return null;
     Object.assign(group, patch);
@@ -1001,6 +1007,44 @@ export class Store {
     this.saveBots();
     this.emit({ type: "bot", botId });
     return task;
+  }
+
+  /** Change the engine/model and open its session-isolated task as one
+   * persisted transition. A failed atomic write restores the exact in-memory
+   * bot so callers never observe a selection without its matching task. */
+  switchModelAndCreateTask(
+    botId: string,
+    selection: ModelSelection,
+  ): { bot: BotRecord; task: TaskRecord } | null {
+    const bot = this.bot(botId);
+    if (!bot) return null;
+    const task: TaskRecord = {
+      threadId: newId(),
+      title: UNTITLED_TASK,
+      createdAt: Date.now(),
+      resumeCursors: {},
+    };
+    const previous = {
+      modelSelection: bot.modelSelection,
+      tasks: bot.tasks,
+      threadId: bot.threadId,
+      resumeCursors: bot.resumeCursors,
+    };
+    bot.modelSelection = { ...selection };
+    bot.tasks = [task, ...(bot.tasks ?? [])];
+    bot.threadId = task.threadId;
+    bot.resumeCursors = {};
+    try {
+      this.saveBots();
+    } catch (error) {
+      bot.modelSelection = previous.modelSelection;
+      bot.tasks = previous.tasks;
+      bot.threadId = previous.threadId;
+      bot.resumeCursors = previous.resumeCursors;
+      throw error;
+    }
+    this.emit({ type: "bot", botId });
+    return { bot, task };
   }
 
   switchTask(botId: string, threadId: string): BotRecord | null {

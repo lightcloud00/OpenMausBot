@@ -18,6 +18,7 @@ import { IMAGE_MAX_BYTES } from "./attachments.ts";
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SERVER_DIR, "..");
 const FAKE_CLAUDE_CLI = join(SERVER_DIR, "testing", "fake-claude-cli.ts");
+const FAKE_ACP_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
 const PORT = 18800 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
 const WEBHOOK_PORT = 39000 + Math.floor(Math.random() * 10_000);
@@ -30,7 +31,51 @@ let boxStubPort = 0;
 let home: string;
 let staticDir: string;
 let fakeClaudeDump: string;
+let fleetCatalogPath: string;
 let stderr = "";
+
+const fleetCatalogFixture = (busy = false) => ({
+  schema_version: "openmausbot-models/v1",
+  catalog_version: 1,
+  generated_at: "2026-08-22T05:00:00Z",
+  source: {
+    registry_schema_version: "aos-model-registry/v1",
+    registry_version: 1,
+    registry_sha256: "a".repeat(64),
+  },
+  default_model_id: "fixture-fleet-model",
+  provider_candidates: [],
+  models: [{
+    id: "fixture-fleet-model",
+    display_name: "Fixture fleet model",
+    kind: "model",
+    provider_id: "fixture",
+    native_model_id: "fixture-fleet-model",
+    capabilities: ["chat"],
+    host: "hosted",
+    cost_class: "free",
+    manual_only: false,
+    is_default: true,
+    selectable: !busy,
+    status: {
+      configured: true,
+      reachable: true,
+      verified: true,
+      admitted: true,
+      busy,
+      reason: busy ? "Fixture host is busy" : null,
+      last_verification_receipt: "/fixture/receipt.json",
+    },
+    translations: {
+      litellm: "fixture-fleet-model",
+      hermes: "litellm-local:fixture-fleet-model",
+      opencode: "litellm-local/fixture-fleet-model",
+      telegram: "fixture-fleet-model",
+      openmausbot: "fixture-fleet-model",
+    },
+    route_members: [],
+  }],
+});
 
 const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
@@ -68,17 +113,20 @@ beforeAll(async () => {
   home = mkdtempSync(join(tmpdir(), "omb-api-test-"));
   staticDir = join(home, "static");
   fakeClaudeDump = join(home, "fake-claude-dump.json");
+  fleetCatalogPath = join(home, "openmausbot-models.v1.json");
   // a fleet of exactly one unknown driver: no CLI probes, no network
   mkdirSync(join(home, ".openmausbot"), { recursive: true });
   mkdirSync(join(staticDir, "assets"), { recursive: true });
   writeFileSync(join(staticDir, "index.html"), "<!doctype html><title>Packaged OpenMausBot</title>");
   writeFileSync(join(staticDir, "assets", "smoke.css"), "body { color: white; }");
+  writeFileSync(fleetCatalogPath, JSON.stringify(fleetCatalogFixture()));
   writeFileSync(
     join(home, ".openmausbot", "config.json"),
     JSON.stringify({
       instances: {
         ghost: { driver: "not-a-real-driver", displayName: "Ghost" },
         claude: { driver: "claudeAgent", displayName: "Fixture Claude", config: { cli: FAKE_CLAUDE_CLI } },
+        hermes: { driver: "hermesAgent", displayName: "Fixture Hermes", config: { cli: FAKE_ACP_CLI } },
       },
     }),
   );
@@ -224,6 +272,7 @@ beforeAll(async () => {
       OMB_STATIC_DIR: staticDir,
       FAKE_CLAUDE_MODE: "hang",
       FAKE_CLAUDE_DUMP: fakeClaudeDump,
+      AOS_MODEL_CATALOG_PATH: fleetCatalogPath,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -317,6 +366,89 @@ describe("harness HTTP API", () => {
     expect(body.bots[0].messages.length).toBeGreaterThanOrEqual(2);
   });
 
+  it("adds and removes room members through PATCH", async () => {
+    const [first, second, third] = await Promise.all([
+      api("POST", "/api/bots"),
+      api("POST", "/api/bots"),
+      api("POST", "/api/bots"),
+    ]).then((created) => created.map((response) => response.body.bot));
+    const room = (await api("POST", "/api/groups", { name: "Roster", memberIds: [first.id, second.id] })).body.group;
+    try {
+      const added = await api("PATCH", `/api/groups/${room.id}`, { memberIds: [first.id, second.id, third.id] });
+      expect(added.status).toBe(200);
+      expect(added.body.group.memberIds).toEqual([first.id, second.id, third.id]);
+
+      const removed = await api("PATCH", `/api/groups/${room.id}`, { memberIds: [third.id] });
+      expect(removed.status).toBe(200);
+      expect(removed.body.group.memberIds).toEqual([third.id]);
+
+      const state = (await api("GET", "/api/bots")).body;
+      expect(state.groups.find((group: { id: string }) => group.id === room.id).memberIds).toEqual([third.id]);
+    } finally {
+      await api("DELETE", `/api/groups/${room.id}`);
+      for (const bot of [first, second, third]) await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("refuses to empty a room's roster", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const room = (await api("POST", "/api/groups", { name: "Never empty", memberIds: [bot.id] })).body.group;
+    try {
+      for (const memberIds of [[], ["no-such-bot"]]) {
+        const attempted = await api("PATCH", `/api/groups/${room.id}`, { memberIds });
+        expect(attempted.status).toBe(400);
+        expect(attempted.body.error).toMatch(/at least one bot/i);
+      }
+      const state = (await api("GET", "/api/bots")).body;
+      expect(state.groups.find((group: { id: string }) => group.id === room.id).memberIds).toEqual([bot.id]);
+    } finally {
+      await api("DELETE", `/api/groups/${room.id}`);
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("deduplicates repeated room members while preserving their first-seen order", async () => {
+    const [first, second] = await Promise.all([api("POST", "/api/bots"), api("POST", "/api/bots")]).then(
+      (created) => created.map((response) => response.body.bot),
+    );
+    const room = (await api("POST", "/api/groups", { name: "Unique roster", memberIds: [first.id] })).body.group;
+    try {
+      const patched = await api("PATCH", `/api/groups/${room.id}`, {
+        memberIds: [second.id, first.id, second.id, first.id],
+      });
+      expect(patched.status).toBe(200);
+      expect(patched.body.group.memberIds).toEqual([second.id, first.id]);
+    } finally {
+      await api("DELETE", `/api/groups/${room.id}`);
+      for (const bot of [first, second]) await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("keeps direct-message channels a fixed pair at the API boundary", async () => {
+    const attempted = await api("PATCH", "/api/groups/test-dm", { memberIds: ["test-bot-a"] });
+    expect(attempted.status).toBe(400);
+    expect(attempted.body.error).toMatch(/direct-message.*members/i);
+    const state = await api("GET", "/api/bots");
+    const dm = state.body.groups.find((group: { id: string }) => group.id === "test-dm");
+    expect(dm.memberIds).toEqual(["test-bot-a", "test-bot-b"]);
+  });
+
+  it("hands the lead to a remaining member when the lead leaves the room", async () => {
+    const [lead, other] = await Promise.all([api("POST", "/api/bots"), api("POST", "/api/bots")]).then((created) =>
+      created.map((response) => response.body.bot),
+    );
+    const room = (await api("POST", "/api/groups", { name: "Handover", memberIds: [lead.id, other.id] })).body.group;
+    try {
+      expect(room.defaultResponder).toEqual({ kind: "member", botId: lead.id });
+      const patched = await api("PATCH", `/api/groups/${room.id}`, { memberIds: [other.id] });
+      expect(patched.status).toBe(200);
+      expect(patched.body.group.defaultResponder).toEqual({ kind: "member", botId: other.id });
+    } finally {
+      await api("DELETE", `/api/groups/${room.id}`);
+      for (const bot of [lead, other]) await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
   it("keeps direct-message channels folderless at the API boundary", async () => {
     const attempted = await api("PATCH", "/api/groups/test-dm", { cwd: home });
     expect(attempted.status).toBe(400);
@@ -371,6 +503,85 @@ describe("harness HTTP API", () => {
       driverKind: "claudeAgent",
       displayName: "Fixture Claude",
     }));
+  });
+
+  it("projects the cached secret-free fleet catalog and fail-closes an invalid refresh", async () => {
+    const first = await api("GET", "/api/instances");
+    const hermes = first.body.instances.find((instance: { instanceId: string }) => instance.instanceId === "hermes");
+    expect(hermes.models.options).toContainEqual(expect.objectContaining({
+      id: "litellm-local:fixture-fleet-model",
+      canonicalId: "fixture-fleet-model",
+      costClass: "free",
+      host: "hosted",
+      selectable: true,
+    }));
+
+    writeFileSync(fleetCatalogPath, "not-json");
+    const failed = await api("POST", "/api/model-catalog/refresh");
+    expect(failed.status).toBe(200);
+    expect(failed.body.catalog.source.state).toBe("invalid");
+    const failedHermes = failed.body.instances.find((instance: { instanceId: string }) => instance.instanceId === "hermes");
+    expect(failedHermes.models.options).toContainEqual(expect.objectContaining({
+      canonicalId: "fixture-fleet-model",
+      selectable: false,
+    }));
+
+    writeFileSync(fleetCatalogPath, JSON.stringify(fleetCatalogFixture()));
+    expect((await api("POST", "/api/model-catalog/refresh")).body.catalog.source.state).toBe("ready");
+  });
+
+  it("translates a stable fleet id and starts one fresh task after a model change", async () => {
+    writeFileSync(fleetCatalogPath, JSON.stringify(fleetCatalogFixture()));
+    await api("POST", "/api/model-catalog/refresh");
+    const defaulted = (await api("POST", "/api/bots")).body.bot;
+    expect(defaulted.modelSelection).toEqual({
+      instanceId: "hermes",
+      model: "litellm-local:fixture-fleet-model",
+    });
+    const created = (await api("PATCH", `/api/bots/${defaulted.id}`, {
+      modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+    })).body.bot;
+    const previousThread = created.threadId;
+    const previousTaskCount = created.tasks.length;
+
+    const switched = await api("POST", `/api/bots/${created.id}/model`, {
+      instanceId: "hermes",
+      model: "caller-value-is-not-trusted",
+      canonicalId: "fixture-fleet-model",
+    });
+    expect(switched.status).toBe(201);
+    expect(switched.body.changed).toBe(true);
+    expect(switched.body.bot.modelSelection).toEqual({
+      instanceId: "hermes",
+      model: "litellm-local:fixture-fleet-model",
+    });
+    expect(switched.body.bot.threadId).not.toBe(previousThread);
+    expect(switched.body.bot.tasks).toHaveLength(previousTaskCount + 1);
+    expect(switched.body.bot.messages).toEqual([]);
+
+    const same = await api("POST", `/api/bots/${created.id}/model`, {
+      instanceId: "hermes",
+      model: "still-not-authoritative",
+      canonicalId: "fixture-fleet-model",
+    });
+    expect(same.status).toBe(200);
+    expect(same.body.changed).toBe(false);
+    expect(same.body.bot.tasks).toHaveLength(previousTaskCount + 1);
+
+    try {
+      writeFileSync(fleetCatalogPath, JSON.stringify(fleetCatalogFixture(true)));
+      await api("POST", "/api/model-catalog/refresh");
+      const disabled = await api("POST", `/api/bots/${created.id}/model`, {
+        instanceId: "hermes",
+        model: "litellm-local:fixture-fleet-model",
+        canonicalId: "fixture-fleet-model",
+      });
+      expect(disabled.status).toBe(409);
+      expect(disabled.body.error).toBe("Fixture host is busy");
+    } finally {
+      writeFileSync(fleetCatalogPath, JSON.stringify(fleetCatalogFixture()));
+      await api("POST", "/api/model-catalog/refresh");
+    }
   });
 
   it("searches transcripts and exports a conversation", async () => {
@@ -475,6 +686,21 @@ describe("harness HTTP API", () => {
     const clearedEmpty = await api("PATCH", `/api/bots/${bot.id}`, { section: "   " });
     expect(clearedEmpty.status).toBe(200);
     expect(clearedEmpty.body.bot).not.toHaveProperty("section");
+
+    // rooms file under the same sidebar sections, with the same contract
+    const sectionRoom = (await api("POST", "/api/groups", { name: "Filed", memberIds: [bot.id] })).body.group;
+    const roomSectioned = await api("PATCH", `/api/groups/${sectionRoom.id}`, { section: "  Clients  " });
+    expect(roomSectioned.status).toBe(200);
+    expect(roomSectioned.body.group).toMatchObject({ section: "Clients" });
+    expect((await api("PATCH", `/api/groups/${sectionRoom.id}`, { section: 7 })).status).toBe(400);
+    expect((await api("PATCH", `/api/groups/${sectionRoom.id}`, { section: "S".repeat(61) })).status).toBe(400);
+    const roomSectionCleared = await api("PATCH", `/api/groups/${sectionRoom.id}`, { section: null });
+    expect(roomSectionCleared.status).toBe(200);
+    expect(roomSectionCleared.body.group).not.toHaveProperty("section");
+    const roomSectionEmpty = await api("PATCH", `/api/groups/${sectionRoom.id}`, { section: "   " });
+    expect(roomSectionEmpty.status).toBe(200);
+    expect(roomSectionEmpty.body.group).not.toHaveProperty("section");
+    expect((await api("DELETE", `/api/groups/${sectionRoom.id}`)).status).toBe(200);
     expect(gated.body.bot.composio).toBe(false);
     expect((await api("PATCH", `/api/bots/${bot.id}`, { composio: true })).body.bot.composio).toBe(true);
 
@@ -482,6 +708,91 @@ describe("harness HTTP API", () => {
     expect(deleted.status).toBe(200);
     const after = await api("GET", "/api/bots");
     expect(after.body.bots.find((b: { id: string }) => b.id === bot.id)).toBeUndefined();
+  });
+
+  it("explains when archived room members cannot respond", async () => {
+    const archived = (await api("POST", "/api/bots")).body.bot;
+    const active = (await api("POST", "/api/bots")).body.bot;
+    const room = (await api("POST", "/api/groups", {
+      name: "Archived member feedback",
+      memberIds: [archived.id, active.id],
+    })).body.group;
+
+    try {
+      const archivedBot = await api("PATCH", `/api/bots/${archived.id}`, {
+        name: "Quill",
+        hidden: true,
+        chiefOfStaff: false,
+      });
+      expect(archivedBot.status).toBe(200);
+      await api("PATCH", `/api/bots/${active.id}`, {
+        name: "Atlas",
+        modelSelection: { instanceId: "ghost" },
+      });
+      await api("PATCH", `/api/groups/${room.id}`, { defaultResponder: { kind: "mentions" } });
+
+      expect((await api("POST", `/api/groups/${room.id}/messages`, { text: "@Quill take this" })).status).toBe(202);
+      let state = (await api("GET", "/api/bots?messages=20")).body;
+      let messages = state.groups.find((group: { id: string }) => group.id === room.id).messages;
+      expect(messages.at(-1)).toMatchObject({
+        kind: "activity",
+        tool: {
+          name: "Quill is archived and can't respond — restore it or mention an active room member.",
+          ok: false,
+        },
+      });
+
+      const archivedError = "Quill is archived and can't respond — restore it or mention an active room member.";
+      const beforeMixedMention = messages.filter((message: { tool?: { name?: string } }) =>
+        message.tool?.name === archivedError
+      ).length;
+      await api("POST", `/api/groups/${room.id}/messages`, { text: "@Quill and @Atlas take this" });
+      await expect.poll(async () => {
+        state = (await api("GET", "/api/bots?messages=20")).body;
+        messages = state.groups.find((group: { id: string }) => group.id === room.id).messages;
+        return {
+          archivedErrors: messages.filter((message: { tool?: { name?: string } }) =>
+            message.tool?.name === archivedError
+          ).length,
+          activeDispatched: messages.some((message: { tool?: { name?: string } }) =>
+            message.tool?.name === "error: Atlas's model is unavailable"
+          ),
+        };
+      }).toEqual({ archivedErrors: beforeMixedMention + 1, activeDispatched: true });
+
+      await api("PATCH", `/api/groups/${room.id}`, {
+        defaultResponder: { kind: "member", botId: archived.id },
+      });
+      await api("POST", `/api/groups/${room.id}/messages`, { text: "use the default responder" });
+      state = (await api("GET", "/api/bots?messages=20")).body;
+      messages = state.groups.find((group: { id: string }) => group.id === room.id).messages;
+      expect(messages.at(-1)?.tool).toEqual({ name: archivedError, ok: false });
+
+      await api("PATCH", `/api/groups/${room.id}`, { defaultResponder: { kind: "mentions" } });
+
+      const beforeUnmentioned = messages.length;
+      await api("POST", `/api/groups/${room.id}/messages`, { text: "no mention" });
+      state = (await api("GET", "/api/bots?messages=20")).body;
+      messages = state.groups.find((group: { id: string }) => group.id === room.id).messages;
+      expect(messages).toHaveLength(beforeUnmentioned + 1);
+      expect(messages.at(-1)).toMatchObject({ kind: "text", role: "user", text: "no mention" });
+
+      await api("PATCH", `/api/bots/${active.id}`, { hidden: true });
+      await api("POST", `/api/groups/${room.id}/messages`, { text: "hello everyone" });
+      state = (await api("GET", "/api/bots?messages=20")).body;
+      messages = state.groups.find((group: { id: string }) => group.id === room.id).messages;
+      expect(messages.at(-1)).toMatchObject({
+        kind: "activity",
+        tool: {
+          name: "No active room members can respond — restore an archived bot or add an active member.",
+          ok: false,
+        },
+      });
+    } finally {
+      await api("DELETE", `/api/groups/${room.id}`);
+      await api("DELETE", `/api/bots/${archived.id}`);
+      await api("DELETE", `/api/bots/${active.id}`);
+    }
   });
 
   it("saves, serves, and guards image attachments", async () => {
@@ -778,6 +1089,48 @@ describe("harness HTTP API", () => {
     } finally {
       stream.close();
     }
+  });
+
+  it("the scout reads a folder, proposes an importable team, and creates nothing until the human imports", async () => {
+    const folder = mkdtempSync(join(tmpdir(), "omb-scout-"));
+    writeFileSync(join(folder, "README.md"), "# Demo Shop\n\nA storefront demo.\n");
+    writeFileSync(
+      join(folder, "package.json"),
+      JSON.stringify({ dependencies: { react: "^19" }, devDependencies: { vitest: "^3" } }),
+    );
+
+    const before = (await api("GET", "/api/bots")).body;
+
+    expect((await api("GET", "/api/teams/scout")).status).toBe(400);
+    expect((await api("GET", `/api/teams/scout?cwd=${encodeURIComponent(join(folder, "nope"))}`)).status).toBe(400);
+
+    const scouted = await api("GET", `/api/teams/scout?cwd=${encodeURIComponent(folder)}`);
+    expect(scouted.status).toBe(200);
+    expect(scouted.body.profile).toMatchObject({ name: "Demo Shop", summary: "A storefront demo." });
+    expect(scouted.body.profile.stacks).toContain("React");
+    expect(scouted.body.suggestion.roomName).toBe("Demo Shop");
+    const keys = scouted.body.suggestion.manifest.team.members.map((member: { key: string }) => member.key);
+    expect(keys).toEqual(["lead", "frontend", "testing"]);
+    expect(Object.keys(scouted.body.suggestion.reasons).sort()).toEqual(keys.slice().sort());
+
+    // scouting is read-only: no bot and no room exists until the import
+    const after = (await api("GET", "/api/bots")).body;
+    expect(after.bots).toHaveLength(before.bots.length);
+    expect(after.groups).toHaveLength(before.groups.length);
+
+    // and the suggestion goes through the real importer verbatim
+    const imported = await api(
+      "POST",
+      `/api/teams/import?mode=project&cwd=${encodeURIComponent(folder)}&room=${encodeURIComponent(scouted.body.suggestion.roomName)}`,
+      scouted.body.suggestion.manifest,
+    );
+    expect(imported.status).toBe(201);
+    expect(imported.body.group).toMatchObject({ name: "Demo Shop", cwd: folder });
+    expect(imported.body.bots).toHaveLength(3);
+
+    expect((await api("DELETE", `/api/groups/${imported.body.group.id}`)).status).toBe(200);
+    for (const bot of imported.body.bots) await api("DELETE", `/api/bots/${bot.id}`);
+    rmSync(folder, { recursive: true, force: true });
   });
 
   it("team import is additive-only: smuggled grants, claimed ids, and re-imports never touch existing records", async () => {

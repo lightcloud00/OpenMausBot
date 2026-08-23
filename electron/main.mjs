@@ -9,7 +9,9 @@ import { createAndroidDeviceController } from "./android-device.mjs";
 import { finishSpeech, startSpeech, stopSpeech } from "./speech.mjs";
 import { openBlankTerminal } from "./terminal-launch.mjs";
 import { startUpdater, registerUpdaterIpc } from "./updater.mjs";
+import { buildDiagnosticsReport, decodeLogTail, diagnosticsFileName } from "./diagnostics.mjs";
 import { migrateWorkspaceCredentials, workspaceCredentialEnv } from "./workspace-credentials.mjs";
+import { activateExistingWindow } from "./single-instance.mjs";
 import capabilitiesModule from "./capabilities.cjs";
 
 const { desktopCapabilities, nativeDesktopActions } = capabilitiesModule;
@@ -39,6 +41,17 @@ let mainWindow = null;
 // GNOME groups the window with its installed desktop entry only when both
 // identities match. This must run before Electron becomes ready.
 if (process.platform === "linux") app.setDesktopName("com.openmausbot.app.desktop");
+
+// One instance per user: without this lock a second launch forks a second
+// harness server on a fallback port and splits data dirs in two. The loser
+// exits before any child or window exists; the winner surfaces itself.
+if (!app.requestSingleInstanceLock()) {
+  console.log("[desktop] OpenMausBot is already running — focusing that window");
+  process.exit(0);
+}
+app.on("second-instance", () => {
+  activateExistingWindow(BrowserWindow.getAllWindows());
+});
 
 // Packaged: the harness server ships in Resources (compiled JS, zero deps)
 // and runs on Electron's own Node via utilityProcess. It serves the built
@@ -212,6 +225,53 @@ function slog(line) {
   } catch {
     /* logging must never break startup */
   }
+}
+
+const LOG_TAIL_BYTES = 256 * 1024;
+
+function readLogTail(logPath) {
+  try {
+    const size = fs.statSync(logPath).size;
+    const start = Math.max(0, size - LOG_TAIL_BYTES);
+    const handle = fs.openSync(logPath, "r");
+    try {
+      const buffer = Buffer.alloc(size - start);
+      fs.readSync(handle, buffer, 0, buffer.length, start);
+      return decodeLogTail(buffer, start > 0);
+    } finally {
+      fs.closeSync(handle);
+    }
+  } catch {
+    return null;
+  }
+}
+
+// Everything the bug-report bundle needs. The config summary comes from the
+// server's own booleans-only /api/config status (credentials are never
+// echoed), and the log goes through the redactor in diagnostics.mjs — so the
+// file is safe to paste into a public issue even if a future log line ever
+// carried a secret.
+async function gatherDiagnostics() {
+  const serverStatus = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/config`, {
+    signal: AbortSignal.timeout(3_000),
+  })
+    .then((res) => (res.ok ? res.json() : null))
+    .catch(() => null);
+  const logPath = path.join(LOG_DIR, "server.log");
+  const log = readLogTail(logPath);
+  return buildDiagnosticsReport({
+    appInfo: {
+      version: app.getVersion(),
+      platform: process.platform,
+      arch: process.arch,
+      electron: process.versions.electron,
+      node: process.versions.node,
+      packaged: app.isPackaged,
+      uptimeSeconds: Math.round(process.uptime()),
+    },
+    configSummary: serverStatus ?? {},
+    logTail: log?.tail ?? "",
+  });
 }
 
 async function startServerOn(port) {
@@ -450,9 +510,6 @@ function ensureDesktopWorkspace(owner) {
   });
   desktopWorkspaceManager = manager;
 
-  // Native child views outlive the renderer DOM unless we explicitly tear
-  // them down. Reloads, renderer crashes and owner destruction all close both
-  // panes without retaining their secret-bearing noVNC URLs.
   owner.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
     if (isMainFrame && !isInPlace) manager.closeAll();
   });
@@ -681,6 +738,33 @@ ipcMain.handle("desktop:pick-folder", async (event, current) => {
   return result.canceled ? null : (result.filePaths[0] ?? null);
 });
 
+// One-click bug-report bundle. Secrets are never read; the report is
+// redacted again on the way out (diagnostics.mjs). null means the user
+// cancelled the save dialog.
+ipcMain.handle("desktop:export-diagnostics", async (event) => {
+  const owner = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+  const report = await gatherDiagnostics();
+  const result = await dialog.showSaveDialog(owner, {
+    title: "Export diagnostics",
+    defaultPath: diagnosticsFileName(),
+    filters: [{ name: "Text", extensions: ["txt"] }],
+  });
+  if (result.canceled || !result.filePath) return null;
+  if (process.platform === "win32") {
+    fs.writeFileSync(result.filePath, report, { mode: 0o600 });
+  } else {
+    const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW;
+    const handle = fs.openSync(result.filePath, flags, 0o600);
+    try {
+      fs.fchmodSync(handle, 0o600);
+      fs.writeFileSync(handle, report, "utf8");
+    } finally {
+      fs.closeSync(handle);
+    }
+  }
+  return result.filePath;
+});
+
 ipcMain.handle("desktop:open-external", async (_event, rawUrl) => {
   if (typeof rawUrl !== "string") throw new Error("A web address is required");
   let url;
@@ -704,9 +788,6 @@ ipcMain.handle("desktop-viewer:open", (event, rawUrl, title, contextId) => {
   return openDesktopViewer(owner, rawUrl, title, contextId);
 });
 
-// Two Local VM desktops share the existing app BrowserWindow. The renderer
-// supplies only layout and intent; URL validation, sandboxing, session
-// isolation and the one-interactive-pane invariant stay in the main process.
 ipcMain.handle("desktop-workspace:open", (event, input) =>
   desktopWorkspaceForEvent(event, true).open(input),
 );

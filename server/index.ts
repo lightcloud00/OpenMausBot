@@ -61,7 +61,7 @@ import { ComputerControl } from "./computer-control.ts";
 import { augmentedPath, findCliCandidates, resetPathCache } from "./env-path.ts";
 import { describeSpawnFailure, execCli } from "./procs.ts";
 import { buildNotification, type Notification } from "./notify.ts";
-import { isEffortLevel, type RequestOutcome, type RuntimeEvent } from "./contracts.ts";
+import { EFFORT_LEVELS, isEffortLevel, type ModelSelection, type RequestOutcome, type RuntimeEvent } from "./contracts.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
@@ -99,6 +99,8 @@ import { LocalVmLease, LocalVmLeasePool } from "./local-vm-lease.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
+import { fetchBotDirectory, matchDirectoryBots, type MatchedDirectoryBot } from "./bot-directory.ts";
+import { scoutProject, suggestTeam } from "./project-scout.ts";
 import { fetchGithubTeam, fetchLibraryTeam, fetchTeamCatalog } from "./team-library.ts";
 import { createTeamManifest, importedMemberProfile, parseTeamManifest } from "./team-manifest.ts";
 import { readThreadEvents } from "./thread-events.ts";
@@ -108,9 +110,19 @@ import { WebhookManager } from "./webhooks.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
+import {
+  FleetModelCatalogRegistry,
+  projectFleetModels,
+} from "./fleet-model-catalog.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
 const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
+const modelSwitchBodySchema = z.object({
+  instanceId: z.string().min(1),
+  model: z.string().min(1),
+  canonicalId: z.string().min(1).optional(),
+  effort: z.enum(EFFORT_LEVELS).optional(),
+}).strict();
 const STATIC_DIR = process.env.OMB_STATIC_DIR || null;
 const MIME: Record<string, string> = {
   ".html": "text/html",
@@ -127,6 +139,15 @@ ensureDirs();
 const cfg = loadConfig();
 const registry = new ProviderRegistry(BUILT_IN_DRIVERS);
 await registry.load(instanceConfigs(cfg));
+const fleetModelCatalog = new FleetModelCatalogRegistry();
+let cachedInstanceDescriptions: Awaited<ReturnType<typeof registry.describe>> | null = null;
+
+async function instanceDescriptions(refresh = false) {
+  if (refresh || !cachedInstanceDescriptions) {
+    cachedInstanceDescriptions = await registry.describe({ refreshModels: refresh });
+  }
+  return cachedInstanceDescriptions;
+}
 const bundledSkills = loadBundledSkills();
 
 const bus = new EventBus();
@@ -241,17 +262,28 @@ function askBotAndWait(targetBotId: string, message: string, depth: number, from
   });
 }
 
-// default selection for new bots: first available instance, claude preferred
+// Default selection for new bots: the validated fleet-wide shared default
+// wins when its owning instance is available. Existing tasks retain their
+// saved selection; this function is only used for new bots/tasks and reset.
 async function defaultSelection() {
-  const described = await registry.describe();
+  const described = projectFleetModels(
+    await instanceDescriptions(false),
+    fleetModelCatalog.snapshot(),
+  );
   const available = described.filter((d) => d.snapshot.state === "available");
+  const sharedDefault = available.find((instance) =>
+    instance.models.options.some((option) => option.isDefault && option.selectable !== false)
+  );
   // Deliberately NO fallback to described[0]. Handing a bot an engine whose
   // CLI isn't installed makes it look ready and then fail on send with a raw
   // spawn ENOENT — the single worst first-run experience, and the one every
   // user with no CLIs used to get. An empty selection is honest: the UI shows
   // the setup path instead of a bot that cannot answer.
-  const pick = available.find((d) => d.driverKind === "claudeAgent") ?? available[0];
-  return { instanceId: pick?.instanceId ?? "", model: pick?.models.default ?? "" };
+  const pick = sharedDefault ?? available.find((d) => d.driverKind === "claudeAgent") ?? available[0];
+  const defaultModel = pick?.models.options.find(
+    (option) => option.isDefault && option.selectable !== false,
+  )?.id ?? pick?.models.default ?? "";
+  return { instanceId: pick?.instanceId ?? "", model: defaultModel };
 }
 let bootSelection = { instanceId: "", model: "" };
 const store = new Store(() => bootSelection);
@@ -985,7 +1017,9 @@ bus.subscribe((event: RuntimeEvent) => {
         if (store.bot(bot.id)?.activity !== "dead") store.setActivity(bot.id, "idle");
         store.patchBot(bot.id, { unread: true });
         if (routineRun?.status !== "failed") {
-          notify(buildNotification("done", bot, event.threadId, reply));
+          // the frame carries the bot's avatar so every desktop client can
+          // show the notification under that bot's own face
+          notify(buildNotification("done", bot, event.threadId, reply, { avatarUrl: bot.avatarUrl }));
         }
         if (screenPollers.has(bot.id)) {
           // the last live frame becomes a settled inline screen message —
@@ -1154,12 +1188,13 @@ bus.subscribe((event: RuntimeEvent) => {
 });
 
 function drainQueuedSends() {
-  drainSteeredMessages(store, (botId, threadId, prompt, userMessage) =>
+  drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds) =>
     // A plain attended turn — no automationSource, no unattended, no comms
     // depth: exactly what typing the same words into an idle bot would run.
-    // The messages are already in the transcript; userMessage keeps
-    // startTurn from appending the joined prompt as a duplicate.
-    startTurn(botId, prompt, { threadId, userMessage }).catch((err) => {
+    // Drain just appended the held lines; userMessage keeps startTurn
+    // from duplicating the last one, and excludeIds drops every drained
+    // line from the transcript-replay so they are not also in `prompt`.
+    startTurn(botId, prompt, { threadId, userMessage, excludeMessageIds: excludeIds }).catch((err) => {
       store.appendMessage(threadId, {
         role: "bot",
         kind: "activity",
@@ -1284,6 +1319,8 @@ async function startTurn(
   opts?: {
     commsDepth?: number;
     userMessage?: Message;
+    /** Extra transcript ids to omit (every drained queued line, not just the last). */
+    excludeMessageIds?: string[];
     /** Routines run in detached tasks; pin the destination for the whole turn. */
     threadId?: string;
     /** Cloud routines run the whole agent inside the bot's Box VM instead
@@ -1352,9 +1389,10 @@ async function startTurn(
 
   // transcript for API-backed drivers: settled text turns on the ACTIVE
   // branch only — abandoned forks never reach the model
+  const skipTranscript = new Set<string>([userMessage.id, ...(opts?.excludeMessageIds ?? [])]);
   const transcript = store
     .activePath(threadId)
-    .filter((m) => m.kind === "text" && m.text && m.id !== userMessage.id)
+    .filter((m) => m.kind === "text" && m.text && !skipTranscript.has(m.id))
     .slice(-40)
     .map((m) => ({ role: m.role === "user" ? ("user" as const) : ("assistant" as const), text: m.text! }));
 
@@ -1998,16 +2036,46 @@ function startGroupTurn(groupId: string, text: string) {
   const members = group.memberIds
     .map((id) => store.bot(id))
     .filter((b): b is NonNullable<typeof b> => Boolean(b));
+  const availableMembers = members.filter((member) => !member.hidden);
+  const archived = members.filter((member) => member.hidden);
+  const mentionedArchived = mentionedBots(text, archived.map(({ name }) => ({ name })))[0];
+  if (mentionedArchived) {
+    store.appendMessage(group.threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: {
+        name: `${mentionedArchived.name} is archived and can't respond — restore it or mention an active room member.`,
+        ok: false,
+      },
+    });
+  }
   let responders = roomResponders(text, members, group.defaultResponder);
   // bot⇄bot channels: chipping in without a tag addresses the last speaker
   if (!responders.length && group.dm) {
     const lastSpeakerId = [...store.messagesFor(group.threadId)]
       .reverse()
       .find((msg) => msg.kind === "text" && msg.from)?.from?.botId;
-    const last = members.find((b) => b.id === lastSpeakerId) ?? members[0];
+    const last = availableMembers.find((b) => b.id === lastSpeakerId) ?? availableMembers[0];
     responders = last ? [last] : [];
   }
-  if (!responders.length) return;
+  if (!responders.length) {
+    const defaultArchivedId = group.defaultResponder.kind === "member" ? group.defaultResponder.botId : undefined;
+    const defaultArchived = archived.find((member) => member.id === defaultArchivedId);
+    let unavailableMessage: string | undefined;
+    if (!mentionedArchived && !availableMembers.length) {
+      unavailableMessage = "No active room members can respond — restore an archived bot or add an active member.";
+    } else if (!mentionedArchived && defaultArchived) {
+      unavailableMessage = `${defaultArchived.name} is archived and can't respond — restore it or mention an active room member.`;
+    }
+    if (unavailableMessage) {
+      store.appendMessage(group.threadId, {
+        role: "bot",
+        kind: "activity",
+        tool: { name: unavailableMessage, ok: false },
+      });
+    }
+    return;
+  }
 
   const prev = groupQueues.get(groupId) ?? Promise.resolve();
   const next = prev.then(async () => {
@@ -2262,6 +2330,7 @@ async function reloadProviders() {
   bus.detachAll();
   await registry.disposeAll();
   await registry.load(instanceConfigs(cfg));
+  cachedInstanceDescriptions = null;
   bus.attach(registry.instances());
   // A killed turn's terminal events can die with the old fleet (dispose is
   // async under the hood), stranding the bot busy — and its screen poller —
@@ -3006,6 +3075,38 @@ const server = createServer(async (req, res) => {
         return json(res, status, { error: error instanceof Error ? error.message : "The GitHub team could not be loaded" });
       }
     }
+    if (method === "GET" && path === "/api/teams/scout") {
+      // The scout reads a folder and answers with a suggestion — it creates
+      // nothing. Bots and the room come into being only when the human sends
+      // the suggested manifest through /api/teams/import, so "the agent
+      // proposes, the person imports" is enforced by the route split itself.
+      // The folder is whatever validateBotCwd accepts: the same local-user
+      // trust boundary as pointing any bot's working folder at a path.
+      // Deliberately offline — the community directory lives on its own
+      // route below, so a slow network can never delay the suggestion.
+      const validated = validateBotCwd(url.searchParams.get("cwd"));
+      if (!validated.ok) return json(res, 400, { error: validated.error });
+      if (!validated.cwd) return json(res, 400, { error: "scout needs a folder to read" });
+      const profile = scoutProject(validated.cwd);
+      return json(res, 200, { profile, suggestion: suggestTeam(profile) });
+    }
+    if (method === "GET" && path === "/api/teams/scout/directory") {
+      // Community bots that fit the scouted folder — a separate, lazy call
+      // so an unreachable directory degrades to "no extra candidates", never
+      // to a broken scout.
+      const validated = validateBotCwd(url.searchParams.get("cwd"));
+      if (!validated.ok) return json(res, 400, { error: validated.error });
+      if (!validated.cwd) return json(res, 400, { error: "scout needs a folder to read" });
+      let directory: MatchedDirectoryBot[] = [];
+      try {
+        directory = matchDirectoryBots(scoutProject(validated.cwd), await fetchBotDirectory());
+      } catch (error) {
+        // an unreachable directory is a fact of life, not an error — but an
+        // empty section should still be diagnosable from the server log
+        console.warn("bot directory lookup failed:", error instanceof Error ? error.message : String(error));
+      }
+      return json(res, 200, { directory });
+    }
     if (method === "POST" && path === "/api/teams/import") {
       // Import is additive-only. A manifest is untrusted input (catalog,
       // GitHub, a shared file), so it must be structurally unable to reach
@@ -3126,8 +3227,15 @@ const server = createServer(async (req, res) => {
         if (body[key] !== undefined) patch[key] = body[key];
       }
       if (Array.isArray(body.memberIds)) {
-        const ids = body.memberIds.filter((id: unknown): id is string => typeof id === "string" && Boolean(store.bot(id)));
-        if (ids.length) patch.memberIds = ids;
+        // A DM is the pair it was opened for; only real rooms have a roster.
+        if (existing.dm) return json(res, 400, { error: "direct-message channels cannot change members" });
+        const ids = [
+          ...new Set(
+            body.memberIds.filter((id: unknown): id is string => typeof id === "string" && Boolean(store.bot(id))),
+          ),
+        ];
+        if (!ids.length) return json(res, 400, { error: "a room needs at least one bot" });
+        patch.memberIds = ids;
       }
       if (body.defaultResponder !== undefined) {
         const value = body.defaultResponder as { kind?: unknown; botId?: unknown } | null;
@@ -3158,6 +3266,17 @@ const server = createServer(async (req, res) => {
         else if (typeof body.pinnedMessageId === "string" && /^[\w-]+$/.test(body.pinnedMessageId)) {
           patch.pinnedMessageId = body.pinnedMessageId;
         } else return json(res, 400, { error: "pinnedMessageId must be a message id" });
+      }
+      // same contract as a bot's sidebar section: null/"" clears, 60 chars max
+      if (body.section !== undefined) {
+        if (body.section === null) patch.section = undefined;
+        else if (typeof body.section !== "string") return json(res, 400, { error: "section must be a string" });
+        else {
+          const trimmed = body.section.trim();
+          if (!trimmed) patch.section = undefined;
+          else if (trimmed.length > 60) return json(res, 400, { error: "section must be at most 60 characters" });
+          else patch.section = trimmed;
+        }
       }
       const group = store.patchGroup(m[1], patch);
       if (!group) return json(res, 404, { error: "no such room" });
@@ -3587,8 +3706,8 @@ const server = createServer(async (req, res) => {
             return json(res, 202, { ok: true, steered: true });
           }
         }
-        const message = queueSteeredMessage(store, bot, text);
-        return json(res, 202, { ok: true, queued: true, messageId: message.id });
+        const queued = queueSteeredMessage(bot, text);
+        return json(res, 202, { ok: true, queued: true, queueId: queued.id, threadId: bot.threadId });
       }
       await startTurn(bot.id, text);
       return json(res, 202, { ok: true });
@@ -3718,6 +3837,74 @@ const server = createServer(async (req, res) => {
       activeLeafId: store.activeLeaf(bot.threadId),
       tasks: store.tasks(bot.id).map(wireTask),
     });
+
+    // A picker model change is one server-owned transition: resolve the
+    // stable catalog id to this driver's native id, enforce cached admission,
+    // persist the selection, then move onto a provider-session-isolated task.
+    // This avoids a PATCH/POST race where the new task could start with the
+    // previous engine or model.
+    m = path.match(/^\/api\/bots\/([\w-]+)\/model$/);
+    if (m && method === "POST") {
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      if (bot.busy) {
+        return json(res, 409, { error: "this bot is working — let it finish before changing model" });
+      }
+      const parsedBody = modelSwitchBodySchema.safeParse(await readBody(req));
+      if (!parsedBody.success) {
+        return json(res, 400, { error: "instanceId, model, optional canonicalId, and optional effort must be valid" });
+      }
+      const body = parsedBody.data;
+      const { instanceId, model: requestedModel, canonicalId } = body;
+
+      if (!cachedInstanceDescriptions) {
+        return json(res, 409, { error: "engine inventory is not loaded — refresh engines first" });
+      }
+      const instances = projectFleetModels(cachedInstanceDescriptions, fleetModelCatalog.snapshot());
+      const target = instances.find((instance) => instance.instanceId === instanceId);
+      if (!target || target.snapshot.state !== "available" || !registry.get(instanceId)) {
+        return json(res, 409, {
+          error: target?.snapshot.reason ?? `provider instance "${instanceId}" is unavailable`,
+        });
+      }
+      const option = target.models.options.find((candidate) =>
+        canonicalId ? candidate.canonicalId === canonicalId : candidate.id === requestedModel
+      );
+      if (!option) {
+        return json(res, 400, { error: "that model is not in the cached catalog for this engine" });
+      }
+      if (option.selectable === false) {
+        return json(res, 409, { error: option.reason ?? "that model is not currently selectable" });
+      }
+      if (body.effort !== undefined) {
+        const allowed: readonly string[] = target.capabilities.effortLevels ?? [];
+        if (!allowed.includes(body.effort)) {
+          return json(res, 400, { error: `effort "${body.effort}" is not offered by this bot's engine` });
+        }
+      }
+      const selection: ModelSelection = {
+        instanceId,
+        model: option.id,
+      };
+      if (body.effort !== undefined) selection.effort = body.effort;
+      if (
+        bot.modelSelection.instanceId === selection.instanceId &&
+        bot.modelSelection.model === selection.model &&
+        bot.modelSelection.effort === selection.effort
+      ) {
+        return json(res, 200, { bot: botWithThread(bot), task: null, changed: false });
+      }
+      let transition: ReturnType<typeof store.switchModelAndCreateTask>;
+      try {
+        transition = store.switchModelAndCreateTask(bot.id, selection);
+      } catch {
+        return json(res, 500, { error: "couldn't create a fresh task for that model" });
+      }
+      if (!transition) return json(res, 404, { error: "no such bot" });
+      const fresh = botWithThread(transition.bot);
+      broadcast({ kind: "bot", bot: fresh });
+      return json(res, 201, { bot: fresh, task: wireTask(transition.task), changed: true });
+    }
 
     m = path.match(/^\/api\/bots\/([\w-]+)\/tasks$/);
     if (m && method === "POST") {
@@ -3919,12 +4106,35 @@ const server = createServer(async (req, res) => {
 
     // ── provider instances (model picker) ──
     if (method === "GET" && path === "/api/instances") {
-      // Rescan PATH first: this endpoint is how the app answers "what can I
-      // run?", and the interesting case is a CLI installed since launch.
-      // Windows never pushes PATH changes into a live process, so without
-      // this the answer is frozen at boot and "check again" is a no-op.
-      resetPathCache();
-      return json(res, 200, { instances: await registry.describe() });
+      // Cached by default: opening the model picker or restoring app state
+      // must not fan out to every CLI/provider. Setup screens opt into a live
+      // provider refresh with ?refresh=1; the fleet-catalog picker has its own
+      // file-only POST below.
+      const refreshModels = url.searchParams.get("refresh") === "1";
+      if (refreshModels) resetPathCache();
+      const instances = projectFleetModels(
+        await instanceDescriptions(refreshModels),
+        fleetModelCatalog.snapshot(),
+      );
+      return json(res, 200, { instances });
+    }
+
+    if (method === "GET" && path === "/api/model-catalog") {
+      return json(res, 200, { catalog: fleetModelCatalog.snapshot() });
+    }
+
+    if (method === "POST" && path === "/api/model-catalog/refresh") {
+      // Reload only the guarded projection. Admission/discovery is owned by
+      // its producer; this action does not probe a provider or model host.
+      const catalog = fleetModelCatalog.refresh();
+      if (!cachedInstanceDescriptions) {
+        return json(res, 409, {
+          error: "engine inventory is not loaded — load instances before refreshing the model catalog",
+          catalog,
+        });
+      }
+      const instances = projectFleetModels(cachedInstanceDescriptions, catalog);
+      return json(res, 200, { catalog, instances });
     }
 
     // ── CLI binary discovery for the Engines "detected" dropdown ──
@@ -3987,7 +4197,9 @@ const server = createServer(async (req, res) => {
         // from the memoized PATH, so resetting after would answer this request
         // with the pre-reset cache
         resetPathCache();
-        return json(res, 200, { instances: await registry.describe() });
+        return json(res, 200, {
+          instances: projectFleetModels(await instanceDescriptions(true), fleetModelCatalog.snapshot()),
+        });
       } finally {
         providerConfigBusy = false;
       }
