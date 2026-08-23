@@ -14,6 +14,10 @@ import { decodeInjectId, hostApiKey, INJECT_SEP, localHost, mergeLocalInject } f
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
 const EMPTY: ModelCatalog = { default: "", options: [] };
+// Canonical fleet routes use Hermes' provider:model dialect. Keep ordinary
+// provider slugs on the existing ACP default path; only a producer-owned
+// route alias (or a guarded local inject id below) is sent to set_model.
+const HERMES_FLEET_MODEL_ID = /^(?![\s\S]*[\r\n])[\w][\w./+-]*:[\w][\w./:+-]*$/;
 
 export const HERMES_OPENMAUS_SCREENSHOT_COMPAT = "HERMES_OPENMAUS_SCREENSHOT_COMPAT";
 export const HERMES_OPENMAUS_SCREENSHOT_COMPAT_MODEL = "HERMES_OPENMAUS_SCREENSHOT_COMPAT_MODEL";
@@ -92,16 +96,17 @@ export function ensureHermesInjectProvider(
   return hermesAcpModelId(modelId) ?? modelId;
 }
 
-/** ACP session/set_model id. Hermes parse_model_input treats `custom:name:model`. */
+/** ACP session/set_model id. Local inject rows become `custom:name:model`;
+ * fleet-catalog rows are already Hermes-native aliases and pass through. */
 export function hermesAcpModelId(modelId: string | null | undefined): string | null {
   const inject = decodeInjectId(modelId);
   if (inject) return `custom:${inject.host}:${inject.model}`;
-  // Hermes' own ACP ids are `<provider>:<model>` (`openrouter:qwen/qwen3.8-max`).
-  // They are not inject ids and must be forwarded untouched; returning null here
-  // is what limited the picker to locally injected hosts.
-  const native = typeof modelId === "string" ? modelId.trim() : "";
-  if (native && !native.includes(INJECT_SEP) && /^[a-z0-9_-]+:[\w./:-]+$/i.test(native)) return native;
-  return null;
+  // Hermes' own ACP ids are `<provider>:<model>` and fleet aliases use the
+  // same dialect. Reject whitespace and line breaks instead of trimming them,
+  // so malformed picker values can never become session/set_model input.
+  return typeof modelId === "string" && HERMES_FLEET_MODEL_ID.test(modelId)
+    ? modelId
+    : null;
 }
 
 /** The id used when Hermes should run on the provider its own config names.
