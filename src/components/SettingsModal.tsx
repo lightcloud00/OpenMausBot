@@ -89,7 +89,7 @@ function UpdatesRow() {
           void updater.check();
         }}
         disabled={s?.status === "checking" || s?.status === "downloading"}
-        className="rounded-lg border border-hairline/40 px-3 py-1.5 text-[13px] text-ink hover:bg-raised disabled:opacity-40"
+        className="rounded-lg border border-hairline/40 px-3 py-1.5 text-[13px] text-ink hover:bg-control disabled:opacity-40"
       >
         {s?.status === "available"
           ? "Download"
@@ -130,9 +130,57 @@ function AnalyticsRow() {
 }
 
 const cnSwitch = (on: boolean) =>
-  `relative h-6 w-11 shrink-0 rounded-full transition-colors ${on ? "bg-accent" : "bg-raised"}`;
+  `relative h-6 w-11 shrink-0 rounded-full transition-colors ${on ? "bg-accent" : "bg-control"}`;
 const cnKnob = (on: boolean) =>
   `absolute top-[3px] h-[18px] w-[18px] rounded-full bg-white transition-all ${on ? "left-[21px]" : "left-[3px]"}`;
+
+/** Writes a redacted diagnostics file to a location the user picks. The
+ * report holds versions, configured-or-not booleans and the server.log tail —
+ * never credential values (the desktop shell does not read secret fields). */
+function DiagnosticsRow() {
+  const [exporting, setExporting] = useState(false);
+  const [result, setResult] = useState<{ kind: "success" | "error"; message: string } | null>(null);
+
+  const exportDiagnostics = async () => {
+    if (!window.ogb?.exportDiagnostics || exporting) return;
+    setExporting(true);
+    setResult(null);
+    try {
+      const path = await window.ogb.exportDiagnostics();
+      if (path) setResult({ kind: "success", message: `Saved to ${path}` });
+    } catch (e) {
+      setResult({ kind: "error", message: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  return (
+    <Card
+      title="Diagnostics"
+      subtitle="Versions, configuration on/off state and a redacted server log tail. Review the file before sharing it."
+    >
+      <div className="flex min-w-0 flex-col items-end gap-2">
+        <button
+          onClick={() => void exportDiagnostics()}
+          disabled={exporting}
+          aria-label="Export diagnostics to a text file"
+          className="rounded-lg border border-hairline/40 px-3 py-1.5 text-[13px] text-ink hover:bg-control disabled:opacity-40"
+        >
+          {exporting ? "Exporting…" : "Export Diagnostics…"}
+        </button>
+        {result ? (
+          <span
+            role={result.kind === "error" ? "alert" : "status"}
+            className={`max-w-64 break-all text-right text-[12px] ${result.kind === "error" ? "text-danger" : "text-success"}`}
+          >
+            {result.message}
+          </span>
+        ) : null}
+      </div>
+    </Card>
+  );
+}
 
 export function SettingsModal() {
   const { state, dispatch } = useStore();
@@ -207,7 +255,7 @@ export function SettingsModal() {
               aria-current={section === id ? "page" : undefined}
               className={cn(
                 "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[14px]",
-                section === id ? "bg-raised text-ink" : "text-ink-secondary hover:bg-raised/50 hover:text-ink",
+                section === id ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/50 hover:text-ink",
               )}
             >
               <Icon size={15} />
@@ -224,7 +272,7 @@ export function SettingsModal() {
             <button
               onClick={() => dispatch({ type: "toggleAppSettings", open: false })}
               aria-label="Close settings"
-              className="rounded-md p-1 text-ink-secondary hover:bg-raised hover:text-ink"
+              className="rounded-md p-1 text-ink-secondary hover:bg-control hover:text-ink"
             >
               <X size={18} />
             </button>
@@ -243,6 +291,7 @@ export function SettingsModal() {
                   <RoomTurnTimeoutSettings />
                 </Card>
                 <UpdatesRow />
+                <DiagnosticsRow />
                 <AnalyticsRow />
               </>
             )}

@@ -86,20 +86,11 @@ contextBridge.exposeInMainWorld("ogb", {
       return () => ipcRenderer.removeListener("desktop-viewer:state", handler);
     },
   },
-  /** Two sandboxed Local VM viewers embedded in the owning app window. */
-  desktopWorkspace: {
-    open: (input) => ipcRenderer.invoke("desktop-workspace:open", input),
-    layout: (items) => ipcRenderer.invoke("desktop-workspace:layout", items),
-    setInteractive: (contextId) => ipcRenderer.invoke("desktop-workspace:set-interactive", contextId),
-    close: (contextId) => ipcRenderer.invoke("desktop-workspace:close", contextId),
-    onState: (cb) => {
-      const handler = (_event, state) => cb(state);
-      ipcRenderer.on("desktop-workspace:state", handler);
-      return () => ipcRenderer.removeListener("desktop-workspace:state", handler);
-    },
-  },
   /** Native folder picker for a bot's working folder; null when cancelled. */
   pickFolder: (current) => ipcRenderer.invoke("desktop:pick-folder", current),
+  /** Writes the redacted diagnostics report to a user-chosen file; resolves
+   * the path, or null when the save dialog was cancelled. */
+  exportDiagnostics: () => ipcRenderer.invoke("desktop:export-diagnostics"),
   /** Store a provider credential with OS-backed encryption. */
   setCredential: (name, value) => ipcRenderer.invoke("credential:set", name, value),
 
