@@ -82,6 +82,10 @@ import {
 import * as tts from "./tts/index.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { buildTurnContext, engineIsFresh } from "./turn-context.ts";
+import {
+  appendPromptRetrievalContext,
+  retrievePromptContext,
+} from "./prompt-retrieval.ts";
 import { TurnWatchdog } from "./turn-watchdog.ts";
 import {
   ensureWorkspace,
@@ -1436,6 +1440,11 @@ async function startTurn(
 
   void (async () => {
     try {
+      const retrievalContext = await retrievePromptContext(text, threadId);
+      const providerTurnText = appendPromptRetrievalContext(
+        turnText,
+        retrievalContext,
+      );
       const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
       const selectedSkills = selectBundledSkills(
         text,
@@ -1659,7 +1668,7 @@ async function startTurn(
       watchdog.watch(threadId, bot.id);
       await instance.adapter.sendTurn({
         threadId,
-        text: turnText,
+        text: providerTurnText,
         model,
         effort,
         // a rewound thread never resumes the abandoned branch's session
@@ -1818,6 +1827,13 @@ function serializeRoomContext(threadId: string, userName: string): string {
     .join("\n");
 }
 
+function latestRoomUserPrompt(threadId: string): string {
+  return [...store.messagesFor(threadId)]
+    .reverse()
+    .find((message) => message.role === "user" && message.kind === "text" && message.text)
+    ?.text ?? "";
+}
+
 
 // comms bus: passed into the visibility helpers in comms-visibility.ts so
 // they can mirror messages + chips without re-deriving SSE plumbing. Same
@@ -1932,6 +1948,11 @@ async function runGroupMemberTurn(
   const text = `${serializeRoomContext(group.threadId, userName)}\n\n(Reply to the conversation above as ${bot.name}.)${
     connectorContinuation ? `\n\n${connectorContinuation}` : ""
   }`;
+  const retrievalContext = await retrievePromptContext(
+    latestRoomUserPrompt(group.threadId),
+    group.threadId,
+  );
+  const providerTurnText = appendPromptRetrievalContext(text, retrievalContext);
 
   // same workspace + memory as a 1:1 turn — the room is a different
   // conversation, not a different bot
@@ -1985,7 +2006,7 @@ async function runGroupMemberTurn(
     instance.adapter
       .sendTurn({
         threadId: group.threadId,
-        text,
+        text: providerTurnText,
         system: roomSystem,
         cwd,
         integrations,
