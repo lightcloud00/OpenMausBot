@@ -352,6 +352,35 @@ describe("comms e2e (fake ACP fleet)", () => {
         (m: any) => m.kind === "activity" && m.tool?.name === "Message from @Asker",
       );
       expect(helperNote?.comm?.groupId).toBe(note.comm.groupId);
+
+      // Queue and dispatch share one stable task id in the existing
+      // decision ledger. The row intentionally names only the target id and
+      // attempt count: prompts and provider output belong in the thread,
+      // never this fleet-wide audit stream.
+      const ledgerDeadline = Date.now() + 5_000;
+      let delegationRows: any[] = [];
+      for (;;) {
+        const decisions = await api("GET", "/api/decisions");
+        expect(decisions.status).toBe(200);
+        delegationRows = decisions.body.decisions.filter(
+          (row: any) => row.threadId === asker.threadId && row.tool === "delegate_bot",
+        );
+        if (
+          delegationRows.some((row: any) => row.decision === "delegation-queued") &&
+          delegationRows.some((row: any) => row.decision === "delegation-completed")
+        ) break;
+        if (Date.now() > ledgerDeadline) {
+          throw new Error(`delegation ledger never settled: ${JSON.stringify(delegationRows)}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const queuedRow = delegationRows.find((row: any) => row.decision === "delegation-queued");
+      const completedRow = delegationRows.find((row: any) => row.decision === "delegation-completed");
+      expect(completedRow.requestId).toBe(queuedRow.requestId);
+      expect(delegationRows.every((row: any) => row.source === "delegation")).toBe(true);
+      expect(delegationRows.every((row: any) => /^target:[^;]+;attempts:\d+$/.test(row.summary))).toBe(true);
+      expect(JSON.stringify(delegationRows)).not.toContain("delegated task");
+      expect(JSON.stringify(delegationRows)).not.toContain("hello from fake acp");
       expect(helperBot.busy).toBeFalsy();
       expect(askerBot.busy).toBeFalsy();
     },

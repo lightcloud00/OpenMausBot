@@ -26,13 +26,20 @@ import { join } from "node:path";
 import type { AutoVerdictSource } from "./auto-approve.ts";
 import { redactSecrets } from "./redact.ts";
 
-export type DecisionKind = "auto-approved" | "card-shown" | "user-approved" | "user-denied";
+export type DecisionKind =
+  | "auto-approved"
+  | "card-shown"
+  | "user-approved"
+  | "user-denied"
+  | "delegation-queued"
+  | "delegation-completed"
+  | "delegation-failed";
 
 /** Who or what produced the decision. The AutoVerdictSource values carry
  * straight through from auto-approve.ts; `question` marks the cards a rule
  * may never answer, `auto-fallback` a card shown because an auto-approval
  * could not be delivered, and `user` the human's answer to a card. */
-export type DecisionSource = AutoVerdictSource | "question" | "auto-fallback" | "user";
+export type DecisionSource = AutoVerdictSource | "question" | "auto-fallback" | "user" | "delegation";
 
 export interface DecisionRow {
   at: string;

@@ -11,9 +11,15 @@ import type { CommsBus } from "./comms-visibility.ts";
 import { DATA_DIR } from "./config.ts";
 import type { ModelSelection } from "./contracts.ts";
 import {
+  _loadPending,
+  _resetPending,
   drainDelegations,
+  drainReadyDelegations,
+  discardDelegations,
+  pendingThreads,
   queueDelegation,
   _pendingCount,
+  type DelegationOutcome,
 } from "./delegations.ts";
 import { peerAllowKey, resolvePeerComms } from "./peer-approval.ts";
 import { Store, type BotRecord } from "./store.ts";
@@ -80,7 +86,7 @@ describe("queueDelegation", () => {
       message: "self-talk",
       depth: 0,
     }, 1);
-    expect(result).toBe("self");
+    expect(result).toEqual({ state: "failed", reason: "self" });
     expect(_pendingCount(from.threadId)).toBe(0);
   });
 
@@ -90,7 +96,7 @@ describe("queueDelegation", () => {
       message: "next task",
       depth: 1,
     }, 1);
-    expect(result).toBe("too_deep");
+    expect(result).toEqual({ state: "failed", reason: "too_deep" });
     expect(_pendingCount(from.threadId)).toBe(0);
   });
 
@@ -100,7 +106,7 @@ describe("queueDelegation", () => {
       message: "where?",
       depth: 0,
     }, 1);
-    expect(result).toBe("no_target");
+    expect(result).toEqual({ state: "failed", reason: "no_target" });
     expect(_pendingCount(from.threadId)).toBe(0);
   });
 
@@ -111,7 +117,7 @@ describe("queueDelegation", () => {
       reason: "followup",
       depth: 0,
     }, 1);
-    expect(result).toBe("ok");
+    expect(result).toMatchObject({ state: "queued", duplicate: false });
     expect(_pendingCount(from.threadId)).toBe(1);
 
     const chip = store
@@ -131,6 +137,20 @@ describe("queueDelegation", () => {
     expect(broadcast).toBeTruthy();
   });
 
+  it("deduplicates repeated identical requests by one stable task id", () => {
+    const outcomes: DelegationOutcome[] = [];
+    const item = { toBotId: target.id, message: "do this once", reason: "same task", depth: 0 };
+    const first = queueDelegation(commsBus, from, item, 1, from.threadId, (event) => outcomes.push(event));
+    const retry = queueDelegation(commsBus, from, item, 1, from.threadId, (event) => outcomes.push(event));
+
+    expect(first).toMatchObject({ state: "queued", duplicate: false });
+    expect(retry).toEqual({ state: "queued", taskId: first.state === "queued" ? first.taskId : "", duplicate: true });
+    expect(_pendingCount(from.threadId)).toBe(1);
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]).toMatchObject({ state: "queued", reason: "source_turn_active" });
+    expect(store.messagesFor(from.threadId).filter((m) => m.tool?.name?.startsWith("Delegated to @"))).toHaveLength(1);
+  });
+
   it("keys detached routine delegations to their real source thread", async () => {
     const routineTask = store.createTask(from.id, "Routine run", false)!;
     const result = queueDelegation(
@@ -141,7 +161,7 @@ describe("queueDelegation", () => {
       routineTask.threadId,
     );
 
-    expect(result).toBe("ok");
+    expect(result).toMatchObject({ state: "queued", duplicate: false });
     expect(_pendingCount(routineTask.threadId)).toBe(1);
     expect(_pendingCount(from.threadId)).toBe(0);
     expect(
@@ -307,20 +327,58 @@ describe("drainDelegations", () => {
     expect(runTargetCalls).toEqual([]);
   });
 
-  it("skips runTarget and emits a 'is busy' chip when the target is currently busy", async () => {
+  it("keeps one busy-target item queued and drains it once when the target becomes idle", async () => {
+    const outcomes: DelegationOutcome[] = [];
     store.patchBot(target.id, { busy: true });
-    queueDelegation(commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1);
+    const item = { toBotId: target.id, message: "do this", depth: 0 };
+    const first = queueDelegation(
+      commsBus,
+      from,
+      item,
+      1,
+      from.threadId,
+      (event) => outcomes.push(event),
+    );
+    const duplicate = queueDelegation(
+      commsBus,
+      from,
+      item,
+      1,
+      from.threadId,
+      (event) => outcomes.push(event),
+    );
+    expect(first).toMatchObject({ state: "queued", duplicate: false });
+    expect(duplicate).toEqual({
+      state: "queued",
+      taskId: first.state === "queued" ? first.taskId : "",
+      duplicate: true,
+    });
+    expect(_pendingCount(from.threadId)).toBe(1);
     drainDelegations(commsBus, approvalBus, from.threadId, (toBotId, message, commsDepth) => {
       runTargetCalls.push({ toBotId, message, commsDepth });
-    });
+    }, (event) => outcomes.push(event));
     const chip = await waitFor(() =>
       store
         .messagesFor(from.threadId)
-        .find((m) => m.kind === "activity" && (m.tool?.name ?? "").includes("is busy")),
+        .find((m) => m.kind === "activity" && (m.tool?.name ?? "").includes("[target_busy]")),
     );
-    expect(chip.tool?.name).toBe("Delegation to @Helper canceled — @Helper is busy");
-    expect(chip.tool?.ok).toBe(false);
+    expect(chip.tool?.name).toContain("will pick it up when the active turn completes");
+    expect(_pendingCount(from.threadId)).toBe(1);
     expect(runTargetCalls).toEqual([]);
+    await waitFor(() => outcomes.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    store.patchBot(target.id, { busy: false });
+    const runTarget = (toBotId: string, message: string, commsDepth: number) => {
+      runTargetCalls.push({ toBotId, message, commsDepth });
+    };
+    drainReadyDelegations(commsBus, approvalBus, runTarget, (event) => outcomes.push(event));
+    await waitFor(() => runTargetCalls.length === 1 && _pendingCount(from.threadId) === 0);
+    drainReadyDelegations(commsBus, approvalBus, runTarget, (event) => outcomes.push(event));
+
+    expect(runTargetCalls).toHaveLength(1);
+    expect(outcomes.map((event) => event.state)).toEqual(["queued", "queued", "completed"]);
+    expect(outcomes[1]).toMatchObject({ reason: "target_busy", attempts: 1 });
   });
 
   it("asks for approval when approvePeerComms is on, then runs only on allow", async () => {
@@ -402,10 +460,8 @@ describe("drainDelegations", () => {
   });
 });
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { _loadPending, _resetPending, discardDelegations, pendingThreads } from "./delegations.ts";
-
 describe("delegations survive a restart", () => {
   let store: Store;
   let from: BotRecord;
@@ -425,7 +481,10 @@ describe("delegations survive a restart", () => {
   afterEach(() => _resetPending());
 
   it("writes the queue to disk on queue, and clears it on drain and discard", async () => {
-    expect(queueDelegation(buses.commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1)).toBe("ok");
+    expect(queueDelegation(buses.commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1)).toMatchObject({
+      state: "queued",
+      duplicate: false,
+    });
     expect(existsSync(file())).toBe(true);
     const onDisk = JSON.parse(readFileSync(file(), "utf8")) as Record<string, unknown[]>;
     expect(onDisk[from.threadId]).toHaveLength(1);
@@ -501,6 +560,75 @@ describe("delegations survive a restart", () => {
     await waitFor(() => ran.length === 1 && pendingThreads().length === 0);
     expect(ran[0]).toContain("left over");
     expect(pendingThreads()).toEqual([]);
+  });
+
+  it("preserves a busy-target wait across restart and dispatches it once", async () => {
+    store.patchBot(target.id, { busy: true });
+    queueDelegation(buses.commsBus, from, { toBotId: target.id, message: "after restart", depth: 0 }, 1);
+    drainDelegations(buses.commsBus, buses.approvalBus, from.threadId, () => {
+      throw new Error("busy work must not start");
+    });
+    await waitFor(() => _pendingCount(from.threadId) === 1);
+
+    _resetPending();
+    _loadPending();
+    expect(_pendingCount(from.threadId)).toBe(1);
+    store.patchBot(target.id, { busy: false });
+    const ran: string[] = [];
+    const runTarget = async (_to: string, message: string) => {
+      ran.push(message);
+    };
+    drainReadyDelegations(buses.commsBus, buses.approvalBus, runTarget);
+    await waitFor(() => ran.length === 1 && _pendingCount(from.threadId) === 0);
+    drainReadyDelegations(buses.commsBus, buses.approvalBus, runTarget);
+    expect(ran).toHaveLength(1);
+  });
+
+  it("expires an aged busy-target item with a machine-readable reason", async () => {
+    const outcomes: DelegationOutcome[] = [];
+    store.patchBot(target.id, { busy: true });
+    queueDelegation(buses.commsBus, from, { toBotId: target.id, message: "too old", depth: 0 }, 1);
+    drainDelegations(buses.commsBus, buses.approvalBus, from.threadId, () => {});
+    await waitFor(() => _pendingCount(from.threadId) === 1);
+
+    const onDisk = JSON.parse(readFileSync(file(), "utf8")) as Record<string, Array<Record<string, unknown>>>;
+    onDisk[from.threadId]![0]!.queuedAt = "2000-01-01T00:00:00.000Z";
+    writeFileSync(file(), JSON.stringify(onDisk, null, 2));
+    _resetPending();
+    _loadPending();
+
+    drainReadyDelegations(buses.commsBus, buses.approvalBus, () => {}, (event) => outcomes.push(event));
+    await waitFor(() => outcomes.some((event) => event.reason === "expired"));
+    expect(_pendingCount(from.threadId)).toBe(0);
+    expect(outcomes.at(-1)).toMatchObject({ state: "failed", reason: "expired" });
+    expect(store.messagesFor(from.threadId).some((m) => m.tool?.name.includes("[expired]"))).toBe(true);
+  });
+
+  it("bounds repeated busy races and reports retry_limit", async () => {
+    const outcomes: DelegationOutcome[] = [];
+    queueDelegation(buses.commsBus, from, { toBotId: target.id, message: "racy target", depth: 0 }, 1);
+    let calls = 0;
+    const busyRace = () => {
+      calls += 1;
+      throw Object.assign(new Error("the bot is already working"), { status: 409 });
+    };
+
+    drainDelegations(buses.commsBus, buses.approvalBus, from.threadId, busyRace, (event) => outcomes.push(event));
+    await waitFor(() => outcomes.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    drainReadyDelegations(buses.commsBus, buses.approvalBus, busyRace, (event) => outcomes.push(event));
+    await waitFor(() => outcomes.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    drainReadyDelegations(buses.commsBus, buses.approvalBus, busyRace, (event) => outcomes.push(event));
+    await waitFor(() => outcomes.length === 3);
+
+    expect(calls).toBe(3);
+    expect(_pendingCount(from.threadId)).toBe(0);
+    expect(outcomes.map((event) => [event.state, event.reason, event.attempts])).toEqual([
+      ["queued", "target_busy", 1],
+      ["queued", "target_busy", 2],
+      ["failed", "retry_limit", 3],
+    ]);
   });
 
   it("tolerates a missing or corrupt file", () => {

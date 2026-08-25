@@ -66,7 +66,16 @@ import { EFFORT_LEVELS, isEffortLevel, type ModelSelection, type RequestOutcome,
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
 import { searchMessages } from "./message-db.ts";
-import { _loadPending, discardDelegations, drainDelegations, pendingThreads, queueDelegation, type QueueResult } from "./delegations.ts";
+import {
+  _loadPending,
+  discardDelegations,
+  drainDelegations,
+  drainReadyDelegations,
+  pendingThreads,
+  queueDelegation,
+  type DelegationRecorder,
+  type QueueFailureReason,
+} from "./delegations.ts";
 import { drainSteeredMessages, queueSteeredMessage } from "./steer-queue.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
@@ -1125,7 +1134,29 @@ bus.subscribe((event: RuntimeEvent) => {
 /** How a drained delegation becomes a real turn on the target. Shared by
  * the settle-time drain and the boot-time drain of what a previous process
  * left queued. */
-const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text, commsDepth, sourceThreadId, channel) => {
+const recordDelegationOutcome: DelegationRecorder = (outcome) => {
+  const source = store.botByThread(outcome.sourceThreadId);
+  const decision = outcome.state === "queued"
+    ? "delegation-queued"
+    : outcome.state === "completed"
+      ? "delegation-completed"
+      : "delegation-failed";
+  appendDecision(DATA_DIR, {
+    threadId: outcome.sourceThreadId,
+    requestId: outcome.taskId,
+    botId: source?.id,
+    botName: source?.name,
+    tool: "delegate_bot",
+    summary: `target:${outcome.toBotId};attempts:${outcome.attempts}`,
+    decision,
+    source: "delegation",
+    rule: outcome.reason,
+    unattended: source ? isUnattended(source.id) : undefined,
+  });
+};
+
+const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text, commsDepth, sourceThreadId, channel) =>
+  new Promise<void>((resolve, reject) => {
     // startTurn REJECTS on an ordinary condition — busy target, deleted bot,
     // unavailable provider. Unhandled, that rejection is fatal to the
     // harness (Node's default), which in the packaged app kills the server
@@ -1133,10 +1164,10 @@ const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text,
     const targetThreadId = store.bot(toBotId)?.threadId;
     if (targetThreadId) delegationWatch.set(targetThreadId, { channelId: channel?.id, toBotId });
     let failureReported = false;
+    let settled = false;
     const reportStartFailure = (error: unknown) => {
-      if (failureReported) return;
+      if (failureReported || settled) return;
       failureReported = true;
-      const bot = store.bot(toBotId);
       const why = error instanceof Error ? error.message : String(error);
       if (targetThreadId) {
         finalizeDelegationWatch(
@@ -1146,33 +1177,43 @@ const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text,
           `Delegated turn could not start — ${why.slice(0, 120)}`,
         );
       }
-      const source = store.botByThread(sourceThreadId);
-      if (!source) return;
-      store.appendMessage(sourceThreadId, {
-        role: "bot",
-        kind: "activity",
-        tool: { name: `error: delegation to @${bot?.name ?? toBotId} could not start — ${why.slice(0, 120)}`, ok: false },
-      });
+      if (!settled) {
+        settled = true;
+        const failure = error instanceof Error ? error : new Error(why);
+        reject(failure);
+      }
     };
-    return startTurn(toBotId, text, {
+    const reportStarted = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    void startTurn(toBotId, text, {
       commsDepth,
       unattended: isUnattended(store.botByThread(sourceThreadId)?.id),
       // startTurn schedules provider/integration setup after marking the bot
       // busy. Those asynchronous setup failures do not emit turn.completed,
       // so clear the watch and report them through this callback too.
-      onDispatchError: reportStartFailure,
-    }).catch((err) => {
-      reportStartFailure(err);
-    });
-};
+      onDispatchError: (message) => reportStartFailure(new Error(message)),
+      onDispatched: reportStarted,
+    }).catch(reportStartFailure);
+  });
 
 bus.subscribe((event: RuntimeEvent) => {
   if (event.type !== "turn.completed") return;
   // A turn that failed or was interrupted drops its queue rather than
   // firing it later: the user who hit Stop does not expect the delegations
   // that turn queued to run anyway, minutes later, on an unrelated turn.
-  if (!event.ok) return void discardDelegations(commsBus, event.threadId);
-  drainDelegations(commsBus, approvalBus, event.threadId, runDelegatedTurn);
+  if (!event.ok) return void discardDelegations(commsBus, event.threadId, recordDelegationOutcome);
+  drainDelegations(commsBus, approvalBus, event.threadId, runDelegatedTurn, recordDelegationOutcome);
+});
+
+// A busy target is a temporary state, not a terminal delegation failure.
+// The main runtime fold runs before this subscriber and has already changed
+// the completed bot to idle, so one event can drain each eligible wait once.
+bus.subscribe((event: RuntimeEvent) => {
+  if (event.type !== "turn.completed") return;
+  drainReadyDelegations(commsBus, approvalBus, runDelegatedTurn, recordDelegationOutcome);
 });
 
 // ── steer-queue drain: messages sent while the bot was busy ────────────
@@ -1340,6 +1381,7 @@ async function startTurn(
      * masquerading as another message authored by the user. */
     connectorContinuation?: boolean;
     onDispatchError?: (message: string) => void;
+    onDispatched?: () => void;
   },
 ) {
   const bot = store.bot(botId);
@@ -1715,6 +1757,7 @@ async function startTurn(
       if (rewound) store.patchBot(bot.id, { rewound: false, resumeCursors: {} });
       // and this engine now owns the thread's most recent turn
       store.markTaskDispatched(bot.id, threadId, instanceId);
+      opts?.onDispatched?.();
       // a turn can settle before dispatch returns, and a poller started
       // after its own turn.completed would never be torn down — it would
       // keep polling the box forever, carrying dead per-turn state. busy
@@ -1861,7 +1904,9 @@ _loadPending();
 {
   const leftover = pendingThreads();
   if (leftover.length) console.log(`delegations: ${leftover.length} thread(s) with queued handoffs from a previous run — draining`);
-  for (const threadId of leftover) drainDelegations(commsBus, approvalBus, threadId, runDelegatedTurn);
+  for (const threadId of leftover) {
+    drainDelegations(commsBus, approvalBus, threadId, runDelegatedTurn, recordDelegationOutcome);
+  }
 }
 
 async function runGroupMemberTurn(
@@ -2594,24 +2639,30 @@ const server = createServer(async (req, res) => {
           { toBotId, message, reason, depth },
           MAX_COMMS_DEPTH,
           fromThreadId,
+          recordDelegationOutcome,
         );
-        if (result !== "ok") {
+        if (result.state === "failed") {
           // the agent reads this string — a bare enum ("too_deep") tells it
           // nothing about what to do instead
-          const said: Record<Exclude<QueueResult, "ok">, string> = {
+          const said: Record<QueueFailureReason, string> = {
             self: "a bot cannot delegate to itself",
             too_deep: "delegation chains are limited to one hop — do this one yourself",
             no_target: "no such bot",
             too_many: "too many delegations queued on this turn — finish some first",
           };
-          return json(res, 200, { error: said[result] });
+          return json(res, 200, { state: "failed", error: said[result.reason], reason: result.reason });
         }
         const targetName = store.bot(toBotId)?.name ?? toBotId;
         return json(res, 200, {
+          state: "queued",
           queued: true,
-          message: from.approvePeerComms
-            ? `Queued for review — @${targetName} will only pick it up if the user approves after your turn finishes.`
-            : `Delegation queued — @${targetName} will pick it up after your current turn finishes.`,
+          taskId: result.taskId,
+          duplicate: result.duplicate,
+          message: result.duplicate
+            ? `Delegation already queued — @${targetName} will receive the existing task once eligible.`
+            : from.approvePeerComms
+              ? `Queued for review — @${targetName} will only pick it up if the user approves after your turn finishes.`
+              : `Delegation queued — @${targetName} will pick it up after your current turn finishes.`,
         });
       }
       if (method === "POST" && path === "/api/internal/connectors/mcp") {
@@ -3633,7 +3684,7 @@ const server = createServer(async (req, res) => {
       // a peer approval naming this bot can never be meaningfully answered
       // now, and its caller would otherwise wait out the 15-minute timeout
       cancelPeerApprovalsFor(bot.id);
-      discardDelegations(commsBus, bot.threadId);
+      discardDelegations(commsBus, bot.threadId, recordDelegationOutcome, true);
       computerControl.forget(bot.id);
       const target = perBotLocalVmTarget(bot.id);
       localVmIdles.get(target.key)?.cancel();
