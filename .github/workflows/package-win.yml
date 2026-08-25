@@ -13,12 +13,22 @@
 name: Package Windows
 
 on:
+  # Keep the workflow discoverable when it first lands on the default branch.
+  # Subsequent app changes remain manual; only edits to this workflow package
+  # the exact main commit automatically.
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/package-win.yml
   workflow_dispatch:
     inputs:
       ref:
         description: "Commit/tag/branch to build (defaults to the branch this is run from)"
         required: false
         type: string
+
+permissions:
+  contents: read
 
 jobs:
   package:
