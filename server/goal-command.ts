@@ -77,7 +77,10 @@ export function parseGoalCommand(text: string): ParsedGoalCommand | null {
   const tokens = words(tail);
   const first = tokens.shift() ?? "";
   const verb = first.toLowerCase();
-  if (verb === "pause" || verb === "resume" || verb === "clear") return { action: verb };
+  if (verb === "pause" || verb === "resume" || verb === "clear") {
+    if (tokens.length) throw new Error(`/goal ${verb} does not accept extra arguments`);
+    return { action: verb };
+  }
   if (verb === "done" || verb === "complete") {
     const { proof, remaining } = proofArgument(tokens);
     if (!proof || remaining.length) throw new Error("/goal done requires exactly --proof /absolute/path");

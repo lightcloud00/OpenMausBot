@@ -48,4 +48,8 @@ export const SPAWNED_PROXIES = {
   // bundle preserves them; the main server remains ESM.
   telemetrySink: resolveProxy("telemetry-sink", ".cjs"),
   phone: resolveProxy("drivers/phone-proxy"),
+  // Loaded by the external `pi` process via `-e`, not by this server — but
+  // resolved through the same single source of truth so the packaged layout
+  // check can assert it ships.
+  piMcpExtension: resolveProxy("drivers/pi-mcp-extension"),
 } as const;

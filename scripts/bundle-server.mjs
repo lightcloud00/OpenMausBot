@@ -20,6 +20,7 @@
 import { build } from "esbuild";
 import { execFileSync } from "node:child_process";
 import { copyFile, rm } from "node:fs/promises";
+import { copyFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -35,6 +36,19 @@ try {
 } catch {
   // Source identity remains explicit when the build is made from an archive.
 }
+
+// yaml's Node export is CommonJS and contains dynamic requires that cannot run
+// after it is inlined into our ESM-only packaged server. Its browser export is
+// the same pure-JS parser without those Node shims, so resolve only this package
+// to that entry while leaving every other dependency on the Node condition.
+const yamlEsmPlugin = {
+  name: "yaml-esm",
+  setup(build) {
+    build.onResolve({ filter: /^yaml$/ }, () => ({
+      path: join(root, "node_modules", "yaml", "browser", "index.js"),
+    }));
+  },
+};
 
 // Every file run as its own process. Keep in sync with the spawn sites above.
 const ENTRY_POINTS = [
@@ -71,6 +85,7 @@ await build({
   allowOverwrite: true,
   define: { __OMB_SOURCE_SHA__: JSON.stringify(sourceSha) },
   logLevel: "info",
+  plugins: [yamlEsmPlugin],
 });
 
 // The OpenTelemetry/Sentry dependency graph contains dynamic CommonJS
@@ -99,3 +114,13 @@ await copyFile(
   join(server, "credential-redacting-node-launcher.cmd"),
   join(root, "dist-server", "credential-redacting-node-launcher.cmd"),
 );
+
+// pi-mcp-extension.ts is NOT an OpenMausBot entry point: it is loaded by the
+// external `pi` process (pi's own jiti), which resolves its
+// @earendil-works/pi-coding-agent and typebox imports from pi's install. Ship
+// it verbatim as .ts so the packaged app has it too — never bundle it, or
+// esbuild would inline pi's packages and the extension would stop loading.
+const piMcpExtSrc = join(server, "drivers", "pi-mcp-extension.ts");
+const piMcpExtDest = join(root, "dist-server", "drivers", "pi-mcp-extension.ts");
+mkdirSync(dirname(piMcpExtDest), { recursive: true });
+copyFileSync(piMcpExtSrc, piMcpExtDest);

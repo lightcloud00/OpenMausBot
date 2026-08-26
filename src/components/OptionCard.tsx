@@ -1,9 +1,24 @@
 import { useState } from "react";
 import { X } from "lucide-react";
-import { useStore, type Message } from "@/state/store";
+import { useStore, visibleMessages, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
 
 const LETTERS = ["A", "B", "C", "D", "E", "F"];
+
+/** First-run quiz, not a live provider ask (those carry requestId). */
+export function isOnboardingCard(message: Message): boolean {
+  return message.kind === "options" && !!message.card && !message.card.requestId;
+}
+
+/** Hide the quiz once they have talked past it — picked an option, typed in
+ * the composer, or dismissed it. Live asks are never this card. */
+export function shouldHideOnboardingCard(message: Message, transcript: Message[]): boolean {
+  if (!isOnboardingCard(message) || !message.card) return false;
+  if (message.card.dismissed || message.card.answered) return true;
+  const index = transcript.findIndex((entry) => entry.id === message.id);
+  if (index < 0) return false;
+  return transcript.slice(index + 1).some((later) => later.role === "user" && later.kind === "text");
+}
 
 export function OptionCard({
   botId,
@@ -12,10 +27,14 @@ export function OptionCard({
   botId: string;
   message: Message;
 }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   const [custom, setCustom] = useState("");
   const card = message.card;
-  if (!card || card.dismissed) return null;
+  const bot = state.bots.find((candidate) => candidate.id === botId);
+  const transcript = bot ? visibleMessages(bot) : [];
+  // Full thread, not the mounted window: a search-focus slice can omit the
+  // later user message that means they already talked past this quiz.
+  if (!card || shouldHideOnboardingCard(message, transcript)) return null;
 
   const answer = (text: string) => {
     if (!text.trim()) return;
@@ -35,7 +54,7 @@ export function OptionCard({
           onClick={() =>
             dispatch({ type: "dismissCard", botId, messageId: message.id })
           }
-          className="rounded-md p-1 text-ink-secondary hover:bg-raised hover:text-ink"
+          className="rounded-md p-1 text-ink-secondary hover:bg-control hover:text-ink"
         >
           <X size={16} />
         </button>
@@ -50,12 +69,18 @@ export function OptionCard({
             className={cn(
               "flex w-full items-center gap-3 px-3 py-3 text-left text-[15px] text-ink",
               i > 0 && "border-t border-hairline/40",
+              // `raised` is the wrong fill here: the light skins define it as
+              // pure white, the same value as the card underneath, so a
+              // hovered or answered row used to be invisible. `raised-hover`
+              // is the one tone every skin guarantees stands off a surface.
               card.answered === opt
-                ? "bg-raised"
-                : "hover:bg-raised/60 disabled:hover:bg-transparent",
+                ? "bg-raised-hover"
+                : "hover:bg-raised-hover/60 disabled:hover:bg-transparent",
             )}
           >
-            <span className="flex size-6 items-center justify-center rounded-md bg-raised text-[12px] font-medium text-ink-secondary">
+            {/* `control` is the chip tone every skin guarantees on a card; the
+                hairline keeps it a chip even on a row that is itself filled */}
+            <span className="flex size-6 items-center justify-center rounded-md border border-hairline/50 bg-control text-[12px] font-medium text-ink-secondary">
               {LETTERS[i]}
             </span>
             {opt}

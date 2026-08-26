@@ -28,6 +28,9 @@ describe("OpenMaus /goal adapter", () => {
       objective: "Finish the iOS app",
       replace: true,
     });
+    expect(() => parseGoalCommand("/goal pause later")).toThrow(
+      "/goal pause does not accept extra arguments",
+    );
   });
 
   it("shows before mutation and identifies the OpenMaus lane", async () => {
