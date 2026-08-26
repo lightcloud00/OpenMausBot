@@ -68,6 +68,11 @@ let desktopViewerOwner = null;
 let desktopViewerContextId = null;
 const SMOKE_TEST = process.env.OMB_SMOKE_TEST === "1";
 const SMOKE_CUA = SMOKE_TEST && process.env.OMB_SMOKE_CUA === "1";
+// The Wayland safety lane must enter CUA initialization so the real guard can
+// fail closed, but it must not wait for the crash/retry sequence that only a
+// ready daemon can produce.
+const SMOKE_CUA_CRASH_RETRY =
+  SMOKE_CUA && process.env.OMB_SMOKE_LINUX_CUA_BLOCKED !== "1";
 const SMOKE_BUNDLED_CUA = SMOKE_TEST && process.env.OMB_SMOKE_BUNDLED_CUA === "1";
 const SMOKE_HARD_DEATH_CUA = SMOKE_TEST && process.env.OMB_SMOKE_HARD_DEATH === "1";
 let pendingPackageInstallUrl = packageUrlFromCommandLine(process.argv);
@@ -1017,7 +1022,7 @@ function createWindow() {
           (async () => {
             if (!window.ogb?.getCapabilities) throw new Error("desktop preload bridge is unavailable");
             let crashPromise = null;
-            if (${JSON.stringify(SMOKE_CUA)}) {
+            if (${JSON.stringify(SMOKE_CUA_CRASH_RETRY)}) {
               crashPromise = new Promise((resolve, reject) => {
                 const timeout = setTimeout(() => {
                   unsubscribe?.();

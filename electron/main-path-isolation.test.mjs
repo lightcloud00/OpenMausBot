@@ -52,6 +52,9 @@ it("requires isolated absolute non-root path overrides", () => {
 it("keeps package smoke away from shared credentials, CUA, and updater state by default", () => {
   expect(source).toContain('const SMOKE_TEST = process.env.OMB_SMOKE_TEST === "1";');
   expect(source).toContain('const SMOKE_CUA = SMOKE_TEST && process.env.OMB_SMOKE_CUA === "1";');
+  expect(source).toContain(
+    'SMOKE_CUA && process.env.OMB_SMOKE_LINUX_CUA_BLOCKED !== "1"',
+  );
   expect(source).toContain('const SMOKE_BUNDLED_CUA = SMOKE_TEST && process.env.OMB_SMOKE_BUNDLED_CUA === "1";');
   expect(source).toContain('const SMOKE_HARD_DEATH_CUA = SMOKE_TEST && process.env.OMB_SMOKE_HARD_DEATH === "1";');
   expect(source).toContain("if (app.isPackaged && !SMOKE_TEST)");
