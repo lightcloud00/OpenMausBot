@@ -195,7 +195,11 @@ const desktopEnv = {
   CUA_DRIVER_PATH: sentinel,
   OMB_COMPOSIO_BROKER_URL: `http://127.0.0.1:${brokerAddress.port}`,
   OMB_SMOKE_TEST: "1",
-  OMB_SMOKE_CUA: hardDeath || bundled || sessionBlocked ? "0" : "1",
+  // The Wayland safety lane must still enter the isolated Linux CUA
+  // initializer so it can prove the real seat-safety reason. Disabling CUA
+  // here produces only the generic unsupported-platform fallback and tests
+  // neither the guard nor its user-facing contract.
+  OMB_SMOKE_CUA: hardDeath || bundled ? "0" : "1",
   OMB_SMOKE_BUNDLED_CUA: bundled ? "1" : "0",
 };
 if (hardDeath || signalShutdown) desktopEnv.OMB_SMOKE_KEEP_OPEN = "1";

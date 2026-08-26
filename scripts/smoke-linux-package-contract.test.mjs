@@ -15,4 +15,13 @@ describe("Linux package smoke network isolation", () => {
     expect(packageSmoke).toContain("if (brokerRequests !== 0)");
     expect(packageSmoke).not.toContain("brokerRequests > 0");
   });
+
+  it("enters the isolated CUA initializer for the Wayland safety lane", () => {
+    const packageSmoke = fs.readFileSync(path.join(root, "scripts", "smoke-linux-package.mjs"), "utf8");
+
+    expect(packageSmoke).toContain('OMB_SMOKE_CUA: hardDeath || bundled ? "0" : "1"');
+    expect(packageSmoke).not.toContain(
+      'OMB_SMOKE_CUA: hardDeath || bundled || sessionBlocked ? "0" : "1"',
+    );
+  });
 });
