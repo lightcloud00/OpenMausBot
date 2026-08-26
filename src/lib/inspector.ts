@@ -95,6 +95,11 @@ export function summarizeRuntime(e: RuntimeEvent): { summary: string; tone: Insp
       return { summary: `tokens in ${e.input} · out ${e.output}`, tone: "plain" };
     case "runtime.error":
       return { summary: `${e.setup ? "setup: " : ""}${clip(oneLine(e.message))}`, tone: "error" };
+    case "delegation.status":
+      return {
+        summary: `delegation ${e.state} · ${e.taskId.slice(0, 8)}${e.reason ? ` · ${e.reason}` : ""}`,
+        tone: e.state === "failed" ? "error" : e.state === "completed" ? "boundary" : "plain",
+      };
     default:
       return { summary: (e as { type: string }).type, tone: "plain" };
   }

@@ -118,6 +118,50 @@ describe("readThreadEvents", () => {
     expect(page.entries.map((entry) => (entry.data as { eventId: string }).eventId)).toEqual(["valid-retry"]);
   });
 
+  it("retains metadata-only delegation lifecycle events and rejects malformed states", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    writeFileSync(
+      join(eventsDir, "t1.ndjson"),
+      line(runtime({
+        eventId: "queued",
+        createdAt: "2026-08-17T10:00:00.000Z",
+        type: "delegation.status",
+        taskId: "a".repeat(64),
+        targetBotId: "helper",
+        state: "queued",
+        reason: "target_busy",
+        attemptCount: 1,
+      })) +
+        line(runtime({
+          eventId: "bad",
+          createdAt: "2026-08-17T10:00:01.000Z",
+          type: "delegation.status",
+          taskId: "b".repeat(64),
+          targetBotId: "helper",
+          state: "waiting",
+          attemptCount: 1,
+        })) +
+        line(runtime({
+          eventId: "completed",
+          createdAt: "2026-08-17T10:00:02.000Z",
+          type: "delegation.status",
+          taskId: "a".repeat(64),
+          targetBotId: "helper",
+          state: "completed",
+          reason: "dispatch_accepted",
+          attemptCount: 2,
+        })),
+    );
+
+    const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1" });
+    expect(page.entries.map((entry) => (entry.data as { eventId: string }).eventId)).toEqual([
+      "queued",
+      "completed",
+    ]);
+    expect(page.total.runtime).toBe(3);
+  });
+
   it("keeps walking backward when a corrupt tail record would otherwise consume the limit", () => {
     const eventsDir = tmp();
     const nativeDir = tmp();

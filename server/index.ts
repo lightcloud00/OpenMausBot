@@ -77,7 +77,7 @@ import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
 import { searchMessages } from "./message-db.ts";
 import { promptWithReply, transcriptText } from "./replies.ts";
-import { _loadPending, discardDelegations, drainDelegations, pendingDelegationSnapshot, pendingThreads, queueDelegation, type QueueResult } from "./delegations.ts";
+import { _loadPending, discardDelegations, drainDelegations, drainReadyDelegations, pendingDelegationSnapshot, pendingThreads, queueDelegation } from "./delegations.ts";
 import { drainSteeredMessages, queueSteeredMessage } from "./steer-queue.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
@@ -205,6 +205,7 @@ function authorizedComms(header: string | string[] | undefined): boolean {
 // A→B is allowed but B→C (and A→B→A loops) never start.
 const MAX_COMMS_DEPTH = 1;
 const MAX_WORKSPACE_BOTS = 100;
+const sourceRunIdSchema = z.string().min(16).max(120).regex(/^[A-Za-z0-9_-]+$/);
 // Resolved from the server root — see server/proxy-paths.ts. This descending
 // path happened to survive bundling, but it goes through the same anchor so
 // there is exactly one way proxies are located.
@@ -213,7 +214,7 @@ const phoneProxyPath = SPAWNED_PROXIES.phone;
 // in the packaged app process.execPath is Electron — run the proxy as node
 const AGENTS_NODE_FLAG = { ELECTRON_RUN_AS_NODE: "1" };
 
-function agentsIntegration(botId: string, threadId: string, depth: number) {
+function agentsIntegration(botId: string, threadId: string, depth: number, sourceRunId: string) {
   return {
     command: process.execPath,
     args: [agentsProxyPath],
@@ -222,6 +223,7 @@ function agentsIntegration(botId: string, threadId: string, depth: number) {
       OMB_HARNESS_URL: `http://127.0.0.1:${PORT}`,
       OMB_BOT_ID: botId,
       OMB_THREAD_ID: threadId,
+      OMB_SOURCE_RUN_ID: sourceRunId,
       OMB_COMMS_TOKEN: COMMS_TOKEN,
       OMB_TURN_DEPTH: String(depth),
     },
@@ -1191,15 +1193,36 @@ const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text,
         tool: { name: `error: delegation to @${bot?.name ?? toBotId} could not start — ${why.slice(0, 120)}`, ok: false },
       });
     };
-    return startTurn(toBotId, text, {
-      commsDepth,
-      unattended: isUnattended(store.botByThread(sourceThreadId)?.id),
-      // startTurn schedules provider/integration setup after marking the bot
-      // busy. Those asynchronous setup failures do not emit turn.completed,
-      // so clear the watch and report them through this callback too.
-      onDispatchError: reportStartFailure,
-    }).catch((err) => {
-      reportStartFailure(err);
+    return new Promise((resolve) => {
+      let resolved = false;
+      const finish = (outcome: { state: "completed" | "queued" | "failed"; reason: "dispatch_accepted" | "target_busy" | "dispatch_failed" }) => {
+        if (resolved) return;
+        resolved = true;
+        resolve(outcome);
+      };
+      startTurn(toBotId, text, {
+        commsDepth,
+        unattended: isUnattended(store.botByThread(sourceThreadId)?.id),
+        // The queue becomes terminal only after the provider accepted the
+        // turn and the harness recorded ownership for this task.
+        onDispatchAccepted: () => finish({ state: "completed", reason: "dispatch_accepted" }),
+        // Asynchronous integration/provider setup failures do not emit
+        // turn.completed, so report and settle them through this callback.
+        onDispatchError: (message) => {
+          reportStartFailure(message);
+          finish({ state: "failed", reason: "dispatch_failed" });
+        },
+      }).catch((err) => {
+        const status = (err as { status?: unknown } | null)?.status;
+        const why = err instanceof Error ? err.message : String(err);
+        if (status === 409 && /busy|already working/i.test(why)) {
+          if (targetThreadId) delegationWatch.delete(targetThreadId);
+          finish({ state: "queued", reason: "target_busy" });
+          return;
+        }
+        reportStartFailure(err);
+        finish({ state: "failed", reason: "dispatch_failed" });
+      });
     });
 };
 
@@ -1210,6 +1233,20 @@ bus.subscribe((event: RuntimeEvent) => {
   // that turn queued to run anyway, minutes later, on an unrelated turn.
   if (!event.ok) return void discardDelegations(commsBus, event.threadId);
   drainDelegations(commsBus, approvalBus, event.threadId, runDelegatedTurn);
+});
+
+// Busy-target handoffs wake only from a real turn transition. Direct turns
+// retain an exact bot id; room turns have already released their speaker by
+// this subscriber, so the fallback scans all now-idle targets once. There is
+// no timer and no retry polling.
+bus.subscribe((event: RuntimeEvent) => {
+  if (event.type !== "turn.completed") return;
+  drainReadyDelegations(
+    commsBus,
+    approvalBus,
+    runDelegatedTurn,
+    store.botByThread(event.threadId)?.id,
+  );
 });
 
 // ── steer-queue drain: messages sent while the bot was busy ────────────
@@ -1378,6 +1415,8 @@ async function startTurn(
     cardContinuation?: boolean;
     /** Earlier text message this user turn is replying to. */
     replyTo?: Message;
+    /** Provider submission and task ownership both succeeded. */
+    onDispatchAccepted?: () => void;
     onDispatchError?: (message: string) => void;
   },
 ) {
@@ -1390,6 +1429,10 @@ async function startTurn(
   }
   if (bot.busy) throw Object.assign(new Error("the bot is already working — interrupt it first"), { status: 409 });
   const threadId = opts?.threadId ?? bot.threadId;
+  // Harness-owned identity for this exact source turn. Agent tool retries
+  // reuse the mounted proxy and therefore this id; a later turn receives a
+  // new id even when it delegates identical text to the same target.
+  const sourceRunId = randomUUID();
   // a webhook turn, or one inherited from a bot already running unattended
   if (opts?.automationSource === "webhook" || opts?.unattended) markUnattended(bot.id);
   // a person typing into this bot ends the unattended window immediately
@@ -1715,7 +1758,7 @@ async function startTurn(
         commsDepth < MAX_COMMS_DEPTH &&
         instance.adapter.capabilities.agentsMcp === true
       ) {
-        integrations.agents = agentsIntegration(bot.id, threadId, commsDepth);
+        integrations.agents = agentsIntegration(bot.id, threadId, commsDepth, sourceRunId);
       }
       // @mentions in the user's message (the composer's tagging UI) become
       // an explicit delegation nudge — the agent still does the ask_bot call
@@ -1795,6 +1838,12 @@ async function startTurn(
       if (rewound) store.patchBot(bot.id, { rewound: false, resumeCursors: {} });
       // and this engine now owns the thread's most recent turn
       store.markTaskDispatched(bot.id, threadId, instanceId);
+      try {
+        opts?.onDispatchAccepted?.();
+      } catch {
+        // Dispatch ownership is already committed; a receipt callback must
+        // never convert an accepted provider turn into an apparent failure.
+      }
       // a turn can settle before dispatch returns, and a poller started
       // after its own turn.completed would never be torn down — it would
       // keep polling the box forever, carrying dead per-turn state. busy
@@ -1914,7 +1963,18 @@ function serializeRoomContext(threadId: string, userName: string): string {
 // comms bus: passed into the visibility helpers in comms-visibility.ts so
 // they can mirror messages + chips without re-deriving SSE plumbing. Same
 // shape every comms entry point uses (ask_bot, delegate_bot).
-const commsBus: CommsBus = { store, broadcast };
+const commsBus: CommsBus = {
+  store,
+  broadcast,
+  recordDelegation: (event) => {
+    bus.publish({
+      eventId: randomUUID(),
+      provider: "openmausbot",
+      createdAt: new Date().toISOString(),
+      ...event,
+    });
+  },
+};
 
 // approval bus: peer-approval.ts only needs to push cards and broadcast
 // them — its pending map lives in the module so the two respond endpoints
@@ -2752,10 +2812,15 @@ const server = createServer(async (req, res) => {
         const fromBotId = String(body.fromBotId ?? "");
         const toBotId = String(body.toBotId ?? "");
         const message = String(body.message ?? "").trim();
-        const depth = Number(body.depth ?? 0) || 0;
+        const depth = body.depth === undefined ? 0 : body.depth;
         if (!toBotId || !message) return json(res, 400, { error: "toBotId and message required" });
         if (toBotId === fromBotId) return json(res, 400, { error: "a bot cannot message itself" });
-        if (depth >= MAX_COMMS_DEPTH) return json(res, 200, { error: "message chains are limited to one hop" });
+        if (!Number.isSafeInteger(depth) || (depth as number) < 0) {
+          return json(res, 400, { error: "depth must be a non-negative safe integer" });
+        }
+        if ((depth as number) >= MAX_COMMS_DEPTH) {
+          return json(res, 200, { error: "message chains are limited to one hop" });
+        }
         const target = store.bot(toBotId);
         if (!target) return json(res, 404, { error: "no such bot" });
         if (target.busy) return json(res, 200, { busy: true });
@@ -2814,7 +2879,7 @@ const server = createServer(async (req, res) => {
         const channel = getOrCreateChannel(store, currentFrom, currentTarget);
         mirrorExchange(commsBus, currentFrom, currentTarget, message, channel, fromThreadId);
         const prefixed = `[Message from @${currentFrom.name}, another bot in this OpenMausBot workspace. Reply to them.]\n\n${message}`;
-        const reply = await askBotAndWait(toBotId, prefixed, depth, fromBotId);
+        const reply = await askBotAndWait(toBotId, prefixed, depth as number, fromBotId);
         mirrorReply(commsBus, currentTarget, reply, channel);
         return json(res, 200, { botName: currentTarget.name, text: reply });
       }
@@ -2827,8 +2892,13 @@ const server = createServer(async (req, res) => {
         const toBotId = String(body.toBotId ?? "");
         const message = String(body.message ?? "").trim();
         const reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim() : undefined;
-        const depth = Number(body.depth ?? 0) || 0;
+        const depth = body.depth === undefined ? 0 : body.depth;
+        const sourceRun = sourceRunIdSchema.safeParse(body.sourceRunId);
         if (!toBotId || !message) return json(res, 400, { error: "toBotId and message required" });
+        if (!sourceRun.success) return json(res, 400, { error: "sourceRunId is invalid" });
+        if (!Number.isSafeInteger(depth) || (depth as number) < 0) {
+          return json(res, 400, { error: "depth must be a non-negative safe integer" });
+        }
         const from = store.bot(fromBotId);
         if (!from) return json(res, 404, { error: "no such bot" });
         const target = store.bot(toBotId);
@@ -2843,23 +2913,55 @@ const server = createServer(async (req, res) => {
         const result = queueDelegation(
           commsBus,
           from,
-          { toBotId, message, reason, depth },
+          { toBotId, message, reason, depth: depth as number },
           MAX_COMMS_DEPTH,
+          sourceRun.data,
           fromThreadId,
         );
-        if (result !== "ok") {
+        if (result.state === "failed") {
           // the agent reads this string — a bare enum ("too_deep") tells it
           // nothing about what to do instead
-          const said: Record<Exclude<QueueResult, "ok">, string> = {
+          const said: Record<string, string> = {
             self: "a bot cannot delegate to itself",
             too_deep: "delegation chains are limited to one hop — do this one yourself",
             no_target: "no such bot",
             too_many: "too many delegations queued on this turn — finish some first",
+            queue_persist_failed: "the delegation queue could not be persisted",
+            source_run_invalid: "the source turn identity is invalid",
+            source_missing: "the source task no longer exists",
+            target_missing: "the target bot no longer exists",
+            target_busy_retry_limit: "the target stayed busy until the retry limit expired",
+            retry_limit_exceeded: "the delegation retry limit expired",
+            max_age_exceeded: "the delegation expired before it could run",
+            approval_denied: "the user denied this delegation",
+            approval_unavailable: "the delegation approval channel became unavailable",
+            dispatch_failed: "the target could not start the delegated turn",
+            source_turn_failed: "the source turn failed before delegation",
+            dispatch_outcome_unknown_after_restart: "the prior dispatch outcome is unknown after restart",
           };
-          return json(res, 200, { error: said[result] });
+          return json(res, 200, {
+            state: "failed",
+            taskId: result.taskId,
+            duplicate: result.duplicate,
+            reason: result.reason,
+            error: said[result.reason ?? ""] ?? "delegation failed",
+          });
         }
         const targetName = store.bot(toBotId)?.name ?? toBotId;
+        if (result.state === "completed") {
+          return json(res, 200, {
+            state: "completed",
+            taskId: result.taskId,
+            duplicate: result.duplicate,
+            queued: false,
+            message: `Delegation already dispatched to @${targetName}.`,
+          });
+        }
         return json(res, 200, {
+          state: "queued",
+          taskId: result.taskId,
+          duplicate: result.duplicate,
+          reason: result.reason,
           queued: true,
           message: from.approvePeerComms
             ? `Queued for review — @${targetName} will only pick it up if the user approves after your turn finishes.`

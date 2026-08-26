@@ -19,6 +19,7 @@
 // the harness when it builds the integration:
 //   OMB_HARNESS_URL  base URL of the harness (http://127.0.0.1:8799)
 //   OMB_BOT_ID       the calling bot's id (excluded from list_bots; sender)
+//   OMB_SOURCE_RUN_ID harness-generated identity for this exact source turn
 //   OMB_COMMS_TOKEN  shared secret for the localhost-only internal endpoints
 //   OMB_TURN_DEPTH   this turn's comms depth (the harness refuses recursion)
 import readline from "node:readline";
@@ -28,6 +29,7 @@ import { CREDENTIAL_TARGETS, isCredentialTargetId } from "../../shared/credentia
 const HARNESS = process.env.OMB_HARNESS_URL ?? "http://127.0.0.1:8799";
 const BOT_ID = process.env.OMB_BOT_ID ?? "";
 const THREAD_ID = process.env.OMB_THREAD_ID ?? "";
+const SOURCE_RUN_ID = process.env.OMB_SOURCE_RUN_ID ?? "";
 const TOKEN = process.env.OMB_COMMS_TOKEN ?? "";
 const DEPTH = Number(process.env.OMB_TURN_DEPTH ?? "0") || 0;
 const MAX_CREATED_PER_TURN = 4;
@@ -152,6 +154,7 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     const body: Record<string, unknown> = {
       fromBotId: BOT_ID,
       fromThreadId: THREAD_ID,
+      sourceRunId: SOURCE_RUN_ID,
       toBotId,
       message,
       depth: DEPTH,

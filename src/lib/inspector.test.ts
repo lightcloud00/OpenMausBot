@@ -25,6 +25,31 @@ describe("summarizeRuntime", () => {
     expect(summary.length).toBeLessThanOrEqual("assistant: ".length + 120);
     expect(summary).not.toContain("\n");
   });
+
+  it("summarizes durable delegation states without task content", () => {
+    const taskId = "abcdef1234567890";
+    expect(summarizeRuntime({
+      ...base,
+      type: "delegation.status",
+      taskId,
+      targetBotId: "helper",
+      state: "queued",
+      reason: "target_busy",
+      attemptCount: 1,
+    })).toEqual({
+      summary: "delegation queued · abcdef12 · target_busy",
+      tone: "plain",
+    });
+    expect(summarizeRuntime({
+      ...base,
+      type: "delegation.status",
+      taskId,
+      targetBotId: "helper",
+      state: "failed",
+      reason: "max_age_exceeded",
+      attemptCount: 3,
+    }).tone).toBe("error");
+  });
 });
 
 describe("summarizeNative", () => {

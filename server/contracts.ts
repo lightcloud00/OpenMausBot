@@ -132,6 +132,16 @@ export type RuntimeEvent = RuntimeEventBase &
     // `setup: true` marks a failure the user fixes by installing or
     // configuring something, not by retrying — the UI offers setup instead.
     | { type: "runtime.error"; message: string; setup?: boolean }
+    | {
+        /** Metadata-only lifecycle evidence for a durable async handoff. */
+        type: "delegation.status";
+        taskId: string;
+        targetBotId: string;
+        state: "completed" | "queued" | "failed";
+        reason?: string;
+        attemptCount: number;
+        duplicate?: boolean;
+      }
   );
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;

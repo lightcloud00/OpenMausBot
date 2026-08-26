@@ -228,6 +228,17 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
       return typeof value.input === "number" && typeof value.output === "number";
     case "runtime.error":
       return typeof value.message === "string" && (value.setup === undefined || typeof value.setup === "boolean");
+    case "delegation.status":
+      return (
+        typeof value.taskId === "string" &&
+        typeof value.targetBotId === "string" &&
+        (value.state === "completed" || value.state === "queued" || value.state === "failed") &&
+        stringOrMissing(value.reason) &&
+        typeof value.attemptCount === "number" &&
+        Number.isInteger(value.attemptCount) &&
+        value.attemptCount >= 0 &&
+        (value.duplicate === undefined || typeof value.duplicate === "boolean")
+      );
     default:
       return false;
   }

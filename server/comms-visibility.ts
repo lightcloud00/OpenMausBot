@@ -4,6 +4,20 @@
 
 import { sectionKey, type BotRecord, type GroupRecord, type Message, type Store } from "./store.ts";
 
+/** Machine-readable delegation lifecycle evidence. The payload is deliberately
+ * metadata-only: task and routing ids plus bounded enum-like state. Prompts,
+ * tool output, credentials, and approval-card text never enter the turn log. */
+export interface DelegationAuditEvent {
+  type: "delegation.status";
+  threadId: string;
+  taskId: string;
+  targetBotId: string;
+  state: "completed" | "queued" | "failed";
+  reason?: string;
+  attemptCount: number;
+  duplicate?: boolean;
+}
+
 /** What a peer-exchange helper needs from the outside world:
  * the store (for persisted messages + groups) and the SSE broadcasters
  * so chat clients see the change without waiting for a refresh. */
@@ -11,6 +25,8 @@ export interface CommsBus {
   store: Store;
   /** SSE broadcast (kind: "message" envelope). */
   broadcast: (payload: Record<string, unknown>) => void;
+  /** Optional bridge into the canonical per-thread event ledger. */
+  recordDelegation?: (event: DelegationAuditEvent) => void;
   /** SSE broadcast (kind: "group" envelope) for a single group. */
 }
 

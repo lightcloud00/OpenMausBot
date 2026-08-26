@@ -106,6 +106,7 @@ beforeAll(async () => {
       OMB_HARNESS_URL: `http://127.0.0.1:${stubPort}`,
       OMB_BOT_ID: "bot-asker",
       OMB_THREAD_ID: "thread-asker-routine",
+      OMB_SOURCE_RUN_ID: "source-run-proxy-0001",
       OMB_COMMS_TOKEN: TOKEN,
       OMB_TURN_DEPTH: "0",
     },
@@ -192,6 +193,7 @@ describe("agents-proxy MCP surface", () => {
     expect(lastDelegateBody).toMatchObject({
       fromBotId: "bot-asker",
       fromThreadId: "thread-asker-routine",
+      sourceRunId: "source-run-proxy-0001",
       toBotId: "bot-helper",
       message: "take this",
       reason: "follow-up",
