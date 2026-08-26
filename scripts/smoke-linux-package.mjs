@@ -331,7 +331,6 @@ try {
     throw new Error("Linux package did not disable hardware acceleration before startup");
   }
   if (displayMediaRequests !== 0) throw new Error("launch triggered display capture without user intent");
-  await until(async () => brokerRequests > 0, "the optional slow-broker request");
   if (sessionBlocked) {
     await waitForExit();
     if (existsSync(marker)) throw new Error("release safety block still invoked a CUA executable");
@@ -346,7 +345,7 @@ try {
       throw new Error("release safety block did not clear the durable Linux opt-in");
     }
     console.log(
-      `[smoke-linux-package] OK (${wayland ? "GNOME/Wayland" : path.basename(executable)}): slow optional broker did not block first paint and Wayland CUA failed closed`,
+      `[smoke-linux-package] OK (${wayland ? "GNOME/Wayland" : path.basename(executable)}): optional broker stayed isolated and Wayland CUA failed closed`,
     );
   } else if (bundled) {
     if (signalShutdown) child.kill("SIGTERM");
@@ -586,6 +585,9 @@ try {
     if (!hardDeath) {
       console.log(`[smoke-linux-package] OK (${wayland ? "GNOME/Wayland" : "GNOME/X11"}): renderer, private CUA crash/retry, harness, and shutdown`);
     }
+  }
+  if (brokerRequests !== 0) {
+    throw new Error(`package smoke unexpectedly contacted the optional broker ${brokerRequests} time(s)`);
   }
 } finally {
   await stopProcess();
