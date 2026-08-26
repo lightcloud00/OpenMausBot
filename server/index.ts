@@ -2042,9 +2042,10 @@ async function runGroupMemberTurn(
     onDispatchError?.(message);
     return true;
   }
+  const sourceRunId = randomUUID();
   const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
   if (hop < MAX_COMMS_DEPTH && instance.adapter.capabilities.agentsMcp === true) {
-    integrations.agents = agentsIntegration(bot.id, group.threadId, hop);
+    integrations.agents = agentsIntegration(bot.id, group.threadId, hop, sourceRunId);
   }
   const selectedSkills = selectBundledSkills(
     serializeRoomContext(group.threadId, userName),
