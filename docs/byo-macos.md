@@ -75,10 +75,12 @@ openmausbot-worker-companion --version
 
 Install the pinned CUA Driver release with the official instructions — do not
 use an unreviewed wrapper or an ambient alternate binary. Build the companion
-from the exact OpenMausBot source commit on the control-plane Mac, copy only
-its `package.json` and `dist/` into a private directory owned by the worker
-account, and put its `openmausbot-worker-companion` bin on that account's
-`PATH`.
+from the exact OpenMausBot source commit on the control-plane Mac with
+`pnpm build:worker-companion`, copy only its `package.json` and `dist/` into a
+private directory owned by the worker account, install its dependencies there
+(`npm install --omit=dev`), and put its `openmausbot-worker-companion` bin on
+that account's `PATH`. The dependency is the pinned CUA SDK: the companion
+reads the driver's own Accessibility and Screen Recording grants through it.
 
 The driver listens on a unix socket at `~/.openmausbot/run/cua.sock`. Both the
 socket and its directory must be owned by the worker account and private to

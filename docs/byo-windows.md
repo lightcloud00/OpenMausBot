@@ -70,7 +70,8 @@ pnpm build:worker-companion
 ```
 
 Copy only `worker-companion/package.json` and `worker-companion/dist/` to a
-private directory owned by the Windows worker user, then expose the package's
+private directory owned by the Windows worker user, install its dependencies
+there (`npm install --omit=dev`), then expose the package's
 `openmausbot-worker-companion` bin on that user's `PATH` (for example with
 `npm link` from that copied directory). Verify protocol 1:
 
@@ -78,8 +79,9 @@ private directory owned by the Windows worker user, then expose the package's
 openmausbot-worker-companion --version
 ```
 
-The companion has no listener. Its stdio protocol accepts only reset,
-validate, activate, pause, resume, and run. Activation derives the CUA capability YAML from
+The companion has no listener. Its stdio protocol accepts only pause and
+resume in this release; reset, validate, activate and run arrive with the
+server-side task layer. Activation derives the CUA capability YAML from
 the already-approved manifest, restarts the fixed official CUA autostart task,
 rechecks that the executable is Driver 0.20.0, and requires `cua-driver status`
 to report both bounded mode and the exact capability digest. It never accepts a remote executable, argv, environment,
