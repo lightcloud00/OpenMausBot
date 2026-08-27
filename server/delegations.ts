@@ -680,6 +680,15 @@ async function processOne(
       return;
     }
     if (outcome.state === "failed") {
+      try {
+        // A non-busy dispatch attempt still belongs in the shared channel:
+        // runTarget may already have mirrored its terminal failure there,
+        // and the source needs the channel link to make that record visible.
+        // Busy races return above without producing a misleading exchange.
+        mirrorExchange(bus, sender, target, item.message, channel, threadId);
+      } catch (error) {
+        console.error("delegations: could not mirror failed dispatch", error);
+      }
       settle(bus, item, "failed", outcome.reason ?? "dispatch_failed", clock());
       appendActivity(bus, threadId, `Delegation to @${target.name} failed to start`, false);
       return;
