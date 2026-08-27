@@ -14,6 +14,7 @@ import {
   type WorkerPlatform,
 } from "./computer-workers.ts";
 import { augmentedPath } from "./env-path.ts";
+import type { JsonValue } from "./schema.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 
 export const WORKER_COMPANION_PROTOCOL_VERSION = 1;
@@ -163,7 +164,7 @@ export type RemoteWorkerHealthReport = z.output<typeof healthReportSchema>;
 
 /** Never throws: every field catches, so an unparseable payload yields a
  * report in which nothing is proven. */
-export function parseHealthReport(raw: unknown): RemoteWorkerHealthReport {
+export function parseHealthReport(raw: JsonValue): RemoteWorkerHealthReport {
   const parsed = healthReportSchema.safeParse(raw);
   return parsed.success ? parsed.data : {};
 }
@@ -268,8 +269,8 @@ export function defaultRemoteWorkerRunner(
   });
 }
 
-export function isSafeChannelPath(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 512 && !UNSAFE_PATH.test(value);
+export function isSafeChannelPath(value: string): boolean {
+  return value.length > 0 && value.length <= 512 && !UNSAFE_PATH.test(value);
 }
 
 export function baseWorkerStatus(worker: ResolvedWorker): RemoteWorkerStatus {
@@ -321,7 +322,7 @@ export function failWorker(
 /** Copies a probe result onto the status without deciding readiness. Split
  * from the ladder below so a caller can render a diagnostic panel for a
  * worker that will never become ready. */
-export function applyHealthReport(status: RemoteWorkerStatus, raw: unknown): RemoteWorkerStatus {
+export function applyHealthReport(status: RemoteWorkerStatus, raw: JsonValue): RemoteWorkerStatus {
   const report = parseHealthReport(raw);
   status.driverVersion = report.driverVersion ?? null;
   status.companionVersion = report.companionVersion ?? null;

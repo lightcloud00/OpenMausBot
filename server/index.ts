@@ -1619,7 +1619,7 @@ async function startTurn(
         if (!mountsComputerMcp || instance.driverKind === "boxAgent") {
           throw new Error("this model engine cannot use a remote worker — choose Claude or an ACP engine, or select another computer destination");
         }
-        const worker = workerById(cfg, bot.workerId);
+        const worker = workerById(cfg, bot.workerId ?? null);
         if (!worker) {
           throw new Error("this bot is not assigned to a configured worker (App Settings → Workers)");
         }
@@ -4124,13 +4124,19 @@ const server = createServer(async (req, res) => {
       ) {
         return json(res, 400, { error: "computer must be cloud, vm, local, worker, or off" });
       }
+      // Tracked in its own typed local: `patch` is a Record<string, unknown>,
+      // so reading the id back out of it would lose the type the check below
+      // needs.
+      let assignedWorkerId: string | null | undefined;
       if (body.workerId !== undefined) {
         if (body.workerId === null || body.workerId === "") {
           patch.workerId = undefined;
+          assignedWorkerId = null;
         } else if (!workerById(cfg, body.workerId)) {
           return json(res, 400, { error: "workerId must name a configured worker (App Settings → Workers)" });
         } else {
-          patch.workerId = String(body.workerId);
+          assignedWorkerId = String(body.workerId);
+          patch.workerId = assignedWorkerId;
         }
       }
       {
@@ -4138,7 +4144,7 @@ const server = createServer(async (req, res) => {
         // arrive alone, and "worker" without a resolvable id would fail only
         // at the start of the next turn, long after the person left Settings.
         const nextComputer = body.computer !== undefined ? body.computer : existingBot?.computer;
-        const nextWorkerId = body.workerId !== undefined ? patch.workerId : existingBot?.workerId;
+        const nextWorkerId = assignedWorkerId !== undefined ? assignedWorkerId : (existingBot?.workerId ?? null);
         if (nextComputer === "worker" && !workerById(cfg, nextWorkerId)) {
           return json(res, 400, { error: "choose a configured worker for this bot first (App Settings → Workers)" });
         }

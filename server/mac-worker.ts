@@ -28,6 +28,7 @@ import {
   type RemoteWorkerStatus,
 } from "./remote-worker.ts";
 import type { ResolvedWorker } from "./computer-workers.ts";
+import { parseJson, type JsonValue } from "./schema.ts";
 
 /** Fixed by convention under the worker account's own home so the socket and
  * its directory can both be owner-private. The probe reports the resolved
@@ -160,10 +161,10 @@ export async function macWorkerStatus(
   if (worker.paused) return failWorker(status, "paused", "worker_paused", "This worker is paused");
 
   const runner = options.runner ?? defaultRemoteWorkerRunner;
-  let report: unknown;
+  let report: JsonValue;
   try {
     const result = await runner(macWorkerHealthArgs(worker.sshAlias), WORKER_SSH_TIMEOUT_MS, MAC_HEALTH_SCRIPT);
-    report = JSON.parse(result.stdout.trim());
+    report = parseJson(result.stdout.trim());
   } catch (error) {
     return failWorker(status, "offline", "worker_offline",
       `Worker SSH is offline: ${error instanceof Error ? error.message.slice(0, 200) : "unknown error"}`);

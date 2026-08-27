@@ -156,7 +156,7 @@ export function configuredWorkers(cfg: AppConfig): ResolvedWorker[] {
   return listWorkers(cfg.workers);
 }
 
-export function workerById(cfg: AppConfig, id: unknown): ResolvedWorker | null {
+export function workerById(cfg: AppConfig, id: JsonValue): ResolvedWorker | null {
   return findWorker(cfg.workers, id);
 }
 

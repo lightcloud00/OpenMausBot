@@ -12,6 +12,7 @@
 // per-alias lease in ./remote-worker.ts keeps two workers independent, so a
 // bot on Windows and a bot on macOS can hold their desktops at the same time.
 import { z } from "zod";
+import type { JsonValue } from "./schema.ts";
 
 /** Pinned across every worker platform; the driver's wire protocol and its
  * policy/capability digests are only comparable within one exact version. */
@@ -45,17 +46,20 @@ export const WORKER_DEFAULTS = {
   },
 } satisfies Record<WorkerPlatform, { browserExecutable: string; browserProfile: string; ideExecutable: string }>;
 
-export function isValidWorkerId(value: unknown): value is string {
-  return typeof value === "string" && WORKER_ID.test(value);
+export function isValidWorkerId(value: string): boolean {
+  return WORKER_ID.test(value);
 }
 
-export function isValidWorkerSshAlias(value: unknown): value is string {
-  return typeof value === "string" && SSH_ALIAS.test(value);
+export function isValidWorkerSshAlias(value: string): boolean {
+  return SSH_ALIAS.test(value);
 }
 
-export function isWorkerPlatform(value: unknown): value is WorkerPlatform {
+export function isWorkerPlatform(value: JsonValue): value is WorkerPlatform {
   return value === "windows" || value === "macos";
 }
+
+/** The id as it arrives from config, a bot record, or an HTTP body. */
+const workerIdSchema = z.string().regex(WORKER_ID);
 
 /** Executable paths reach a shell-free spawn and the CUA capability YAML, but
  * they are still operator input echoed into a manifest the daemon enforces.
@@ -169,10 +173,11 @@ export function listWorkers(workers: WorkerConfigMap | undefined): ResolvedWorke
     .map((id) => resolveWorker(id, workers[id]));
 }
 
-export function findWorker(workers: WorkerConfigMap | undefined, id: unknown): ResolvedWorker | null {
-  if (!workers || !isValidWorkerId(id)) return null;
-  const raw = workers[id];
-  return raw ? resolveWorker(id, raw) : null;
+export function findWorker(workers: WorkerConfigMap | undefined, id: JsonValue): ResolvedWorker | null {
+  const parsed = workerIdSchema.safeParse(id);
+  if (!workers || !parsed.success) return null;
+  const raw = workers[parsed.data];
+  return raw ? resolveWorker(parsed.data, raw) : null;
 }
 
 /** Redacts the transport identity before a worker is described to a bot, a

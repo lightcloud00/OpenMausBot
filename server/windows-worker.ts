@@ -18,6 +18,7 @@ import {
   type RemoteWorkerStatus,
 } from "./remote-worker.ts";
 import type { ResolvedWorker } from "./computer-workers.ts";
+import { parseJson, type JsonValue } from "./schema.ts";
 
 export const WINDOWS_CUA_PIPE = "\\\\.\\pipe\\cua-driver";
 export const WINDOWS_POLICY_PATH = "%LOCALAPPDATA%\\OpenMausBot\\windows-policy.yaml";
@@ -119,7 +120,7 @@ export async function windowsWorkerStatus(
   if (worker.paused) return failWorker(status, "paused", "worker_paused", "This worker is paused");
 
   const runner = options.runner ?? defaultRemoteWorkerRunner;
-  let report: unknown;
+  let report: JsonValue;
   try {
     // Keep the fixed health program off argv. Windows OpenSSH invokes the
     // user's command through cmd.exe, whose command-line ceiling is lower
@@ -130,7 +131,7 @@ export async function windowsWorkerStatus(
       WORKER_SSH_TIMEOUT_MS,
       WINDOWS_HEALTH_SCRIPT,
     );
-    report = JSON.parse(result.stdout.trim());
+    report = parseJson(result.stdout.trim());
   } catch (error) {
     return failWorker(status, "offline", "worker_offline",
       `Worker SSH is offline: ${error instanceof Error ? error.message.slice(0, 200) : "unknown error"}`);
