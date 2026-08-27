@@ -30,8 +30,12 @@ describe("parked capability", () => {
     ["darwin", "docs/macos-parked-capabilities.yaml"],
     ["win32", "docs/windows-parked-capabilities.yaml"],
   ] as const)("embedded %s manifest matches the documented file", (platform, docPath) => {
+    // Line endings are normalised because this asserts *content* drift, and a
+    // Windows checkout may convert them. The separate hazard — that a CRLF copy
+    // hashes differently from the LF one the companion writes — is handled at
+    // source by the `text eol=lf` rules in .gitattributes, not here.
     const documented = readFileSync(new URL(`../../${docPath}`, import.meta.url), "utf8");
-    expect(parkedCapability(platform)).toBe(documented);
+    expect(parkedCapability(platform).replace(/\r\n/g, "\n")).toBe(documented.replace(/\r\n/g, "\n"));
   });
 
   it("grants no tools on either platform", () => {
