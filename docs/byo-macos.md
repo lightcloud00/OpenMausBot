@@ -123,6 +123,22 @@ once at daemon start, and an unset policy variable disables enforcement
 entirely, so readiness requires the daemon to *report* the same digest it
 finds on disk.
 
+## Install the parked capability manifest
+
+The base policy is the stable ceiling; a **capability manifest** is the
+short-lived, per-task boundary that intersects it. Between tasks the guest
+should hold the parked manifest, which grants no tools at all:
+
+```bash
+cp macos-parked-capabilities.yaml \
+  ~/Library/Application\ Support/OpenMausBot/active-capabilities.yaml
+```
+
+Readiness requires the daemon to report a loaded capability manifest, so a
+guest without one never becomes ready. With the parked manifest in place the
+worker is reachable and provably bounded, and can do nothing until a task
+capability is approved — the correct resting state.
+
 ## Add the worker
 
 In OpenMausBot, open **Settings → Workers**, add a worker with:
