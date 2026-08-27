@@ -245,7 +245,9 @@ describe("worker leases", () => {
 describe("worker MCP boundary", () => {
   it("pins driver, policy, capability and channel into the generation", () => {
     const descriptor = remoteWorkerMcp(macWorker, MAC_SOCKET, undefined, capability);
-    expect(descriptor.platform).toBe("macos");
+    // The integration contract speaks Node platform names; the worker's own
+    // spelling travels in argv for the bridge's liveness command.
+    expect(descriptor.platform).toBe("darwin");
     expect(descriptor.scope).toBe("remote-worker-computer");
     expect(descriptor.args).toEqual(["macguest", MAC_SOCKET, "macos"]);
     expect(descriptor.generation).toBe(`0.20.0:${policy}:${capability}:${MAC_SOCKET}`);

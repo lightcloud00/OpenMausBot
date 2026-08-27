@@ -435,7 +435,10 @@ export interface RemoteWorkerMcpDescriptor {
   command: string;
   args: string[];
   env: Record<string, string>;
-  platform: WorkerPlatform;
+  /** The integration contract speaks Node's platform names. The worker's own
+   * spelling travels in argv instead, where the bridge needs it to pick a
+   * liveness command. */
+  platform: "darwin" | "win32";
   generation: string;
   scope: "remote-worker-computer";
 }
@@ -453,7 +456,7 @@ export function remoteWorkerMcp(
     command: SPAWNED_PROXIES.workerMcp,
     args: [worker.sshAlias, channelPath, worker.platform],
     env: control ? { OMB_CONTROL_URL: control.url, OMB_CONTROL_TOKEN: control.token } : {},
-    platform: worker.platform,
+    platform: worker.platform === "windows" ? "win32" : "darwin",
     generation: [
       worker.expectedDriverVersion,
       worker.expectedBasePolicySha256 ?? "no-policy",
