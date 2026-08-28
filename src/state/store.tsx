@@ -16,6 +16,7 @@ import {
 import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { MausColor, MausMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
+import type { RoutineRequestCardData } from "../../shared/routine-request";
 import type { Routine, RoutineInput, RoutineRun } from "@/lib/routines";
 import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib/webhooks";
 import { currentCall } from "@/lib/call";
@@ -41,6 +42,8 @@ export interface OptionCardData {
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
   approvalScope?: "local-computer" | "remote-worker-computer";
+  /** Persisted proposal used by the server when the user confirms it. */
+  routineRequest?: RoutineRequestCardData;
 }
 
 export interface ConnectorCardData {
@@ -136,7 +139,20 @@ export interface Group {
   /** New user-created rooms remain in setup until Save or Skip. */
   setupCompletedAt?: number | null;
   setupSkippedAt?: number | null;
+  /** Separate conversations in this channel. DMs deliberately stay on one
+   * thread and omit this collection. */
+  tasks?: GroupTask[];
   messages: Message[];
+}
+
+/** One of a channel's independent conversations. The channel's threadId
+ * points at the active one; folder and pin state belong to the task. */
+export interface GroupTask {
+  threadId: string;
+  title: string;
+  createdAt: number;
+  pinnedCwd?: string | null;
+  pinnedMessageId?: string;
 }
 
 export interface ModelSelection {
@@ -202,6 +218,8 @@ export interface Bot {
   cwd?: string;
   /** auto mode: the bot approves its own tool permissions */
   autoApprove?: boolean;
+  /** optional model review for otherwise undecided, attended approvals */
+  autoReview?: "off" | "shadow" | "enforce";
   /** tools this bot may always use without asking */
   alwaysAllow?: string[];
   /** speak this bot's replies aloud as they settle */
@@ -329,6 +347,9 @@ export interface InstanceInfo {
     /** the engine keeps a live session and takes a message mid-turn */
     queueing?: boolean;
     localComputerMcp?: boolean;
+    /** This engine can answer a bounded review prompt without changing the
+     * bot's active conversation. */
+    approvalReview?: boolean;
   };
   /** `custom` agents sit below the rail divider — no subscription catalog. */
   access?: "subscription" | "custom";
@@ -443,6 +464,10 @@ export type Action =
       patch: Partial<Pick<Group, "name" | "bulletin" | "memberIds" | "defaultResponder" | "pinnedMessageId" | "section">>;
     }
   | { type: "deleteGroup"; groupId: string }
+  | { type: "newGroupTask"; groupId: string }
+  | { type: "switchGroupTask"; groupId: string; threadId: string }
+  | { type: "renameGroupTask"; groupId: string; threadId: string; title: string }
+  | { type: "deleteGroupTask"; groupId: string; threadId: string }
   | { type: "toggleReaction"; threadId: string; messageId: string; emoji: string }
   | { type: "interruptGroup"; groupId: string }
   | { type: "instances"; instances: InstanceInfo[] }
@@ -467,6 +492,8 @@ export type Action =
       message?: string;
       /** remember this exact grant (the server's allowKey) for the bot */
       alwaysAllow?: { botId: string; key: string };
+      /** Local UI recovery hook for voice flows. Never sent to the server. */
+      onError?: (message: string) => void;
     }
   | { type: "newTask"; botId: string }
   | { type: "switchTask"; botId: string; threadId: string }
@@ -510,9 +537,16 @@ export function openNotificationTarget(
   // GROUP's thread id; asking the bot to switch to that thread would 404.
   // Open the room itself. A thread that is neither a room nor one of the
   // bot's own lands on a plain bot select instead of an error banner.
-  const group = state.groups.find((candidate) => candidate.threadId === target.threadId);
+  const group = state.groups.find(
+    (candidate) =>
+      candidate.threadId === target.threadId ||
+      (candidate.tasks ?? []).some((task) => task.threadId === target.threadId),
+  );
   if (group) {
     dispatch({ type: "select", id: group.id });
+    if (group.threadId !== target.threadId) {
+      dispatch({ type: "switchGroupTask", groupId: group.id, threadId: target.threadId });
+    }
     return;
   }
   dispatch({ type: "select", id: target.botId });
@@ -1051,9 +1085,32 @@ export function reducer(state: AppState, action: Action): AppState {
       return withMascotMotion(state, action.botId, "working");
     case "newTask":
     case "switchTask":
-    case "renameTask":
     case "deleteTask":
+    case "newGroupTask":
+    case "switchGroupTask":
+    case "deleteGroupTask":
       return state;
+    case "renameTask":
+      return updateBot(state, action.botId, (bot) => ({
+        ...bot,
+        tasks: (bot.tasks ?? []).map((task) =>
+          task.threadId === action.threadId ? { ...task, title: action.title } : task,
+        ),
+      }));
+    case "renameGroupTask":
+      return {
+        ...state,
+        groups: state.groups.map((group) =>
+          group.id === action.groupId
+            ? {
+                ...group,
+                tasks: (group.tasks ?? []).map((task) =>
+                  task.threadId === action.threadId ? { ...task, title: action.title } : task,
+                ),
+              }
+            : group,
+        ),
+      };
     case "taskSwitched":
       return updateBot(state, action.bot.id, (bot) => ({ ...bot, ...action.bot, messages: action.bot.messages ?? [] }));
     case "newBot":
@@ -1322,7 +1379,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 behavior: action.behavior,
                 message: action.message,
               }),
-            }).catch(showError);
+            }).catch((error) => {
+              showError(error);
+              action.onError?.(error instanceof Error ? error.message : String(error));
+            });
           if (action.alwaysAllow) {
             const bot = stateRef.current.bots.find((b) => b.id === action.alwaysAllow!.botId);
             const next = [...new Set([...(bot?.alwaysAllow ?? []), action.alwaysAllow.key])];
@@ -1492,6 +1552,29 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "deleteTask":
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, { method: "DELETE" })
             .then((r: any) => r?.bot && dispatch({ type: "taskSwitched", bot: r.bot }))
+            .catch(showError);
+          break;
+        // Channel tasks mirror bot tasks, but hydrate the whole channel so
+        // switching atomically replaces its transcript, folder and pin.
+        case "newGroupTask":
+          api(`/api/groups/${action.groupId}/tasks`, { method: "POST", body: "{}" })
+            .then((r: any) => r?.group && dispatch({ type: "groupPatched", group: r.group }))
+            .catch(showError);
+          break;
+        case "switchGroupTask":
+          api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, { method: "POST" })
+            .then((r: any) => r?.group && dispatch({ type: "groupPatched", group: r.group }))
+            .catch(showError);
+          break;
+        case "renameGroupTask":
+          api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, {
+            method: "PATCH",
+            body: JSON.stringify({ title: action.title }),
+          }).catch(showError);
+          break;
+        case "deleteGroupTask":
+          api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, { method: "DELETE" })
+            .then((r: any) => r?.group && dispatch({ type: "groupPatched", group: r.group }))
             .catch(showError);
           break;
         case "interruptGroup":

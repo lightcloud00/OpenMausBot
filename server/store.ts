@@ -15,6 +15,7 @@ import { isValidWorkerId } from "./computer-workers.ts";
 import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
+import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 
 export type MausColor =
   | "green"
@@ -52,6 +53,9 @@ export interface OptionCardData {
   allowKey?: string;
   /** Local actions never share remembered grants with cloud/tool approvals. */
   approvalScope?: ApprovalScope;
+  /** A durable chat-created routine proposal. The scheduler only applies it
+   * after this card is explicitly confirmed by the user. */
+  routineRequest?: RoutineRequestCardData;
 }
 
 export interface ConnectorCardData {
@@ -132,13 +136,28 @@ export type GroupDefaultResponder =
   | { kind: "everyone" }
   | { kind: "mentions" };
 
+/** One independent conversation inside a user-created channel. Channel
+ * membership and instructions stay on GroupRecord; transcript-bound state
+ * lives here so switching tasks never moves a pin or working directory into
+ * another provider context. */
+export interface GroupTaskRecord {
+  threadId: ThreadId;
+  title: string;
+  createdAt: number;
+  pinnedCwd?: string | null;
+  pinnedMessageId?: string;
+}
+
 /** A room: a shared thread where several bots + the user talk. Plain
  * messages follow `defaultResponder`; explicit @mentions always override it.
  * The bulletin is the room's shared instructions — every member's turn gets
  * it as part of its system prompt. */
 export interface GroupRecord {
   id: string;
+  /** The active task's thread. Direct-message channels remain single-threaded. */
   threadId: ThreadId;
+  /** User-created channels have independent tasks, newest first. */
+  tasks?: GroupTaskRecord[];
   name: string;
   memberIds: string[];
   defaultResponder: GroupDefaultResponder;
@@ -154,12 +173,9 @@ export interface GroupRecord {
    * overriding each member's own folder. The room pins its own copy on its
    * first turn (pinnedCwd). Absent = each member's own default. */
   cwd?: string;
-  /** the folder this room's turns actually run in, pinned on the first
-   * turn that dispatches. null = each member's own default; absent = not
-   * pinned yet. See pinGroupCwd for why it never moves. */
+  /** Compatibility mirror of the active task's pinned folder. */
   pinnedCwd?: string | null;
-  /** the one message pinned to the top of this room's transcript. A pin id
-   * that no longer resolves (edited away, deleted) simply renders nothing. */
+  /** Compatibility mirror of the active task's pinned message. */
   pinnedMessageId?: string;
   /** sidebar section heading this room is filed under; shares the bots'
    * namespace so one heading can hold a project's room and its people */
@@ -230,6 +246,39 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
     card.title = redactSecretsInText(card.title);
     if (typeof card.subtitle === "string") card.subtitle = redactSecretsInText(card.subtitle);
     if (typeof card.summary === "string") card.summary = redactSecretsInText(card.summary);
+    if (typeof card.held === "string") card.held = redactSecretsInText(card.held);
+    // Routine definitions are executable bot-authored text stored behind the
+    // visible summary. Scrub the durable payload too so nesting it on a card
+    // cannot bypass the transcript's secret-redaction boundary.
+    if (card.routineRequest) {
+      const operation = card.routineRequest.operation;
+      card.routineRequest = {
+        ...card.routineRequest,
+        operation: operation.action === "create"
+          ? {
+              ...operation,
+              routine: {
+                ...operation.routine,
+                name: redactSecretsInText(operation.routine.name),
+                instructions: redactSecretsInText(operation.routine.instructions),
+              },
+            }
+          : operation.action === "update"
+            ? {
+                ...operation,
+                changes: {
+                  ...operation.changes,
+                  ...(typeof operation.changes.name === "string"
+                    ? { name: redactSecretsInText(operation.changes.name) }
+                    : {}),
+                  ...(typeof operation.changes.instructions === "string"
+                    ? { instructions: redactSecretsInText(operation.changes.instructions) }
+                    : {}),
+                },
+              }
+            : { ...operation },
+      };
+    }
     out.card = card;
   }
   if (out.connector) {
@@ -266,6 +315,7 @@ export type StoreChange =
   | { type: "message"; threadId: string; message: Message }
   | { type: "message.patch"; threadId: string; message: Message }
   | { type: "thread"; threadId: string; activeLeafId: string }
+  | { type: "thread.deleted"; threadId: string }
   | { type: "bot"; botId: string }
   | { type: "bot.deleted"; botId: string }
   | { type: "group"; groupId: string }
@@ -320,6 +370,9 @@ export interface BotRecord {
    * working instead of stopping to ask. Questions it asks YOU still come
    * through, and a short list of destructive commands still stops it. */
   autoApprove?: boolean;
+  /** Optional model review of otherwise undecided, attended approval cards.
+   * Unknown persisted values are treated as off by the review boundary. */
+  autoReview?: "off" | "shadow" | "enforce";
   /** Tools this bot may always use without asking, even outside auto mode
    * (set by "Always allow" on an approval card). */
   alwaysAllow?: string[];
@@ -584,6 +637,36 @@ export class Store {
       const normalized = normalizeGroupDefaultResponder(g.defaultResponder, g.memberIds, Boolean(g.dm));
       if (JSON.stringify(normalized) !== JSON.stringify(g.defaultResponder)) groupsMigrated = true;
       g.defaultResponder = normalized;
+      // Bot-to-bot channels intentionally remain one canonical thread.
+      if (g.dm) {
+        if (g.tasks !== undefined) {
+          delete g.tasks;
+          groupsMigrated = true;
+        }
+        continue;
+      }
+      if (!g.tasks?.length) {
+        g.tasks = [
+          {
+            threadId: g.threadId,
+            title: this.firstUserLine(g.threadId) ?? UNTITLED_TASK,
+            createdAt: g.createdAt,
+            ...(g.pinnedCwd !== undefined ? { pinnedCwd: g.pinnedCwd } : {}),
+            ...(g.pinnedMessageId ? { pinnedMessageId: g.pinnedMessageId } : {}),
+          },
+        ];
+        groupsMigrated = true;
+      }
+      // Repair a malformed/stale active pointer conservatively. Every task
+      // transcript is retained; the newest known task becomes active.
+      let active = g.tasks.find((task) => task.threadId === g.threadId);
+      if (!active) {
+        active = g.tasks[0]!;
+        g.threadId = active.threadId;
+        groupsMigrated = true;
+      }
+      g.pinnedCwd = active.pinnedCwd;
+      g.pinnedMessageId = active.pinnedMessageId;
     }
     if (botsMigrated) this.saveBots();
     if (groupsMigrated) this.saveGroups();
@@ -605,7 +688,7 @@ export class Store {
     // pending JSON files are touched; already-migrated threads stay lazy.
     const knownThreads = new Set([
       ...this.bots.flatMap((b) => [b.threadId, ...(b.tasks ?? []).map((task) => task.threadId)]),
-      ...this.groups.map((group) => group.threadId),
+      ...this.groups.flatMap((group) => [group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)]),
     ]);
     for (const threadId of knownThreads) {
       const legacyFile = messagesFile(threadId);
@@ -644,23 +727,47 @@ export class Store {
   }
 
   groupByThread(threadId: string): GroupRecord | undefined {
-    return this.groups.find((g) => g.threadId === threadId);
+    return this.groups.find(
+      (group) => group.threadId === threadId || group.tasks?.some((task) => task.threadId === threadId),
+    );
   }
 
-  createGroup(name: string, memberIds: string[], dm = false, section?: string): GroupRecord {
+  createGroup(
+    name: string,
+    memberIds: string[],
+    dm = false,
+    section?: string,
+    setup?: {
+      bulletin?: string;
+      defaultResponder?: GroupDefaultResponder;
+      completed?: boolean;
+    },
+  ): GroupRecord {
+    const threadId = newId();
+    const createdAt = Date.now();
     const group: GroupRecord = {
       id: newId(),
-      threadId: newId(),
+      threadId,
+      ...(dm
+        ? {}
+        : { tasks: [{ threadId, title: UNTITLED_TASK, createdAt }] }),
       name,
       memberIds,
-      defaultResponder: dm ? { kind: "mentions" } : { kind: "member", botId: memberIds[0] },
-      bulletin: "",
+      defaultResponder: dm
+        ? { kind: "mentions" }
+        : normalizeGroupDefaultResponder(setup?.defaultResponder, memberIds, false),
+      bulletin: setup?.bulletin ?? "",
       unread: false,
-      createdAt: Date.now(),
+      createdAt,
       dm: dm || undefined,
       busyBotId: null,
       section,
-      ...(dm ? {} : { setupCompletedAt: null, setupSkippedAt: null }),
+      ...(dm
+        ? {}
+        : {
+            setupCompletedAt: setup?.completed ? createdAt : null,
+            setupSkippedAt: null,
+          }),
     };
     this.groups.unshift(group);
     this.saveGroups();
@@ -675,10 +782,14 @@ export class Store {
     );
   }
 
-  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "section" | "setupCompletedAt" | "setupSkippedAt">>): GroupRecord | null {
+  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "pinnedMessageId" | "section" | "setupCompletedAt" | "setupSkippedAt">>): GroupRecord | null {
     const group = this.group(id);
     if (!group) return null;
     Object.assign(group, patch);
+    if (!group.dm && Object.prototype.hasOwnProperty.call(patch, "pinnedMessageId")) {
+      const active = this.activeGroupTask(group.id);
+      if (active) active.pinnedMessageId = patch.pinnedMessageId;
+    }
     group.defaultResponder = normalizeGroupDefaultResponder(
       group.defaultResponder,
       group.memberIds,
@@ -698,6 +809,7 @@ export class Store {
         unlinkSync(file);
       } catch {}
     }
+    this.emit({ type: "thread.deleted", threadId });
   }
 
   deleteGroup(id: string): boolean {
@@ -705,9 +817,91 @@ export class Store {
     if (!group) return false;
     this.groups = this.groups.filter((g) => g.id !== id);
     this.saveGroups();
-    this.deleteThreadRecord(group.threadId);
+    for (const threadId of new Set([group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)])) {
+      this.deleteThreadRecord(threadId);
+    }
     this.emit({ type: "group.deleted", groupId: id });
     return true;
+  }
+
+  // ── channel tasks ────────────────────────────────────────────────────
+  groupTasks(groupId: string): GroupTaskRecord[] {
+    const group = this.group(groupId);
+    return group?.dm ? [] : (group?.tasks ?? []);
+  }
+
+  activeGroupTask(groupId: string): GroupTaskRecord | undefined {
+    const group = this.group(groupId);
+    return group?.tasks?.find((task) => task.threadId === group.threadId);
+  }
+
+  groupTaskByThread(groupId: string, threadId: string): GroupTaskRecord | undefined {
+    const group = this.group(groupId);
+    if (!group || group.dm) return undefined;
+    return group.tasks?.find((task) => task.threadId === threadId);
+  }
+
+  createGroupTask(groupId: string, title?: string): GroupTaskRecord | null {
+    const group = this.group(groupId);
+    if (!group || group.dm) return null;
+    const task: GroupTaskRecord = {
+      threadId: newId(),
+      title: title?.trim() || UNTITLED_TASK,
+      createdAt: Date.now(),
+    };
+    group.tasks = [task, ...(group.tasks ?? [])];
+    group.threadId = task.threadId;
+    group.pinnedCwd = undefined;
+    group.pinnedMessageId = undefined;
+    this.saveGroups();
+    this.emit({ type: "group", groupId });
+    return task;
+  }
+
+  switchGroupTask(groupId: string, threadId: string): GroupRecord | null {
+    const group = this.group(groupId);
+    const task = group?.tasks?.find((candidate) => candidate.threadId === threadId);
+    if (!group || group.dm || !task) return null;
+    group.threadId = task.threadId;
+    group.pinnedCwd = task.pinnedCwd;
+    group.pinnedMessageId = task.pinnedMessageId;
+    this.saveGroups();
+    this.emit({ type: "group", groupId });
+    return group;
+  }
+
+  renameGroupTask(groupId: string, threadId: string, title: string): GroupTaskRecord | null {
+    const task = this.groupTaskByThread(groupId, threadId);
+    if (!task) return null;
+    task.title = title.trim().slice(0, 80) || UNTITLED_TASK;
+    this.saveGroups();
+    this.emit({ type: "group", groupId });
+    return task;
+  }
+
+  titleGroupTaskFromFirstMessage(groupId: string, text: string, threadId?: string) {
+    const task = threadId ? this.groupTaskByThread(groupId, threadId) : this.activeGroupTask(groupId);
+    if (!task || task.title !== UNTITLED_TASK) return;
+    task.title = titleFromMessage(text);
+    this.saveGroups();
+    this.emit({ type: "group", groupId });
+  }
+
+  deleteGroupTask(groupId: string, threadId: string): GroupRecord | null {
+    const group = this.group(groupId);
+    if (!group || group.dm || !group.tasks || group.tasks.length < 2) return null;
+    if (!group.tasks.some((task) => task.threadId === threadId)) return null;
+    group.tasks = group.tasks.filter((task) => task.threadId !== threadId);
+    this.deleteThreadRecord(threadId);
+    if (group.threadId === threadId) {
+      const next = group.tasks[0]!;
+      group.threadId = next.threadId;
+      group.pinnedCwd = next.pinnedCwd;
+      group.pinnedMessageId = next.pinnedMessageId;
+    }
+    this.saveGroups();
+    this.emit({ type: "group", groupId });
+    return group;
   }
 
   /** Toggle an emoji reaction on a message ("user" or a member botId). */
@@ -1069,15 +1263,27 @@ export class Store {
    * future rooms, never under a room that already started working
    * somewhere. Returns the pinned value: a path, or null = each member's
    * own default. */
-  pinGroupCwd(groupId: string): string | null {
+  pinGroupCwd(groupId: string, threadId?: string): string | null {
     const group = this.group(groupId);
     if (!group) return null;
-    if (group.pinnedCwd === undefined) {
-      group.pinnedCwd = group.cwd ?? null;
+    const task = threadId ? this.groupTaskByThread(groupId, threadId) : this.activeGroupTask(groupId);
+    // Direct-message channels retain the original single-thread contract.
+    if (!task) {
+      if (!group.dm) return null;
+      if (group.pinnedCwd === undefined) {
+        group.pinnedCwd = group.cwd ?? null;
+        this.saveGroups();
+        this.emit({ type: "group", groupId: group.id });
+      }
+      return group.pinnedCwd;
+    }
+    if (task.pinnedCwd === undefined) {
+      task.pinnedCwd = group.cwd ?? null;
+      if (group.threadId === task.threadId) group.pinnedCwd = task.pinnedCwd;
       this.saveGroups();
       this.emit({ type: "group", groupId: group.id });
     }
-    return group.pinnedCwd;
+    return task.pinnedCwd;
   }
 
   // ── tasks ─────────────────────────────────────────────────────────────

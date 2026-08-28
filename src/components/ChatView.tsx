@@ -1005,14 +1005,6 @@ export function ChatView({ bot }: { bot: Bot }) {
     });
   };
 
-  // on Windows the frameless window's min/max/close overlay sits at the
-  // top-right: the header becomes the drag strip and clears room for it
-  const isWin = window.ogb?.platform === "win32";
-  // SAFETY: Electron supports this nonstandard CSS property, which React's type declarations omit.
-  const drag = isWin ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
-  // SAFETY: Electron supports this nonstandard CSS property, which React's type declarations omit.
-  const noDrag = isWin ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
-
   return (
     <main className="relative flex h-full min-w-0 flex-1 flex-col bg-app">
       {/* Call mode covers the thread while the bot is on the line */}
@@ -1025,11 +1017,9 @@ export function ChatView({ bot }: { bot: Bot }) {
           "@container/chathead flex items-center justify-between px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
-          isWin && "pr-[148px]",
         )}
-        style={drag}
       >
-        <div className="flex min-w-0 items-center gap-2.5 rounded-lg px-1.5 py-1" style={noDrag}>
+        <div className="flex min-w-0 items-center gap-2.5 rounded-lg px-1.5 py-1">
           <button
             onClick={() => dispatch({ type: "toggleSettings", open: true })}
             className="flex size-10 shrink-0 items-center justify-center rounded-lg hover:bg-raised/50"
@@ -1059,7 +1049,7 @@ export function ChatView({ bot }: { bot: Bot }) {
           )}
           {bot.busy && <Loader2 size={14} className="animate-spin text-ink-secondary" />}
         </div>
-        <div className="flex shrink-0 items-center gap-2" style={noDrag}>
+        <div className="flex shrink-0 items-center gap-2">
           <button
             onClick={() => setFindOpen((open) => !open)}
             aria-label="Find in conversation"
@@ -1141,10 +1131,12 @@ export function ChatView({ bot }: { bot: Bot }) {
 
       {showToolCallsEnabled(state.config) && <TaskTimeline messages={messages} busy={bot.busy ?? false} />}
 
-      {/* Messages */}
+      {/* Messages + composer share one pane so bubbles scroll into the pill
+          instead of dying on a rectangular clip above a black dock. */}
+      <div className="relative min-h-0 flex-1">
       <div
         ref={scrollRef}
-        className="flex-1 overflow-x-hidden overflow-y-auto px-5 [overflow-anchor:none]"
+        className="h-full overflow-x-hidden overflow-y-auto px-5 [overflow-anchor:none]"
         onWheel={(e) => {
           if (e.deltaY < 0) setBottomFollow(false);
           else if (atEnd()) setBottomFollow(true);
@@ -1170,7 +1162,7 @@ export function ChatView({ bot }: { bot: Bot }) {
         }}
       >
         <div
-          className="flex w-full flex-col gap-3 pb-4"
+          className="flex w-full flex-col gap-3 pb-24"
           role="log"
           aria-live="polite"
           aria-label={`Conversation with ${bot.name}`}
@@ -1260,6 +1252,7 @@ export function ChatView({ bot }: { bot: Bot }) {
           the previous bot's half-written message over. ArrowUp-to-edit is
           gated on busy like the pencil button — editing rewinds the thread,
           which a live turn forbids (the server 409s it). */}
+      <div className="absolute inset-x-0 bottom-0 z-[2]">
       <Composer
         key={bot.id}
         bot={bot}
@@ -1267,6 +1260,8 @@ export function ChatView({ bot }: { bot: Bot }) {
         onClearReply={() => setReplyTo(null)}
         onEditLast={lastUserMessage && !bot.busy ? () => setEditingId(lastUserMessage.id) : undefined}
       />
+      </div>
+      </div>
 
     </main>
   );

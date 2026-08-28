@@ -1,7 +1,7 @@
 {
   "name": "openmausbot",
   "private": true,
-  "version": "0.1.37",
+  "version": "0.1.38",
   "description": "A local-first chat app for running a team of AI agents.",
   "homepage": "https://github.com/milind-soni/OpenMausBot",
   "repository": {
@@ -30,12 +30,13 @@
     "docs:preview": "pnpm --filter @openmausbot/docs preview",
     "companion": "node --experimental-strip-types companion/src/index.ts",
     "dev:server": "node --experimental-strip-types server/index.ts",
+    "mcp": "node --experimental-strip-types scripts/mcp-server.ts",
     "dev:desktop": "node scripts/prepare-cloudflared.mjs --current && electron .",
     "build": "tsc -b && tsc -p tsconfig.server.json && vite build",
     "typecheck": "tsc -b && tsc -p tsconfig.server.json",
     "test": "node scripts/test-floor.mjs && pnpm broker:test && pnpm test:updater && pnpm test:desktop-viewer && pnpm test:package-link && pnpm test:save-file && pnpm test:server-boot-probe && pnpm test:packaged-server",
     "test:updater": "node --test electron/updater-coordinator.node-test.mjs",
-    "test:desktop-viewer": "node --test electron/desktop-viewer.node-test.mjs",
+    "test:desktop-viewer": "node --test electron/desktop-viewer.node-test.mjs electron/desktop-workspace.node-test.mjs",
     "test:package-link": "node --test electron/package-link.node-test.mjs",
     "test:save-file": "node --test electron/save-file.node-test.mjs",
     "test:server-boot-probe": "node --test electron/server-boot-probe.node-test.mjs",

@@ -22,6 +22,7 @@ import { effectiveDefaultResponder, groupResponseHint } from "@/lib/group-routin
 import { ChatMarkdown } from "./ChatMarkdown";
 import { Composer } from "./Composer";
 import { ChatFindBar } from "./ChatFindBar";
+import { GroupTaskPicker } from "./TaskPicker";
 import { ReplyQuote } from "./ReplyQuote";
 import { ConnectorCard } from "./ConnectorCard";
 import { SecretRequestCard } from "./SecretRequestCard";
@@ -378,7 +379,7 @@ function RoomWorkingFolder({ group }: { group: Group }) {
             {shownCwd ? shortPath(shownCwd, home) : <span className="text-ink-secondary">Each bot's own folder</span>}
           </div>
           <div className="mt-2 text-[12px] text-ink-secondary">
-            Fixed after this channel's first turn. Create a new channel and choose its folder before sending the first message to work somewhere else.
+            Fixed for this task after its first turn. Start a new task to work somewhere else.
           </div>
         </div>
       ) : canPick ? (
@@ -988,10 +989,6 @@ export function GroupView({ group }: { group: Group }) {
     </span>
   ));
 
-  const isWin = window.ogb?.platform === "win32";
-  const drag = isWin ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
-  const noDrag = isWin ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
-
   return (
     <main className="relative flex h-full min-w-0 flex-1 flex-col bg-app">
       <GroupCallOverlay group={group} members={members} />
@@ -1004,12 +1001,13 @@ export function GroupView({ group }: { group: Group }) {
           "flex items-center justify-between px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
-          isWin && "pr-[148px]",
         )}
-        style={drag}
       >
-        <span className="text-[15px] font-semibold text-ink">{group.name}</span>
-        <div className="flex items-center gap-1.5" style={noDrag}>
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="truncate text-[15px] font-semibold text-ink">{group.name}</span>
+          {!setupPending && !group.dm && <GroupTaskPicker group={group} />}
+        </div>
+        <div className="flex items-center gap-1.5">
           <button
             type="button"
             onClick={() => setFindOpen((open) => !open)}
@@ -1125,10 +1123,10 @@ export function GroupView({ group }: { group: Group }) {
         );
       })()}
 
-      {/* Transcript */}
+      <div className="relative min-h-0 flex-1">
       <div
         ref={scrollRef}
-        className="flex-1 overflow-x-hidden overflow-y-auto px-5 [overflow-anchor:none]"
+        className="h-full overflow-x-hidden overflow-y-auto px-5 [overflow-anchor:none]"
         onWheel={(e) => {
           if (e.deltaY < 0) setBottomFollow(false);
           else if (atEnd()) setBottomFollow(true);
@@ -1159,7 +1157,7 @@ export function GroupView({ group }: { group: Group }) {
           </div>
         ) : (
         <div
-          className="flex w-full flex-col gap-3 pb-4"
+          className="flex w-full flex-col gap-3 pb-24"
           role="log"
           aria-live="polite"
           aria-label={`Room ${group.name}`}
@@ -1256,14 +1254,17 @@ export function GroupView({ group }: { group: Group }) {
         </button>
       )}
 
+      <div className="absolute inset-x-0 bottom-0 z-[2]">
       <Composer
-        key={group.id}
+        key={group.threadId}
         group={group}
         members={members}
         locked={setupPending}
         replyTo={replyTo}
         onClearReply={() => setReplyTo(null)}
       />
+      </div>
+      </div>
     </main>
   );
 }

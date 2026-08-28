@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, screen, session, shell, systemPreferences, utilityProcess } from "electron";
+import { app, BrowserWindow, WebContentsView, clipboard, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, screen, session, shell, systemPreferences, utilityProcess } from "electron";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -22,6 +22,7 @@ import { migrateWorkspaceCredentials, workspaceCredentialEnv } from "./workspace
 import { activateExistingWindow } from "./single-instance.mjs";
 import { pollServerIdentity } from "./server-boot-probe.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
+import { windowChromeOptions } from "./window-chrome.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
 import {
   ensureManagedComposioCredentials,
@@ -38,7 +39,7 @@ import {
   withoutManagedCompanionTunnelAccess,
 } from "./managed-companion-tunnel.mjs";
 import { createSecureCredentialState } from "./secure-credential-state.mjs";
-import { skinChrome, isKnownSkin } from "./skin-overlay.cjs";
+import { isKnownSkin } from "./skin-overlay.cjs";
 import { readSecureCredentials } from "./secure-credentials.mjs";
 import { createControlPlaneClient } from "./control-plane-client.mjs";
 import {
@@ -56,6 +57,7 @@ const { createDisplayMediaGuard, invokeDisplayMediaCallback, selectCaptureSource
 );
 const { STAGE_PREFIX: APPIMAGE_CUA_STAGE_PREFIX } = require("./cua-linux-bundle.cjs");
 const { desktopViewerUrl, sameDesktopViewerOrigin } = require("./desktop-viewer.cjs");
+const { createDesktopWorkspaceManager } = require("./desktop-workspace.cjs");
 const { normalizeUnreadCount, parseWindowState, resolveWindowState } = require("./window-state.cjs");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -68,11 +70,10 @@ const APP_ICON = path.join(__dirname, "resources/app-icon.png");
 let desktopViewerWindow = null;
 let desktopViewerOwner = null;
 let desktopViewerContextId = null;
+let desktopWorkspaceManager = null;
+let desktopWorkspaceOwner = null;
 let pendingPackageInstallUrl = packageUrlFromCommandLine(process.argv);
 let mainWindow = null;
-// The active skin id, mirrored from the renderer so a window's native
-// caption-button overlay (issue #454) starts and stays on the right colours.
-let currentSkin = "midnight";
 let unreadCount = 0;
 let unreadOverlayIcon = null;
 
@@ -939,6 +940,56 @@ function openDesktopViewer(owner, rawUrl, rawTitle, contextId) {
   return true;
 }
 
+function ensureDesktopWorkspace(owner) {
+  if (!owner || owner.isDestroyed()) throw new Error("The OpenMausBot window is unavailable");
+  if (desktopWorkspaceManager) {
+    if (desktopWorkspaceOwner !== owner) {
+      throw new Error("The desktop workspace belongs to another app window");
+    }
+    return desktopWorkspaceManager;
+  }
+
+  desktopWorkspaceOwner = owner;
+  const manager = createDesktopWorkspaceManager({
+    owner,
+    createView: (options) => new WebContentsView(options),
+    partitionPrefix: `openmausbot-desktop-workspace-${randomUUID()}`,
+    notify: (state) => {
+      if (!owner.isDestroyed() && !owner.webContents.isDestroyed()) {
+        owner.webContents.send("desktop-workspace:state", state);
+      }
+    },
+  });
+  desktopWorkspaceManager = manager;
+
+  // Native child views outlive the renderer DOM unless we explicitly tear
+  // them down. Reloads, renderer crashes and owner destruction all close both
+  // panes without retaining their secret-bearing noVNC URLs.
+  owner.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) manager.closeAll();
+  });
+  owner.webContents.on("render-process-gone", () => manager.closeAll());
+  owner.once("closed", () => {
+    manager.closeAll();
+    if (desktopWorkspaceManager === manager) {
+      desktopWorkspaceManager = null;
+      desktopWorkspaceOwner = null;
+    }
+  });
+  return manager;
+}
+
+function desktopWorkspaceForEvent(event, create = false) {
+  const owner = mainWindow;
+  if (!owner || owner.isDestroyed() || event.sender !== owner.webContents) {
+    throw new Error("The desktop workspace is available only to the main app window");
+  }
+  if (desktopWorkspaceManager && desktopWorkspaceOwner !== owner) {
+    throw new Error("The desktop workspace belongs to another app window");
+  }
+  return create ? ensureDesktopWorkspace(owner) : desktopWorkspaceManager;
+}
+
 ipcMain.on("screen:preview-intent", (event) => {
   event.returnValue = displayMediaGuard.begin(event.senderFrame);
 });
@@ -951,8 +1002,6 @@ ipcMain.on("desktop:unread-count", (event, value) => {
 });
 
 function createWindow() {
-  const isMac = process.platform === "darwin";
-  const waitsForSkinSync = process.platform === "win32";
   const primary = screen.getPrimaryDisplay();
   const displays = [primary, ...screen.getAllDisplays().filter((display) => display.id !== primary.id)];
   const restored = resolveWindowState(readWindowState(), displays.map((display) => display.workArea));
@@ -960,54 +1009,20 @@ function createWindow() {
     ...restored.bounds,
     minWidth: 900,
     minHeight: 600,
-    // The renderer restores its persisted skin before mounting React and
-    // mirrors it over desktop:skin. Keep Windows hidden until that handshake
-    // recolors the native caption-button overlay, otherwise a saved light
-    // skin still flashes the Midnight-black block on every cold start.
-    show: !waitsForSkinSync,
     icon: APP_ICON,
     backgroundColor: "#070707",
     autoHideMenuBar: process.platform !== "darwin",
-    // macOS keeps inset traffic lights, Windows keeps its custom overlay,
-    // and Linux uses the native desktop title bar and window controls.
-    ...(isMac
-      ? { titleBarStyle: "hiddenInset", trafficLightPosition: { x: 16, y: 16 } }
-      : process.platform === "win32"
-        ? {
-            titleBarStyle: "hidden",
-            // height MUST match the ChatView/GroupView header strip (px-5 py-3
-            // around a 36px control row = 60). Windows draws the caption buttons
-            // to fill the overlay, so anything shorter leaves a dead band under
-            // them and anything taller overhangs the header.
-            // color/symbolColor follow the active skin (issue #454): the
-            // caption buttons live in this native overlay, and a light skin
-            // with a Midnight-black overlay is the "black block in the
-            // top-right corner". height stays 60 — see the note above.
-            titleBarOverlay: { ...skinChrome(currentSkin), height: 60 },
-          }
-        : {}),
+    ...windowChromeOptions(process.platform),
     webPreferences: {
       contextIsolation: true,
       preload: path.join(__dirname, "preload.cjs"),
     },
   });
   mainWindow = win;
-  if (waitsForSkinSync) {
-    // A broken renderer or preload must not strand the app as an invisible
-    // process. Normal startup shows from desktop:skin almost immediately;
-    // this is only the bounded recovery path.
-    const skinSyncFallback = setTimeout(() => {
-      if (!win.isDestroyed() && !win.isVisible()) win.show();
-    }, 5_000);
-    skinSyncFallback.unref?.();
-    const clearSkinSyncFallback = () => clearTimeout(skinSyncFallback);
-    win.once("show", clearSkinSyncFallback);
-    win.once("closed", clearSkinSyncFallback);
-  }
   installWindowStatePersistence(win);
   applyUnreadBadge(win);
   if (restored.maximized) win.maximize();
-  win.on("closed", () => {
+  win.once("closed", () => {
     if (mainWindow === win) mainWindow = null;
   });
 
@@ -1269,27 +1284,11 @@ ipcMain.handle("desktop:save-file", async (event, rawPath) => {
   });
 });
 
-// The renderer owns the skin (it lives in localStorage and stamps
-// [data-skin] before first paint); it tells the main process so the one
-// surface CSS cannot reach — the Windows caption-button overlay — matches.
-// Persisted in-process so a window opened later starts on the right colours.
-ipcMain.handle("desktop:skin", (event, skin) => {
+// The renderer owns the skin. Native Windows/Linux chrome is intentionally
+// outside that surface; acknowledge the renderer handshake without creating
+// a frameless caption overlay that can cover page controls.
+ipcMain.handle("desktop:skin", (_event, skin) => {
   if (!isKnownSkin(skin)) return false;
-  currentSkin = skin;
-  // The caption-button overlay is a Windows-only surface (createWindow only
-  // configures titleBarOverlay there); on macOS/Linux the renderer's CSS is
-  // the whole story and there is nothing native to recolour.
-  if (process.platform === "win32") {
-    const sender = BrowserWindow.fromWebContents(event.sender);
-    try {
-      sender?.setTitleBarOverlay({ ...skinChrome(skin), height: 60 });
-      // The first Windows window starts hidden so a persisted light skin is
-      // already applied when native chrome becomes visible.
-      if (sender && !sender.isVisible()) sender.show();
-    } catch {
-      // a window created without an overlay throws; safe to ignore
-    }
-  }
   return true;
 });
 
@@ -1314,6 +1313,28 @@ ipcMain.handle("desktop:open-external", async (_event, rawUrl) => {
 ipcMain.handle("desktop-viewer:open", (event, rawUrl, title, contextId) => {
   const owner = BrowserWindow.fromWebContents(event.sender);
   return openDesktopViewer(owner, rawUrl, title, contextId);
+});
+
+// Two Local VM desktops share the existing app BrowserWindow. The renderer
+// supplies only layout and intent; URL validation, sandboxing, session
+// isolation and the one-interactive-pane invariant stay in the main process.
+ipcMain.handle("desktop-workspace:open", (event, input) =>
+  desktopWorkspaceForEvent(event, true).open(input),
+);
+ipcMain.handle("desktop-workspace:layout", (event, items) => {
+  const manager = desktopWorkspaceForEvent(event);
+  if (!manager) return false;
+  return manager.layout(items);
+});
+ipcMain.handle("desktop-workspace:set-interactive", (event, contextId) => {
+  const manager = desktopWorkspaceForEvent(event);
+  if (!manager) return contextId == null;
+  return manager.setInteractive(contextId);
+});
+ipcMain.handle("desktop-workspace:close", (event, contextId) => {
+  const manager = desktopWorkspaceForEvent(event);
+  if (!manager) return true;
+  return manager.close(contextId);
 });
 
 // Close only when the caller owns the current viewer — otherwise one bot's
