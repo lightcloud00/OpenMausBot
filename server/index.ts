@@ -134,6 +134,13 @@ import { LocalVmLease, LocalVmLeasePool } from "./local-vm-lease.ts";
 import { publicWorker, type ResolvedWorker } from "./computer-workers.ts";
 import { RemoteWorkerLease, remoteWorkerMcp } from "./remote-worker.ts";
 import { allWorkerStatuses, workerStatus } from "./worker-status.ts";
+import { WorkerTaskRegistry } from "./worker-task-manifest.ts";
+import {
+  cancelWorkerTaskApprovalsForThread,
+  dismissStaleWorkerTaskCards,
+  resolveWorkerTaskApproval,
+} from "./worker-task-approval.ts";
+import { WorkerTaskService } from "./worker-task-service.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
@@ -263,6 +270,16 @@ const computerControl = new ComputerControl((botId, snapshot) => {
 function controlIntegration(botId: string) {
   return {
     url: `http://127.0.0.1:${PORT}/api/internal/computer-control?botId=${encodeURIComponent(botId)}`,
+    token: COMMS_TOKEN,
+  };
+}
+
+/** Where the worker MCP bridge sends the four task tools. Same loopback shape
+ * as computer control: the bridge is a separate per-turn process and owns no
+ * authority of its own. */
+function taskIntegration(botId: string) {
+  return {
+    url: `http://127.0.0.1:${PORT}/api/internal/worker-task?botId=${encodeURIComponent(botId)}`,
     token: COMMS_TOKEN,
   };
 }
@@ -771,11 +788,21 @@ function localVmIdleFor(target: LocalVmTarget): LocalVmIdleTimer {
 const workerLease = new RemoteWorkerLease();
 const workerThreadAliases = new Map<string, string>();
 
+/** Approvals and activations for every worker, in one place. Per-worker
+ * revocation lives on the registry so a worker going offline can drop its own
+ * approvals without touching the other's — #508 acceptance item 6. */
+const workerTasks = new WorkerTaskRegistry();
+
 function releaseWorkerThread(threadId: string): void {
   const alias = workerThreadAliases.get(threadId);
   if (!alias) return;
   workerLease.release(threadId);
   workerThreadAliases.delete(threadId);
+  // A turn that ends holds no approval into the next one. The document stays
+  // registered; permission to execute it does not survive the turn.
+  const record = workerTasks.forThread(threadId);
+  if (record) workerTasks.revoke(record.manifest.taskId);
+  cancelWorkerTaskApprovalsForThread(threadId);
 }
 
 function releaseLocalVmThread(threadId: string): void {
@@ -961,9 +988,11 @@ bus.subscribe((event: RuntimeEvent) => {
           title:
             permission && event.approvalScope === "local-computer"
               ? "Local computer approval"
-              : permission
-                ? "Approval needed"
-                : "Your bot has a question",
+              : permission && event.approvalScope === "remote-worker-computer"
+                ? "Worker computer approval"
+                : permission
+                  ? "Approval needed"
+                  : "Your bot has a question",
           subtitle: event.summary,
           options: event.choices?.length ? event.choices : permission ? ["Allow", "Deny"] : [],
           requestId: event.requestId,
@@ -1640,6 +1669,7 @@ async function startTurn(
           status.channelPath,
           controlIntegration(bot.id),
           status.capabilityDigest ?? undefined,
+          taskIntegration(bot.id),
         );
         workerTarget = worker;
         computerKind = "worker";
@@ -1981,6 +2011,21 @@ const approvalBus: ApprovalBus = { store, broadcast };
 {
   const stale = dismissStalePeerCards(approvalBus);
   if (stale) console.log(`peer approvals: dismissed ${stale} card(s) left by a previous run`);
+}
+
+// The four worker task tools are answered here, never in the MCP bridge: the
+// registry, the approval card and the SSH transport all live in this process.
+const workerTaskService = new WorkerTaskService({
+  bus: approvalBus,
+  registry: workerTasks,
+  workerFor: (bot) => workerById(cfg, bot.workerId ?? null),
+});
+
+// Same reasoning as the peer sweep above: a worker task card on disk belongs to
+// a resolver that died with the previous process.
+{
+  const stale = dismissStaleWorkerTaskCards(approvalBus);
+  if (stale) console.log(`worker tasks: dismissed ${stale} card(s) left by a previous run`);
 }
 
 // Handoffs a previous process queued but never ran: the source turn is
@@ -3034,6 +3079,17 @@ const server = createServer(async (req, res) => {
         return res.end(Buffer.from(upstream.bytes));
       }
       // ── computer control: proxies read the hold, bots plead for help ──
+      if (path === "/api/internal/worker-task" && method === "POST") {
+        const botId = url.searchParams.get("botId") ?? "";
+        const bot = store.bot(botId);
+        if (!bot) return json(res, 404, { error: "no such bot" });
+        const body = await readBody(req);
+        // Propose blocks on a human, so this request is deliberately long-lived;
+        // the bridge's own timeout is the ceiling, and the approval's 15-minute
+        // timer resolves it either way.
+        const outcome = await workerTaskService.handle(bot, body);
+        return json(res, outcome.status, outcome.error ? { error: outcome.error } : { text: outcome.text ?? "" });
+      }
       if (path === "/api/internal/computer-control") {
         const botId = url.searchParams.get("botId") ?? "";
         const bot = store.bot(botId);
@@ -4583,6 +4639,10 @@ const server = createServer(async (req, res) => {
       if (resolvePeerComms(approvalBus, String(body.requestId), behavior)) {
         return json(res, 200, { ok: true, outcome: behavior === "allow" ? "allowed-once" : "rejected" });
       }
+      // worker-task intercept: same harness-native shape as peer approval.
+      if (resolveWorkerTaskApproval(String(body.requestId), behavior)) {
+        return json(res, 200, { ok: true, outcome: behavior === "allow" ? "allowed-once" : "rejected" });
+      }
       const outcome = await answerRequest(bot.threadId, bot.modelSelection.instanceId, String(body.requestId), behavior, body.message, { id: bot.id, name: bot.name });
       return json(res, 200, { ok: true, outcome });
     }
@@ -4600,6 +4660,9 @@ const server = createServer(async (req, res) => {
       // belongs to the bus rather than to a speaker, so resolve it before we go
       // looking for one — a room between turns has no speaker to find.
       if (resolvePeerComms(approvalBus, requestId, behavior)) {
+        return json(res, 200, { ok: true, outcome: behavior === "allow" ? "allowed-once" : "rejected" });
+      }
+      if (resolveWorkerTaskApproval(requestId, behavior)) {
         return json(res, 200, { ok: true, outcome: behavior === "allow" ? "allowed-once" : "rejected" });
       }
       const group = store.groupByThread(threadId);
@@ -4933,6 +4996,13 @@ const server = createServer(async (req, res) => {
         lease: workerLease,
         isBotBusy: (botId) => store.bot(botId)?.busy === true,
       });
+      // A worker that is no longer ready cannot be holding the capability its
+      // task was approved against, so its approvals are dropped here — and only
+      // its own. #508 item 6 is precisely that killing one worker leaves the
+      // other usable, approvals included.
+      for (const status of statuses) {
+        if (!status.ready) workerTaskService.forgetWorker(status.workerId);
+      }
       // The SSH alias names a host in the operator's own config. Nothing
       // downstream of the control plane needs it, so it never leaves here.
       return json(res, 200, {

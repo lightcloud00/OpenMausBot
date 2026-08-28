@@ -34,6 +34,8 @@ export type Sha256Digest = z.output<typeof digestSchema>;
 
 const versionSchema = z.literal(PROTOCOL_VERSION).optional();
 
+const idSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/, "invalid id");
+
 const requestSchema = z.discriminatedUnion("op", [
   z.object({ version: versionSchema, op: z.literal("pause") }),
   z.object({
@@ -41,7 +43,42 @@ const requestSchema = z.discriminatedUnion("op", [
     op: z.literal("resume"),
     expectedBasePolicySha256: digestSchema,
   }),
-  // reset / validate / activate / run arrive with the server-side task layer.
+  // The task operations. Note what these can and cannot say: a task id, a
+  // digest, an instant, a command id. Never an executable, argv, working
+  // directory, environment variable, path, policy or capability document —
+  // every one of those is read back out of the staged manifest the digest
+  // pins, so the wire can select an approved action but never describe a new
+  // one.
+  z.object({
+    version: versionSchema,
+    op: z.literal("reset"),
+    taskId: idSchema,
+    expectedBasePolicySha256: digestSchema,
+  }),
+  z.object({
+    version: versionSchema,
+    op: z.literal("validate"),
+    taskId: idSchema,
+    manifestSha256: digestSchema,
+  }),
+  z.object({
+    version: versionSchema,
+    op: z.literal("activate"),
+    taskId: idSchema,
+    manifestSha256: digestSchema,
+    /** The instant the control plane derived the capability. A CUA manifest's
+     * lifetimes are relative, so both ends need the same one to agree on a
+     * digest; task.ts bounds how far it may sit from the worker's own clock. */
+    issuedAt: z.number().int().positive(),
+    expectedCapabilitySha256: digestSchema,
+  }),
+  z.object({
+    version: versionSchema,
+    op: z.literal("run"),
+    taskId: idSchema,
+    manifestSha256: digestSchema,
+    commandId: idSchema,
+  }),
 ]);
 
 export type CompanionRequest = z.output<typeof requestSchema>;
@@ -54,6 +91,40 @@ export type CompanionResponse =
       readonly paused: false;
       readonly capabilitySha256: Sha256Digest;
     }
+  | {
+      readonly ok: true;
+      readonly version: number;
+      readonly op: "validate";
+      /** The task root this worker derived for itself. The control plane needs
+       * the exact string to rebuild the same capability document, and cannot
+       * know the worker account's home directory any other way. It is a hint,
+       * not an authority: `activate` rebuilds the capability against this
+       * worker's own root, so a report that does not match simply fails. */
+      readonly taskRoot: string;
+      readonly files: number;
+      readonly commandIds: readonly string[];
+    }
+  | {
+      readonly ok: true;
+      readonly version: number;
+      readonly op: "activate" | "reset";
+      readonly capabilitySha256: Sha256Digest;
+    }
+  | {
+      readonly ok: true;
+      readonly version: number;
+      readonly op: "run";
+      readonly commandId: string;
+      readonly code: number | null;
+      readonly stdout: string;
+      readonly stderr: string;
+    }
+  | { readonly ok: false; readonly error: string };
+
+/** The reply to a `stage` invocation, which is a subcommand rather than a wire
+ * operation because its payload is a raw byte stream. */
+export type StageResponse =
+  | { readonly ok: true; readonly version: number; readonly op: "stage"; readonly files: number }
   | { readonly ok: false; readonly error: string };
 
 /** Brand a digest this process computed itself. */

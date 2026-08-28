@@ -39,6 +39,17 @@ export function activeCapabilityPath(platform: WorkerPlatform = workerPlatform()
   return join(supportDirectory(platform), "active-capabilities.yaml");
 }
 
+const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+
+/** Where one task's staged files live. The wire names a task id, never a
+ * path: the id is validated against the same grammar the control plane's
+ * manifest schema uses, and the root is derived here so no caller can point
+ * the companion at a directory of its choosing. */
+export function taskRoot(taskId: string, platform: WorkerPlatform = workerPlatform()): string {
+  if (!TASK_ID.test(taskId)) throw new Error("invalid task id");
+  return join(supportDirectory(platform), "tasks", taskId);
+}
+
 /** Fixed allow-list. Never inherit the caller's environment wholesale: the SSH
  * session's environment is attacker-adjacent and the driver is the one process
  * on this box that can drive the whole desktop. */

@@ -1,8 +1,10 @@
 // Fixed-argv control of the local CUA Driver.
 //
-// Every invocation here is a constant: no shell, no caller-supplied executable,
-// argv, cwd or environment. The companion's whole security value is that the
-// wire cannot name a program to run.
+// Never a shell, and never an environment from the caller. The driver
+// invocations here are constants; the one caller that supplies an executable,
+// argv and cwd is task.ts, and every one of those values comes out of a staged
+// manifest whose digest an operator approved. The companion's security value is
+// that the wire itself cannot name a program to run.
 import { spawn } from "node:child_process";
 
 import { capabilityDigest, parkedCapability, writeActiveCapability } from "./capability.ts";
@@ -15,19 +17,37 @@ const READY_TIMEOUT_MS = 15_000;
 
 export interface RunResult { stdout: string; stderr: string; code: number | null }
 
+export interface RunOptions {
+  /** Working directory for the child. Only ever a directory the caller has
+   * already resolved inside an approved task root — never a path off the wire. */
+  cwd?: string;
+}
+
 export function runFixed(
   executable: string,
   args: string[],
   timeoutMs: number,
   acceptNonZero = false,
+  options: RunOptions = {},
 ): Promise<RunResult> {
   return new Promise((resolveResult, reject) => {
-    const child = spawn(executable, args, {
-      shell: false,
-      env: childEnvironment(),
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    // Two calls rather than one with a conditional spread: an absent cwd is an
+    // omission the reader can see, and the literal keeps its exact stdio tuple
+    // type so `child.stdout` and `child.stderr` stay non-null below.
+    const child = options.cwd === undefined
+      ? spawn(executable, args, {
+          shell: false,
+          env: childEnvironment(),
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        })
+      : spawn(executable, args, {
+          shell: false,
+          env: childEnvironment(),
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "pipe"],
+          cwd: options.cwd,
+        });
     let stdout = "";
     let stderr = "";
     let settled = false;

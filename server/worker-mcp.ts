@@ -37,6 +37,17 @@ const gate = (() => {
   const token = process.env.OMB_CONTROL_TOKEN ?? "";
   return url && token ? { gate: { url, token } } : {};
 })();
+// The task tools ride the same MCP server as the CUA tools they unlock, so a
+// bot never holds a bounded worker with no way to propose the task that would
+// unbind it.
+const task = (() => {
+  const url = process.env.OMB_TASK_URL ?? "";
+  const secret = process.env.OMB_TASK_TOKEN ?? "";
+  return url && secret ? { task: { url, token: secret } } : {};
+})();
+// Note which environment the ssh child gets: the allow-list below, which
+// carries neither loopback secret. Both stay in this process, where the two
+// interceptors use them, and never cross to the worker.
 const sshEnv = remoteWorkerSshEnvironment();
 
 runMcpBridge({
@@ -46,4 +57,5 @@ runMcpBridge({
   label: "Worker CUA Driver",
   liveness: { command: "ssh", args: livenessArgs, env: sshEnv },
   ...gate,
+  ...task,
 });

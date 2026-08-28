@@ -160,9 +160,26 @@ describe("stdio request parsing", () => {
   it.each([
     ["unknown op", '{"op":"exfiltrate"}'],
     ["missing op", "{}"],
-    ["task-layer op not in this release", '{"op":"run","taskId":"t","commandId":"c"}'],
   ])("rejects %s", (_label, line) => {
     expect(() => parseRequest(line)).toThrow("unsupported operation");
+  });
+
+  // The task operations landed with the server-side task layer. What still has
+  // to hold is the shape of their vocabulary: an id, a digest, an instant, a
+  // command id — and nothing that could name a program or a path.
+  it.each([
+    ["run with no digest", '{"op":"run","taskId":"t","commandId":"c"}'],
+    ["validate with a short digest", `{"op":"validate","taskId":"t","manifestSha256":"${"a".repeat(63)}"}`],
+    ["reset with no task id", `{"op":"reset","expectedBasePolicySha256":"${"a".repeat(64)}"}`],
+    ["activate with no issuing instant", `{"op":"activate","taskId":"t","manifestSha256":"${"a".repeat(64)}","expectedCapabilitySha256":"${"b".repeat(64)}"}`],
+    ["a task id that is a path", `{"op":"validate","taskId":"../etc","manifestSha256":"${"a".repeat(64)}"}`],
+  ])("rejects %s", (_label, line) => {
+    expect(() => parseRequest(line)).toThrow();
+  });
+
+  it("accepts a well-formed run", () => {
+    const request = parseRequest(`{"op":"run","taskId":"task-1","manifestSha256":"${"a".repeat(64)}","commandId":"build"}`);
+    expect(request.op).toBe("run");
   });
 
   it.each([

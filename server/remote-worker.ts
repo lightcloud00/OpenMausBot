@@ -444,11 +444,32 @@ export interface RemoteWorkerMcpDescriptor {
   scope: "remote-worker-computer";
 }
 
+/** The bridge process's own environment: the two loopback endpoints, and
+ * nothing else. Built in statements rather than conditional spreads so an
+ * absent endpoint is visibly an omission rather than an empty object folded
+ * into a literal. */
+function bridgeEnvironment(
+  control?: { url: string; token: string },
+  task?: { url: string; token: string },
+) {
+  const env: Record<string, string> = {};
+  if (control) {
+    env.OMB_CONTROL_URL = control.url;
+    env.OMB_CONTROL_TOKEN = control.token;
+  }
+  if (task) {
+    env.OMB_TASK_URL = task.url;
+    env.OMB_TASK_TOKEN = task.token;
+  }
+  return env;
+}
+
 export function remoteWorkerMcp(
   worker: ResolvedWorker,
   channelPath: string,
   control?: { url: string; token: string },
   capabilityDigest?: string,
+  task?: { url: string; token: string },
 ): RemoteWorkerMcpDescriptor {
   if (!worker.sshAlias) throw new Error("worker SSH alias is not configured");
   // Throws before any bridge is spawned when the channel path is unsafe.
@@ -456,7 +477,10 @@ export function remoteWorkerMcp(
   return {
     command: SPAWNED_PROXIES.workerMcp,
     args: [worker.sshAlias, channelPath, worker.platform],
-    env: control ? { OMB_CONTROL_URL: control.url, OMB_CONTROL_TOKEN: control.token } : {},
+    // Both loopback endpoints reach only the bridge process. The ssh child it
+    // spawns gets `remoteWorkerSshEnvironment()` instead, which carries neither
+    // of these, so nothing here can travel to the worker.
+    env: bridgeEnvironment(control, task),
     platform: worker.platform === "windows" ? "win32" : "darwin",
     generation: [
       worker.expectedDriverVersion,
