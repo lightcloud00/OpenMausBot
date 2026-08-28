@@ -25,6 +25,11 @@ export const HARMLESS_EXECUTABLE = process.platform === "win32"
   ? "C:\\Windows\\System32\\hostname.exe"
   : "/bin/echo";
 
+/** Argv that makes the executable above exit 0. `hostname` with an argument
+ * tries to SET the machine name and exits 1 without admin rights, so the two
+ * platforms cannot share one argv. */
+export const HARMLESS_ARGV = process.platform === "win32" ? [] : ["hello"];
+
 export function workerFixture(
   platform: WorkerPlatform = HOST_TASK_PLATFORM,
   overrides: Partial<ResolvedWorker> = {},
@@ -66,7 +71,7 @@ export function manifestFixture(
     commands: [{
       id: "build",
       executable: HARMLESS_EXECUTABLE,
-      argv: ["hello"],
+      argv: HARMLESS_ARGV,
       cwd: "src",
       timeoutMs: 60_000,
     }],

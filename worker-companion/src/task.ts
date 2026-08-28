@@ -266,11 +266,11 @@ async function awaitActiveCapability(
   platform: WorkerPlatform,
 ): Promise<void> {
   const socket = cuaSocket(platform);
-  await runFixed("cua-driver", ["autostart", "kick"], READY_TIMEOUT_MS, true);
+  await runFixed("cua-driver", ["autostart", "kick"], READY_TIMEOUT_MS, true, { platform });
   const deadline = Date.now() + READY_TIMEOUT_MS;
   let diagnostic = "";
   for (;;) {
-    const status = await runFixed("cua-driver", ["status", "--socket", socket], 5_000, true);
+    const status = await runFixed("cua-driver", ["status", "--socket", socket], 5_000, true, { platform });
     diagnostic = `${status.stdout}\n${status.stderr}`.toLowerCase();
     if (
       status.code === 0 &&
@@ -304,7 +304,7 @@ export async function activateTask(
   if (digest !== expectedCapabilitySha256.toLowerCase()) {
     throw new Error("derived CUA capability does not match the approved digest");
   }
-  await assertDriverVersion();
+  await assertDriverVersion(platform);
   writeActiveCapability(content, platform);
   await awaitActiveCapability(digest, manifest.target.basePolicySha256, platform);
   return digest;
@@ -332,7 +332,7 @@ export async function runTaskCommand(
   const cwd = resolveInRoot(root, command.cwd);
   if (!statSync(cwd).isDirectory()) throw new Error(`command working directory is not a directory: ${command.cwd}`);
 
-  const result = await runFixed(command.executable, command.argv, command.timeoutMs, true, { cwd });
+  const result = await runFixed(command.executable, command.argv, command.timeoutMs, true, { cwd, platform });
   return {
     commandId,
     code: result.code,
@@ -352,7 +352,7 @@ export async function resetTask(
   platform: WorkerPlatform = workerPlatform(),
 ): Promise<Sha256Digest> {
   rmSync(taskRoot(taskId, platform), { recursive: true, force: true });
-  await assertDriverVersion();
+  await assertDriverVersion(platform);
   const content = parkedCapability(platform);
   writeActiveCapability(content, platform);
   const digest = asDigest(capabilityDigest(content));

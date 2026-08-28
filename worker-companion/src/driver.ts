@@ -8,7 +8,7 @@
 import { spawn } from "node:child_process";
 
 import { capabilityDigest, parkedCapability, writeActiveCapability } from "./capability.ts";
-import { childEnvironment, cuaSocket } from "./platform.ts";
+import { childEnvironment, cuaSocket, type WorkerPlatform } from "./platform.ts";
 import { asDigest, type Sha256Digest } from "./wire.ts";
 
 export const EXPECTED_DRIVER_VERSION = "0.20.0";
@@ -21,6 +21,10 @@ export interface RunOptions {
   /** Working directory for the child. Only ever a directory the caller has
    * already resolved inside an approved task root — never a path off the wire. */
   cwd?: string;
+  /** Which platform's environment allow-list to build. Omitted on a real
+   * worker, where the host's own platform is the answer; supplied by tests,
+   * which run on Linux too and would otherwise trip `workerPlatform()`. */
+  platform?: WorkerPlatform;
 }
 
 export function runFixed(
@@ -31,19 +35,20 @@ export function runFixed(
   options: RunOptions = {},
 ): Promise<RunResult> {
   return new Promise((resolveResult, reject) => {
+    const environment = childEnvironment(options.platform);
     // Two calls rather than one with a conditional spread: an absent cwd is an
     // omission the reader can see, and the literal keeps its exact stdio tuple
     // type so `child.stdout` and `child.stderr` stay non-null below.
     const child = options.cwd === undefined
       ? spawn(executable, args, {
           shell: false,
-          env: childEnvironment(),
+          env: environment,
           windowsHide: true,
           stdio: ["ignore", "pipe", "pipe"],
         })
       : spawn(executable, args, {
           shell: false,
-          env: childEnvironment(),
+          env: environment,
           windowsHide: true,
           stdio: ["ignore", "pipe", "pipe"],
           cwd: options.cwd,
@@ -77,8 +82,8 @@ export function runFixed(
  * tool semantics than the capability manifests were written against, and the
  * control plane refuses the worker anyway, so refuse it here with a message
  * that names the mismatch. */
-export async function assertDriverVersion(): Promise<void> {
-  const result = await runFixed("cua-driver", ["--version"], 10_000);
+export async function assertDriverVersion(platform?: WorkerPlatform): Promise<void> {
+  const result = await runFixed("cua-driver", ["--version"], 10_000, false, { platform });
   const match = `${result.stdout}\n${result.stderr}`.match(/\b(\d+\.\d+\.\d+)\b/);
   if (match?.[1] !== EXPECTED_DRIVER_VERSION) {
     throw new Error(`CUA Driver ${match?.[1] ?? "missing"} does not match required ${EXPECTED_DRIVER_VERSION}`);
