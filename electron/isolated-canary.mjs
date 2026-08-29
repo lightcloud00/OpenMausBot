@@ -16,8 +16,16 @@ export function desktopLaunchPolicy(env = {}, identity = {}) {
 }
 
 /** Resolve a canary-only Electron profile and server state tree. */
-export function isolatedCanaryDataPaths(env = {}, pathApi) {
-  const raw = env.OMB_ISOLATED_CANARY_DATA_ROOT?.trim();
+export function isolatedCanaryDataPaths(env = {}, pathApi, defaults = {}) {
+  const explicit = env.OMB_ISOLATED_CANARY_DATA_ROOT?.trim();
+  const version = String(defaults.appVersion ?? "unknown")
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, "_") || "unknown";
+  const raw = explicit || (
+    defaults.tempRoot
+      ? pathApi?.join(defaults.tempRoot, "OpenMausBot-Isolated-Canary", version)
+      : ""
+  );
   if (!raw || !pathApi?.isAbsolute(raw)) {
     throw new Error("OMB_ISOLATED_CANARY_DATA_ROOT must be an absolute canary-only directory");
   }

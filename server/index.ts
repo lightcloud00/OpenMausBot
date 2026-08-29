@@ -122,6 +122,7 @@ import {
   retrievePromptContext,
   type PromptRetrievalRequestKind,
 } from "./prompt-retrieval.ts";
+import { completeAcceptedProviderDispatch } from "./provider-dispatch-completion.ts";
 import { TurnWatchdog } from "./turn-watchdog.ts";
 import {
   ensureWorkspace,
@@ -2187,11 +2188,12 @@ async function startTurn(
         integrations,
         cwd,
       });
-      if (pendingDispatch.cancelled) {
-        await instance.adapter.interruptTurn(threadId).catch(() => {});
-      }
-      assertDirectDispatch(pendingDispatch, threadId);
-      finishDirectDispatch(pendingDispatch, threadId);
+      await completeAcceptedProviderDispatch({
+        cancelled: pendingDispatch.cancelled,
+        interrupt: () => instance.adapter.interruptTurn(threadId),
+        assertOwned: () => assertDirectDispatch(pendingDispatch, threadId),
+        finish: () => finishDirectDispatch(pendingDispatch, threadId),
+      });
       // dispatched: the rewind is spent, and the old cursors are dead
       if (rewound) store.patchBot(bot.id, { rewound: false, resumeCursors: {} });
       // and this engine now owns the thread's most recent turn

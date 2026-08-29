@@ -75,7 +75,10 @@ if (launchPolicy.isolated) {
   // This runs before the single-instance lock. The canary therefore cannot
   // focus, reuse, or inherit the installed app's profile, lock, or server
   // state even when both executables run at the same time.
-  const canaryPaths = isolatedCanaryDataPaths(process.env, path);
+  const canaryPaths = isolatedCanaryDataPaths(process.env, path, {
+    tempRoot: app.getPath("temp"),
+    appVersion: app.getVersion(),
+  });
   fs.mkdirSync(canaryPaths.userData, { recursive: true, mode: 0o700 });
   fs.mkdirSync(canaryPaths.serverData, { recursive: true, mode: 0o700 });
   app.setPath("userData", canaryPaths.userData);

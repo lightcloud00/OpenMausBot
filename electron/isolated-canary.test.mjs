@@ -49,15 +49,35 @@ describe("isolated packaged canary policy", () => {
     expect(desktopLaunchPolicy({}, { appVersion: "0.1.40" }).isolated).toBe(false);
   });
 
-  it("requires a distinct absolute state root before an isolated launch", () => {
+  it("derives a distinct absolute state root for an auto-detected packaged canary", () => {
+    const tempRoot = path.join(path.parse(process.cwd()).root, "tmp");
+    const resolved = isolatedCanaryDataPaths({}, path, {
+      tempRoot,
+      appVersion: "0.1.40-autorag-canary.1",
+    });
+    expect(resolved.root).toBe(path.join(
+      tempRoot,
+      "OpenMausBot-Isolated-Canary",
+      "0.1.40-autorag-canary.1",
+    ));
+    expect(resolved.userData).toBe(path.join(resolved.root, "electron-user-data"));
+    expect(resolved.serverData).toBe(path.join(resolved.root, "server-data"));
+  });
+
+  it("preserves an explicit canary state root and rejects unsafe roots", () => {
     expect(() => isolatedCanaryDataPaths({}, path)).toThrow(/must be an absolute/);
     expect(() => isolatedCanaryDataPaths({ OMB_ISOLATED_CANARY_DATA_ROOT: "." }, path))
       .toThrow(/must be an absolute/);
     expect(() => isolatedCanaryDataPaths({ OMB_ISOLATED_CANARY_DATA_ROOT: path.parse(process.cwd()).root }, path))
       .toThrow(/filesystem root/);
+    const explicitRoot = path.join(process.cwd(), ".canary-state");
     const resolved = isolatedCanaryDataPaths({
-      OMB_ISOLATED_CANARY_DATA_ROOT: path.join(process.cwd(), ".canary-state"),
-    }, path);
+      OMB_ISOLATED_CANARY_DATA_ROOT: explicitRoot,
+    }, path, {
+      tempRoot: path.join(path.parse(process.cwd()).root, "tmp"),
+      appVersion: "0.1.40-autorag-canary.1",
+    });
+    expect(resolved.root).toBe(explicitRoot);
     expect(resolved.userData).toBe(path.join(resolved.root, "electron-user-data"));
     expect(resolved.serverData).toBe(path.join(resolved.root, "server-data"));
     expect(resolved.userData).not.toBe(resolved.serverData);
