@@ -168,6 +168,24 @@ describe("remote worker readiness", () => {
     }
   });
 
+  it("requires explicit proof of a non-admin account and unlocked desktop", async () => {
+    for (const field of ["privileged", "locked"] as const) {
+      const missing = await workerStatus(winWorker, {
+        runner: async () => {
+          const report = JSON.parse(healthy("windows"));
+          delete report[field];
+          return { stdout: JSON.stringify(report), stderr: "" };
+        },
+      });
+      expect(missing.ready).toBe(false);
+      expect(missing.errorCode).toBe(field === "privileged" ? "worker_privileged_account" : "worker_locked");
+
+      const malformed = await workerStatus(winWorker, { runner: runnerFor("windows", { [field]: "unknown" }) });
+      expect(malformed.ready).toBe(false);
+      expect(malformed.errorCode).toBe(field === "privileged" ? "worker_privileged_account" : "worker_locked");
+    }
+  });
+
   it("refuses a driver whose version is not the pinned one", async () => {
     const status = await workerStatus(macWorker, { runner: runnerFor("macos", { driverVersion: "0.19.3" }) });
     expect(status.errorCode).toBe("worker_driver_wrong_version");

@@ -29,7 +29,14 @@ import {
   type RemoteWorkerSshRunner,
 } from "./remote-worker.ts";
 import { type JsonObject, type JsonValue, parseJson } from "./schema.ts";
-import { encodeFrameHeader, END_FRAME, FrameReader, type FrameHeader } from "./worker-task-frames.ts";
+import {
+  encodeFrameHeader,
+  END_FRAME,
+  FRAME_HEADER_PREFIX_BYTES,
+  FrameReader,
+  MAX_FRAME_HEADER_BYTES,
+  type FrameHeader,
+} from "./worker-task-frames.ts";
 import {
   readVerifiedWorkerTaskFile,
   verifyWorkerTaskFiles,
@@ -146,6 +153,12 @@ export interface WorkerTaskStreamOptions {
   timeoutMs: number;
   /** A smaller operation-specific bound may narrow the general artefact cap. */
   maxStdoutBytes?: number;
+  /** Consume stdout as it arrives. When captureStdout is false, this is the
+   * only retained view of the stream and may throw to abort the child. */
+  onStdoutChunk?: (chunk: Buffer) => void;
+  /** Defaults to true for one-line replies and CUA calls. Result fetches turn
+   * it off so the framed stream is never retained a second time. */
+  captureStdout?: boolean;
   /** Writes the request body to the child's stdin and resolves when done. */
   write?: (stdin: Writable) => Promise<void>;
 }
@@ -194,13 +207,23 @@ export function defaultWorkerTaskStreamRunner(
         finish(() => reject(new Error("the worker sent more bytes than a task stream may carry")));
         return;
       }
-      chunks.push(chunk);
+      try {
+        options.onStdoutChunk?.(chunk);
+      } catch (error) {
+        child.kill("SIGKILL");
+        finish(() => reject(error instanceof Error ? error : new Error(String(error))));
+        return;
+      }
+      if (options.captureStdout !== false) chunks.push(chunk);
     });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => { stderr = (stderr + chunk).slice(-64 * 1024); });
     child.on("error", () => finish(() => reject(new Error("worker SSH could not start"))));
     child.on("close", (code) => finish(() => {
-      if (code === 0) resolve({ stdout: Buffer.concat(chunks), stderr });
+      if (code === 0) resolve({
+        stdout: options.captureStdout === false ? Buffer.alloc(0) : Buffer.concat(chunks),
+        stderr,
+      });
       else reject(new Error("worker SSH stream failed"));
     }));
 
@@ -510,8 +533,15 @@ export async function resetWorkerTask(
 export interface WorkerResultArtefact {
   path: string;
   sha256: string;
+  /** Exact remote size, even when content is only a bounded preview. */
+  bytes: number;
   content: Buffer;
+  truncated: boolean;
 }
+
+/** The model-facing service shows at most this much of any one result. Keep
+ * only that prefix while hashing the complete stream. */
+export const MAX_RESULT_PREVIEW_BYTES = 64 * 1024;
 
 /** Read back only the artefacts the approved manifest declares. A worker that
  * offers anything else — a path not in `resultPaths`, a digest that does not
@@ -522,39 +552,69 @@ export async function fetchWorkerResults(
   manifestSha256: string,
   runner: WorkerTaskStreamRunner = defaultWorkerTaskStreamRunner,
 ): Promise<WorkerResultArtefact[]> {
-  const result = await runner(companionArgs(worker, ["fetch", manifest.taskId, manifestSha256]), {
-    timeoutMs: FETCH_TIMEOUT_MS,
-  });
-
   const declared = new Set(manifest.resultPaths);
+  const seen = new Set<string>();
   const artefacts: WorkerResultArtefact[] = [];
   let parts: Buffer[] = [];
+  let retained = 0;
+  let received = 0;
+  let frameHash = createHash("sha256");
+  let streamed = false;
 
   const reader = new FrameReader({
     onHeader(header: FrameHeader) {
       if (header.kind === "manifest") throw new Error("a result stream cannot carry a manifest");
+      if (header.kind === "file") {
+        const path = header.path ?? "";
+        if (!declared.has(path)) throw new Error(`the worker returned an artefact the task never declared: ${path}`);
+        if (seen.has(path)) throw new Error(`the worker returned ${path} twice`);
+        seen.add(path);
+      }
       parts = [];
+      retained = 0;
+      received = 0;
+      frameHash = createHash("sha256");
     },
     onPayload(chunk: Buffer) {
-      parts.push(chunk);
+      received += chunk.length;
+      frameHash.update(chunk);
+      if (retained < MAX_RESULT_PREVIEW_BYTES) {
+        const take = Math.min(chunk.length, MAX_RESULT_PREVIEW_BYTES - retained);
+        parts.push(Buffer.from(chunk.subarray(0, take)));
+        retained += take;
+      }
     },
     onFrameEnd(header: FrameHeader) {
       if (header.kind !== "file") return;
       const path = header.path ?? "";
-      if (!declared.has(path)) throw new Error(`the worker returned an artefact the task never declared: ${path}`);
-      if (artefacts.some((artefact) => artefact.path === path)) {
-        throw new Error(`the worker returned ${path} twice`);
-      }
-      artefacts.push({ path, sha256: (header.sha256 ?? "").toLowerCase(), content: Buffer.concat(parts) });
+      const sha256 = (header.sha256 ?? "").toLowerCase();
+      const actual = frameHash.digest("hex");
+      if (actual !== sha256) throw new Error(`result artefact hash does not match: ${path}`);
+      artefacts.push({
+        path,
+        sha256,
+        bytes: received,
+        content: Buffer.concat(parts),
+        truncated: received > retained,
+      });
       parts = [];
     },
   });
-  reader.push(result.stdout);
+  const maxStdoutBytes = WORKER_TASK_MAX_TOTAL_BYTES
+    + (manifest.resultPaths.length + 1) * (FRAME_HEADER_PREFIX_BYTES + MAX_FRAME_HEADER_BYTES);
+  const result = await runner(companionArgs(worker, ["fetch", manifest.taskId, manifestSha256]), {
+    timeoutMs: FETCH_TIMEOUT_MS,
+    maxStdoutBytes,
+    captureStdout: false,
+    onStdoutChunk(chunk) {
+      streamed = true;
+      reader.push(chunk);
+    },
+  });
+  // Injectable runners predating the incremental callback may still return a
+  // bounded buffer. Accept that test/adapter contract without double-reading
+  // production runners that invoked onStdoutChunk.
+  if (!streamed && result.stdout.length > 0) reader.push(result.stdout);
   reader.end();
-
-  for (const artefact of artefacts) {
-    const actual = createHash("sha256").update(artefact.content).digest("hex");
-    if (actual !== artefact.sha256) throw new Error(`result artefact hash does not match: ${artefact.path}`);
-  }
   return artefacts;
 }

@@ -3,7 +3,7 @@
 // operations that need one are exercised up to the point where they would.
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -284,6 +284,23 @@ describe("fetch results", () => {
     sink.on("data", (chunk: Buffer) => chunks.push(chunk));
     fetchResults(TASK_ID, asDigest(taskManifestDigest(document)), sink, PLATFORM);
     sink.end();
+    expect(Buffer.concat(chunks).equals(END_FRAME)).toBe(true);
+  });
+
+  it("skips a hard-linked result artefact", async () => {
+    const document = manifestDocument();
+    await stage(stagingStream(document, [goodFile]));
+    const root = taskRoot(TASK_ID, PLATFORM);
+    const outside = join(home, "outside-result.json");
+    writeFileSync(outside, "private bytes");
+    linkSync(outside, join(root, "changes.patch"));
+
+    const chunks: Buffer[] = [];
+    const sink = new PassThrough();
+    sink.on("data", (chunk: Buffer) => chunks.push(chunk));
+    fetchResults(TASK_ID, asDigest(taskManifestDigest(document)), sink, PLATFORM);
+    sink.end();
+
     expect(Buffer.concat(chunks).equals(END_FRAME)).toBe(true);
   });
 });

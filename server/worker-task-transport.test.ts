@@ -399,7 +399,27 @@ describe("fetch results", () => {
     const artefacts = await fetchWorkerResults(worker, manifest, digest, stream.runner);
     expect(artefacts).toHaveLength(1);
     expect(artefacts[0].content.toString("utf8")).toBe('{"ok":true}');
+    expect(artefacts[0]).toMatchObject({ bytes: body.length, truncated: false });
     expect(stream.calls[0].slice(-3)).toEqual(["fetch", "task-1", digest]);
+  });
+
+  it("consumes fetch stdout incrementally without asking the runner to retain it", async () => {
+    const bytes = Buffer.concat([
+      encodeFrame({ kind: "file", bytes: body.length, path: "result.json", sha256 }, body),
+      END_FRAME,
+    ]);
+    let optionsSeen: WorkerTaskStreamOptions | undefined;
+    const runner = async (_args: string[], options: WorkerTaskStreamOptions) => {
+      optionsSeen = options;
+      for (let offset = 0; offset < bytes.length; offset += 3) {
+        options.onStdoutChunk?.(bytes.subarray(offset, offset + 3));
+      }
+      return { stdout: Buffer.alloc(0), stderr: "" };
+    };
+    const artefacts = await fetchWorkerResults(worker, manifest, digest, runner);
+    expect(artefacts[0].content.equals(body)).toBe(true);
+    expect(optionsSeen?.captureStdout).toBe(false);
+    expect(optionsSeen?.maxStdoutBytes).toBeGreaterThan(200 * 1024 * 1024);
   });
 
   it("refuses an artefact the manifest never declared", async () => {

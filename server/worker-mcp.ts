@@ -25,7 +25,13 @@ void (async () => {
     try {
       const reply = await handleWorkerMcpFrame(frame, task, control);
       if (reply) process.stdout.write(`${JSON.stringify(reply)}\n`);
-    } catch {
+    } catch (error) {
+      // This process stays alive after a bad frame, so leave an operator-safe
+      // breadcrumb now. Only the error class is included: messages may contain
+      // task text, paths, or driver output and must not cross this boundary.
+      const rawKind = error instanceof Error ? error.name : "UnknownError";
+      const kind = rawKind.replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "Error";
+      process.stderr.write(`[worker-mcp] request handler failed (${kind})\n`);
       if (frame.id !== undefined && frame.id !== null) {
         process.stdout.write(`${JSON.stringify({
           jsonrpc: "2.0",

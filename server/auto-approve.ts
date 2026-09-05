@@ -115,6 +115,7 @@ export type AutoVerdictSource =
   | "explicit-approval-block"
   | "unattended-block"
   | "local-computer-block"
+  | "remote-worker-block"
   | "destructive-guard"
   | "sensitive-guard"
   | "no-grant";
@@ -227,7 +228,13 @@ export function autoVerdict(
     // Real-desktop control is not covered by a remembered always-allow grant.
     // After the Auto-on-this-computer warning, unclassified GUI actions
     // (click/type) may auto-approve; destructive/sensitive still card.
-    if (grant) return { approve: null, source: "local-computer-block", rule: grant.rule };
+    if (grant) {
+      return {
+        approve: null,
+        source: context.scope === "remote-worker-computer" ? "remote-worker-block" : "local-computer-block",
+        rule: grant.rule,
+      };
+    }
     if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
     if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
     return { approve: null, source: "no-grant" };

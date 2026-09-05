@@ -20,12 +20,16 @@
 import { createHash } from "node:crypto";
 import {
   closeSync,
+  constants,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
+  readSync,
+  realpathSync,
   rmSync,
   statSync,
   writeSync,
@@ -36,7 +40,6 @@ import { Buffer } from "node:buffer";
 import { capabilityDigest, parkedCapability, writeActiveCapability } from "./capability.ts";
 import { assertDriverVersion, restartWorkerDaemon, runFixed } from "./driver.ts";
 import {
-  encodeFrame,
   encodeFrameHeader,
   END_FRAME,
   FrameReader,
@@ -434,15 +437,58 @@ export function fetchResults(
   platform: WorkerPlatform = workerPlatform(),
 ): void {
   const { manifest, root } = validateTask(taskId, manifestSha256, platform);
+  const rootReal = realpathSync(root);
+  const escapes = (within: string) =>
+    !within || within === ".." || within.startsWith(`..${sep}`) || isAbsolute(within);
   for (const path of manifest.resultPaths) {
     const target = resolveInRoot(root, path);
     if (!existsSync(target)) continue;
-    const stat = lstatSync(target);
-    if (stat.isSymbolicLink() || !stat.isFile()) continue;
-    if (stat.size > MAX_FRAME_PAYLOAD_BYTES) throw new Error(`result artefact is too large: ${path}`);
-    const payload = readFileSync(target);
-    const sha256 = createHash("sha256").update(payload).digest("hex");
-    output.write(encodeFrame({ kind: "file", bytes: payload.length, path, sha256 }, payload));
+    let descriptor: number;
+    try {
+      const noFollow = process.platform === "win32" ? 0 : constants.O_NOFOLLOW;
+      descriptor = openSync(target, constants.O_RDONLY | noFollow);
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+      if (code === "ENOENT" || code === "ELOOP") continue;
+      throw error;
+    }
+    try {
+      // On POSIX O_NOFOLLOW rejects the final symlink. Windows has no exposed
+      // equivalent flag, so the descriptor/path identity and realpath checks
+      // below are the reparse-point guard there (and a second guard on POSIX).
+      const opened = fstatSync(descriptor);
+      const linked = lstatSync(target);
+      if (
+        !opened.isFile()
+        || opened.nlink !== 1
+        || linked.isSymbolicLink()
+        || !linked.isFile()
+        || opened.dev !== linked.dev
+        || opened.ino !== linked.ino
+        || escapes(relative(rootReal, realpathSync(target)))
+      ) continue;
+      if (opened.size > MAX_FRAME_PAYLOAD_BYTES) throw new Error(`result artefact is too large: ${path}`);
+      // Read no more than the size proved on this descriptor, then require EOF.
+      // A task growing the file concurrently cannot turn the bounded check into
+      // an unbounded allocation or a mixed-size frame.
+      const payload = Buffer.alloc(opened.size);
+      let offset = 0;
+      while (offset < payload.length) {
+        const count = readSync(descriptor, payload, offset, payload.length - offset, offset);
+        if (count === 0) break;
+        offset += count;
+      }
+      const extra = Buffer.alloc(1);
+      const extraBytes = readSync(descriptor, extra, 0, 1, offset);
+      if (offset !== payload.length || extraBytes !== 0) {
+        throw new Error(`result artefact changed while being read: ${path}`);
+      }
+      const sha256 = createHash("sha256").update(payload).digest("hex");
+      output.write(encodeFrameHeader({ kind: "file", bytes: payload.length, path, sha256 }));
+      output.write(payload);
+    } finally {
+      closeSync(descriptor);
+    }
   }
   output.write(END_FRAME);
 }

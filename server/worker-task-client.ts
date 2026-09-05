@@ -20,19 +20,25 @@ export type WorkerTaskContent =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string };
 
+/** Shared wire limits. The service imports these so it never emits a reply
+ * that this client will reject after the worker action already happened. */
+export const WORKER_TASK_MAX_REPLY_TEXT_CHARS = 1024 * 1024;
+export const WORKER_TASK_MAX_REPLY_CONTENT_BLOCKS = 16;
+export const WORKER_TASK_MAX_REPLY_IMAGE_CHARS = 22 * 1024 * 1024;
+
 const contentSchema = z.union([
-  z.object({ type: z.literal("text"), text: z.string().max(1024 * 1024) }),
+  z.object({ type: z.literal("text"), text: z.string().max(WORKER_TASK_MAX_REPLY_TEXT_CHARS) }),
   z.object({
     type: z.literal("image"),
-    data: z.string().max(22 * 1024 * 1024),
+    data: z.string().max(WORKER_TASK_MAX_REPLY_IMAGE_CHARS),
     mimeType: z.string().regex(/^image\/[a-z0-9.+-]+$/i),
   }),
 ]);
 
 /** The harness answers with one of these two fields and nothing else. */
 const replySchema = z.object({
-  text: z.string().max(1024 * 1024).optional(),
-  content: z.array(contentSchema).max(16).optional(),
+  text: z.string().max(WORKER_TASK_MAX_REPLY_TEXT_CHARS).optional(),
+  content: z.array(contentSchema).max(WORKER_TASK_MAX_REPLY_CONTENT_BLOCKS).optional(),
   isError: z.boolean().optional(),
   error: z.string().max(4096).optional(),
 }).loose();

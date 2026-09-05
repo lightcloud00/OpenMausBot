@@ -23,6 +23,11 @@ import type { BotRecord } from "./store.ts";
 import type { RemoteWorkerSshRunner } from "./remote-worker.ts";
 import { defaultRemoteWorkerRunner } from "./remote-worker.ts";
 import {
+  WORKER_TASK_MAX_REPLY_CONTENT_BLOCKS,
+  WORKER_TASK_MAX_REPLY_IMAGE_CHARS,
+  WORKER_TASK_MAX_REPLY_TEXT_CHARS,
+} from "./worker-task-client.ts";
+import {
   cancelWorkerTaskApproval,
   requestWorkerTaskApproval,
   type WorkerApprovalBus,
@@ -44,6 +49,7 @@ import {
   stageWorkerTask,
   validateWorkerTask,
   type WorkerTaskStreamRunner,
+  type WorkerResultArtefact,
 } from "./worker-task-transport.ts";
 import {
   workerCuaCapabilityDigest,
@@ -53,8 +59,6 @@ import {
 
 /** Per artefact, so a large diff cannot flood a turn's context. */
 const MAX_ARTEFACT_CHARS = 64 * 1024;
-const MAX_TOOL_TEXT_CHARS = 1024 * 1024;
-const MAX_TOOL_IMAGE_CHARS = 22 * 1024 * 1024;
 
 const requestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("propose"), manifest: z.json() }),
@@ -131,14 +135,15 @@ export function workerComputerContent(stdout: Buffer): { content: WorkerToolCont
     if (Array.isArray(record.content)) {
       const content: WorkerToolContent[] = [];
       for (const block of record.content) {
+        if (content.length >= WORKER_TASK_MAX_REPLY_CONTENT_BLOCKS) break;
         if (!block || typeof block !== "object" || Array.isArray(block)) continue;
         const value = block as Record<string, unknown>;
         if (value.type === "text" && typeof value.text === "string") {
-          content.push({ type: "text", text: value.text.slice(0, MAX_TOOL_TEXT_CHARS) });
+          content.push({ type: "text", text: value.text.slice(0, WORKER_TASK_MAX_REPLY_TEXT_CHARS) });
         } else if (
           value.type === "image" &&
           typeof value.data === "string" &&
-          value.data.length <= MAX_TOOL_IMAGE_CHARS &&
+          value.data.length <= WORKER_TASK_MAX_REPLY_IMAGE_CHARS &&
           /^[A-Za-z0-9+/]*={0,2}$/.test(value.data)
         ) {
           const mime = typeof value.mimeType === "string" ? value.mimeType : value.mime_type;
@@ -152,20 +157,44 @@ export function workerComputerContent(stdout: Buffer): { content: WorkerToolCont
     const screenshot = record.screenshot_png_b64;
     if (
       typeof screenshot === "string" &&
-      screenshot.length <= MAX_TOOL_IMAGE_CHARS &&
+      screenshot.length <= WORKER_TASK_MAX_REPLY_IMAGE_CHARS &&
       /^[A-Za-z0-9+/]*={0,2}$/.test(screenshot)
     ) {
       const withoutImage = { ...record, screenshot_png_b64: `[image data: ${screenshot.length} base64 chars]` };
       return {
         content: [
-          { type: "text", text: JSON.stringify(withoutImage).slice(0, MAX_TOOL_TEXT_CHARS) },
+          { type: "text", text: JSON.stringify(withoutImage).slice(0, WORKER_TASK_MAX_REPLY_TEXT_CHARS) },
           { type: "image", data: screenshot, mimeType: "image/png" },
         ],
         isError: false,
       };
     }
   }
-  return { content: [{ type: "text", text: raw.slice(0, MAX_TOOL_TEXT_CHARS) }], isError: false };
+  return {
+    content: [{ type: "text", text: raw.slice(0, WORKER_TASK_MAX_REPLY_TEXT_CHARS) }],
+    isError: false,
+  };
+}
+
+/** Render bounded result previews without ever creating a multi-megabyte
+ * intermediate string that the loopback client will reject. */
+export function workerResultsText(artefacts: WorkerResultArtefact[]): string {
+  let output = "";
+  for (const artefact of artefacts) {
+    const resultText = artefact.content.toString("utf8");
+    const shown = artefact.truncated || resultText.length > MAX_ARTEFACT_CHARS
+      ? `${resultText.slice(0, MAX_ARTEFACT_CHARS)}\n… truncated at ${MAX_ARTEFACT_CHARS} characters`
+      : resultText;
+    const separator = output.length === 0 ? "" : "\n\n";
+    const section = `── ${artefact.path} (${artefact.bytes} bytes)\n${shown}`;
+    const addition = `${separator}${section}`;
+    if (output.length + addition.length > WORKER_TASK_MAX_REPLY_TEXT_CHARS) {
+      const suffix = "\n… truncated: request fewer result paths";
+      return `${output}${addition}`.slice(0, WORKER_TASK_MAX_REPLY_TEXT_CHARS - suffix.length) + suffix;
+    }
+    output += addition;
+  }
+  return output;
 }
 
 export class WorkerTaskService {
@@ -386,14 +415,7 @@ export class WorkerTaskService {
     if (artefacts.length === 0) {
       return { status: 200, text: "The task has not produced any of its declared result artefacts yet." };
     }
-    const sections = artefacts.map((artefact) => {
-      const text = artefact.content.toString("utf8");
-      const shown = text.length > MAX_ARTEFACT_CHARS
-        ? `${text.slice(0, MAX_ARTEFACT_CHARS)}\n… truncated at ${MAX_ARTEFACT_CHARS} characters`
-        : text;
-      return `── ${artefact.path} (${artefact.content.length} bytes)\n${shown}`;
-    });
-    return { status: 200, text: sections.join("\n\n") };
+    return { status: 200, text: workerResultsText(artefacts) };
   }
 
   private allowedComputerTool(manifest: WorkerTaskManifest, tool: string): void {

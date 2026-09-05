@@ -29,7 +29,8 @@ import {
 } from "./worker-task-approval.ts";
 import { encodeFrame, END_FRAME } from "./worker-task-frames.ts";
 import { workerTaskManifestDigest, WorkerTaskRegistry } from "./worker-task-manifest.ts";
-import { WorkerTaskService } from "./worker-task-service.ts";
+import { workerComputerContent, workerResultsText, WorkerTaskService } from "./worker-task-service.ts";
+import { WORKER_TASK_MAX_REPLY_CONTENT_BLOCKS, WORKER_TASK_MAX_REPLY_TEXT_CHARS } from "./worker-task-client.ts";
 import type { WorkerTaskStreamOptions } from "./worker-task-transport.ts";
 
 const selection = (): ModelSelection => ({ instanceId: "claude", model: "fake-model" });
@@ -346,6 +347,42 @@ describe("run and results", () => {
     const outcome = await service.handle(bot, { op: "run", commandId: "build" } as JsonValue);
     expect(outcome.status).toBe(409);
     expect(outcome.error).toMatch(/different worker/);
+  });
+});
+
+describe("worker reply bounds", () => {
+  it("caps accepted computer content at the client wire limit", () => {
+    const stdout = Buffer.from(JSON.stringify({
+      content: Array.from({ length: WORKER_TASK_MAX_REPLY_CONTENT_BLOCKS + 4 }, (_, index) => ({
+        type: "text",
+        text: `block-${index}`,
+      })),
+    }));
+    const parsed = workerComputerContent(stdout);
+    expect(parsed.content).toHaveLength(WORKER_TASK_MAX_REPLY_CONTENT_BLOCKS);
+  });
+
+  it("caps an individual computer text block at the client wire limit", () => {
+    const stdout = Buffer.from(JSON.stringify({
+      content: [{ type: "text", text: "x".repeat(WORKER_TASK_MAX_REPLY_TEXT_CHARS + 1) }],
+    }));
+    const parsed = workerComputerContent(stdout);
+    expect(parsed.content[0]).toMatchObject({ type: "text" });
+    expect(parsed.content[0]?.type === "text" ? parsed.content[0].text.length : 0)
+      .toBe(WORKER_TASK_MAX_REPLY_TEXT_CHARS);
+  });
+
+  it("caps the combined result text at the client wire limit", () => {
+    const content = Buffer.from("x".repeat(64 * 1024));
+    const text = workerResultsText(Array.from({ length: 32 }, (_, index) => ({
+      path: `result-${index}.txt`,
+      sha256: "a".repeat(64),
+      bytes: content.length,
+      content,
+      truncated: false,
+    })));
+    expect(text.length).toBe(WORKER_TASK_MAX_REPLY_TEXT_CHARS);
+    expect(text).toContain("request fewer result paths");
   });
 });
 

@@ -380,11 +380,14 @@ export function applyHealthReport(status: RemoteWorkerStatus, raw: JsonValue): R
   const report = parseHealthReport(raw);
   status.driverVersion = report.driverVersion ?? null;
   status.companionVersion = report.companionVersion ?? null;
-  status.privileged = report.privileged === true;
+  // Both facts are safety assertions, not optional diagnostics. A missing or
+  // malformed field must therefore take the rejecting value until the probe
+  // explicitly proves a non-admin account and an unlocked desktop.
+  status.privileged = report.privileged !== false;
   status.interactiveSessionId = report.interactiveSessionId ?? null;
   // A session flag without an id is not a proven session.
   status.interactiveSession = report.interactiveSession === true && status.interactiveSessionId !== null;
-  status.locked = report.locked === true;
+  status.locked = report.locked !== false;
   status.channelPath = report.channelPath ?? null;
   status.channelAvailable = report.channelAvailable === true;
   status.channelAccess = report.channelAccess ?? "unknown";
