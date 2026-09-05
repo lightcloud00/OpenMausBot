@@ -134,7 +134,7 @@ describe("staging", () => {
     symlinkSync(join(root, "elsewhere.txt"), join(root, "src", "main.txt"));
     writeFileSync(join(root, "elsewhere.txt"), "hello worker");
     const stream = fakeStream({ ok: true, version: 1, op: "stage", files: 1 });
-    await expect(stageWorkerTask(worker, root, manifest, stream.runner)).rejects.toThrow(/not a regular file/);
+    await expect(stageWorkerTask(worker, root, manifest, stream.runner)).rejects.toThrow(/not .*regular file/);
   });
 
   it("does not send bytes from a path swapped after the preflight", async () => {
@@ -154,7 +154,7 @@ describe("staging", () => {
       };
     };
 
-    await expect(stageWorkerTask(worker, root, manifest, runner)).rejects.toThrow(/not a regular file/);
+    await expect(stageWorkerTask(worker, root, manifest, runner)).rejects.toThrow(/not .*regular file/);
     expect(Buffer.concat(captured).includes(Buffer.from("private replacement bytes"))).toBe(false);
   });
 

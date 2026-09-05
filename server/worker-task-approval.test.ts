@@ -66,8 +66,8 @@ describe("the approval card", () => {
     expect(text).toContain(worker.displayName);
     expect(text).toContain(HOST_TASK_PLATFORM === "windows" ? "Windows" : "macOS");
     expect(text).toContain("desktop");
-    expect(text).toContain(exact.target.ideExecutable);
-    expect(text).toContain(workerFileManager(HOST_TASK_PLATFORM));
+    expect(text).toContain(JSON.stringify(exact.target.ideExecutable));
+    expect(text).toContain(JSON.stringify(workerFileManager(HOST_TASK_PLATFORM)));
     expect(text).toContain('"src/main.ts" · 12 bytes · SHA-256 ' + "d".repeat(64));
     expect(text).toContain(JSON.stringify({
       id: "build",
@@ -91,8 +91,8 @@ describe("the approval card", () => {
     const browser = parsedManifest(HOST_TASK_PLATFORM, { surface: "browser", origins: ["https://example.com"] });
     const text = describeWorkerTask(worker, browser);
     expect(text).toContain("https://example.com");
-    expect(text).toContain(browser.target.browserExecutable);
-    expect(text).toContain(browser.target.browserProfile);
+    expect(text).toContain(JSON.stringify(browser.target.browserExecutable));
+    expect(text).toContain(JSON.stringify(browser.target.browserProfile));
     expect(text).toContain("verify the selected window");
   });
 
