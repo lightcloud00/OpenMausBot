@@ -18,6 +18,7 @@
 // drivers/ nested; import.meta.url still resolves to the same location, so
 // that lookup is unaffected.
 import { build } from "esbuild";
+import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -56,3 +57,8 @@ await build({
   allowOverwrite: true,
   logLevel: "info",
 });
+
+// These .js entries are ESM even outside the app's own package scope.
+// Carry the boundary into extraResources so an ancestor's CommonJS package
+// cannot change how the server or any of its spawned proxies is loaded.
+writeFileSync(join(root, "dist-server", "package.json"), '{"type":"module"}\n');

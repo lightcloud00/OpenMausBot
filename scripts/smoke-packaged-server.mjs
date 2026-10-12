@@ -22,6 +22,11 @@ const staging = mkdtempSync(join(tmpdir(), "omb-smoke-"));
 const home = mkdtempSync(join(tmpdir(), "omb-smoke-home-"));
 const port = 21000 + Math.floor(Math.random() * 9000);
 
+// A user's install/temp ancestor can declare CommonJS (as on Windows).
+// The packaged ESM server must establish its own scope instead of depending
+// on Node's syntax detection or the surrounding directory's package.json.
+writeFileSync(join(staging, "package.json"), JSON.stringify({ type: "commonjs" }));
+
 // OMB_SMOKE_DIST lets the release workflow aim this at a packaged app's
 // Resources/server tree instead of the repo build.
 cpSync(process.env.OMB_SMOKE_DIST ?? join(root, "dist-server"), join(staging, "server"), { recursive: true });

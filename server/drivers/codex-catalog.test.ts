@@ -57,6 +57,20 @@ describe("decodeCodexSelection", () => {
 });
 
 describe("readCodexModelCatalog", () => {
+  it.each(["gpt-6.1-sol", "gpt-6-luna"])(
+    "keeps native subscription model %s on OpenAI when the live catalog is unavailable",
+    async (model) => {
+      const home = scratchHome({ "config.toml": `model_provider = "openai"\nmodel = "${model}"\n` });
+      const catalog = await readCodexModelCatalog({ HOME: home });
+      const selected = catalog.options.filter((option) => option.id === model);
+      expect(selected).toHaveLength(1);
+      expect(selected[0].custom).toBeUndefined();
+      expect(catalog.default).toBe(model);
+      expect(decodeCodexSelection(catalog.default)).toEqual({ model, modelProvider: OFFICIAL_CODEX_PROVIDER });
+      expect(catalog.options.some((option) => option.id === "gpt-5.6-sol")).toBe(true);
+    },
+  );
+
   it("returns the static cloud fallback when there is no config or CLI probe", async () => {
     expect(await readCodexModelCatalog({ HOME: join(tmpdir(), "omb-codex-missing-home") })).toEqual(
       STATIC_CODEX_MODELS,

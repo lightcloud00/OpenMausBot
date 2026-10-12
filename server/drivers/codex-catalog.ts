@@ -14,6 +14,10 @@ import { mergeLocalInject } from "./local-inject.ts";
 export const STATIC_CODEX_MODELS: ModelCatalog = {
   default: "gpt-5.6-sol",
   options: [
+    { id: "gpt-6.1-sol", label: "GPT-6.1 Sol" },
+    { id: "gpt-6-astra", label: "GPT-6 Astra" },
+    { id: "gpt-6-sol", label: "GPT-6 Sol" },
+    { id: "gpt-6-luna", label: "GPT-6 Luna" },
     { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
     { id: "gpt-5.6-terra", label: "GPT-5.6 Terra" },
     { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
@@ -353,7 +357,8 @@ async function probeProviderModels(
   }
 }
 
-/** Local slugs Codex already knows, plus the three official cloud rows. */
+/** Local slugs Codex already knows, plus the installed CLI's official rows
+ * (or the static fallback when that read is unavailable). */
 export async function readCodexModelCatalog(
   env: Record<string, string | undefined> = process.env,
   fetchImpl: typeof fetch = fetch,

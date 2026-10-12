@@ -12,9 +12,29 @@ afterEach(() => {
 });
 
 describe("readClaudeModelCatalog", () => {
-  it("returns the official four when settings are missing", () => {
+  it("returns the official subscription catalog when settings are missing", () => {
     expect(readClaudeModelCatalog({ HOME: join(tmpdir(), "omb-claude-missing-home") })).toEqual(STATIC_CLAUDE_MODELS);
   });
+
+  it.each(["claude-sonnet-5-5", "claude-haiku-5-5"])(
+    "keeps native subscription model %s out of Custom without changing the default",
+    (model) => {
+      const home = mkdtempSync(join(tmpdir(), "omb-claude-native-model-"));
+      scratchDirs.push(home);
+      const dir = join(home, ".claude");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "settings.json"), JSON.stringify({
+        availableModels: [model],
+        env: { ANTHROPIC_MODEL: model },
+      }));
+      const catalog = readClaudeModelCatalog({ HOME: home });
+      const selected = catalog.options.filter((option) => option.id === model);
+      expect(selected).toHaveLength(1);
+      expect(selected[0].custom).toBeUndefined();
+      expect(catalog.default).toBe("claude-sonnet-5");
+      expect(catalog.options.some((option) => option.id === "claude-haiku-4-5")).toBe(true);
+    },
+  );
 
   it("tags extra settings models as custom and leaves official rows untagged", () => {
     const home = mkdtempSync(join(tmpdir(), "omb-claude-catalog-"));
