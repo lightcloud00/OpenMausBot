@@ -95,10 +95,13 @@ export interface ClaudeConfig {
   permissionMode: "acceptEdits" | "auto" | "bypassPermissions";
 }
 
-// model catalog ported from upstream packages/contracts/src/model.ts
+// Official subscription rows. Keep the existing default and older selections
+// while adding ids verified through the installed CLI's native worker records.
 export const STATIC_CLAUDE_MODELS: ModelCatalog = {
   default: "claude-sonnet-5",
   options: [
+    { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
+    { id: "claude-haiku-5-5", label: "Claude Haiku 5.5" },
     { id: "claude-fable-5", label: "Claude Fable 5" },
     { id: "claude-opus-5", label: "Claude Opus 5" },
     { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
