@@ -307,7 +307,7 @@ describe("drainDelegations", () => {
     expect(runTargetCalls).toEqual([]);
   });
 
-  it("skips runTarget and emits a 'is busy' chip when the target is currently busy", async () => {
+  it("skips runTarget and parks the handoff with a 'waiting' chip when the target is currently busy", async () => {
     store.patchBot(target.id, { busy: true });
     queueDelegation(commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1);
     drainDelegations(commsBus, approvalBus, from.threadId, (toBotId, message, commsDepth) => {
@@ -318,9 +318,10 @@ describe("drainDelegations", () => {
         .messagesFor(from.threadId)
         .find((m) => m.kind === "activity" && (m.tool?.name ?? "").includes("is busy")),
     );
-    expect(chip.tool?.name).toBe("Delegation to @Helper canceled — @Helper is busy");
-    expect(chip.tool?.ok).toBe(false);
+    expect(chip.tool?.name).toBe("Delegation to @Helper waiting — @Helper is busy; it runs when @Helper is free");
+    expect(chip.tool?.ok).toBeUndefined();
     expect(runTargetCalls).toEqual([]);
+    expect(_pendingCount(from.threadId)).toBe(1);
   });
 
   it("asks for approval when approvePeerComms is on, then runs only on allow", async () => {
@@ -402,9 +403,17 @@ describe("drainDelegations", () => {
   });
 });
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { _loadPending, _resetPending, discardDelegations, pendingThreads } from "./delegations.ts";
+import {
+  _loadPending,
+  _resetPending,
+  discardDelegations,
+  drainParkedDelegations,
+  MAX_BUSY_CHECKS,
+  MAX_PARK_MS,
+  pendingThreads,
+} from "./delegations.ts";
 
 describe("delegations survive a restart", () => {
   let store: Store;
@@ -512,5 +521,191 @@ describe("delegations survive a restart", () => {
     writeFileSync(file(), "{not json");
     _loadPending();
     expect(pendingThreads()).toEqual([]);
+  });
+});
+
+/** The shape savePending writes for one queued handoff. */
+interface StoredDelegation {
+  message: string;
+  parkedAt?: number;
+  busyChecks?: number;
+}
+
+describe("busy targets park handoffs instead of dropping them (#1330)", () => {
+  let store: Store;
+  let from: BotRecord;
+  let target: BotRecord;
+  let buses: BusPair;
+  let ran: string[];
+  const file = () => join(DATA_DIR, "delegations.json");
+  const readQueue = (): Record<string, StoredDelegation[]> =>
+    // SAFETY: delegations.json is written only by savePending, in this test
+    // process, as a map from source thread id to that thread's queued items.
+    JSON.parse(readFileSync(file(), "utf8")) as Record<string, StoredDelegation[]>;
+  const onDisk = (): StoredDelegation[] => readQueue()[from.threadId] ?? [];
+  const chips = (needle: string) =>
+    store.messagesFor(from.threadId).filter((m) => m.kind === "activity" && (m.tool?.name ?? "").includes(needle));
+  const runTarget = async (_to: string, message: string) => {
+    ran.push(message);
+  };
+  // drainDelegations settles on microtasks; one macrotask lets its finally
+  // (which releases the per-thread drain lock) run before the next drain.
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const queue = (message: string) =>
+    queueDelegation(buses.commsBus, from, { toBotId: target.id, message, depth: 0 }, 1);
+  const park = async (message: string) => {
+    store.patchBot(target.id, { busy: true });
+    queue(message);
+    drainDelegations(buses.commsBus, buses.approvalBus, from.threadId, runTarget);
+    await waitFor(() => onDisk().some((item) => item.message === message && item.parkedAt !== undefined));
+    await settle();
+  };
+
+  beforeEach(() => {
+    rmSync(DATA_DIR, { recursive: true, force: true });
+    _resetPending();
+    store = new Store(selection);
+    from = store.createBot();
+    target = store.createBot();
+    store.patchBot(target.id, { name: "Helper" });
+    buses = setupBuses(store);
+    ran = [];
+  });
+  afterEach(() => _resetPending());
+
+  it("records exactly one queued item after repeated identical requests", () => {
+    const item = { toBotId: target.id, message: "summarize the logs", reason: "follow-up", depth: 0 };
+    expect(queueDelegation(buses.commsBus, from, item, 1)).toBe("ok");
+    expect(queueDelegation(buses.commsBus, from, { ...item }, 1)).toBe("duplicate");
+    expect(queueDelegation(buses.commsBus, from, { ...item }, 1)).toBe("duplicate");
+    expect(_pendingCount(from.threadId)).toBe(1);
+    expect(onDisk()).toHaveLength(1);
+    expect(chips("Delegated to @")).toHaveLength(1);
+    // A different message, or a different reason, is different work.
+    expect(queueDelegation(buses.commsBus, from, { ...item, message: "and the metrics" }, 1)).toBe("ok");
+    expect(queueDelegation(buses.commsBus, from, { ...item, reason: "audit" }, 1)).toBe("ok");
+    expect(_pendingCount(from.threadId)).toBe(3);
+  });
+
+  it("parks while the target is busy and drains once, and only once, when it goes idle", async () => {
+    await park("do this");
+    expect(ran).toEqual([]);
+    expect(chips("waiting")).toHaveLength(1);
+    expect(onDisk()[0]).toMatchObject({ busyChecks: 1 });
+
+    // Another bot settles while the target is still busy: nothing runs, and
+    // the item is not charged a busy check for a drain it was never part of.
+    drainParkedDelegations(buses.commsBus, buses.approvalBus, runTarget);
+    await settle();
+    expect(ran).toEqual([]);
+    expect(onDisk()[0]).toMatchObject({ busyChecks: 1 });
+
+    // The target settles. Two turn.completed events in the same tick must
+    // still start it once.
+    store.patchBot(target.id, { busy: false });
+    drainParkedDelegations(buses.commsBus, buses.approvalBus, runTarget);
+    drainParkedDelegations(buses.commsBus, buses.approvalBus, runTarget);
+    await waitFor(() => ran.length === 1 && _pendingCount(from.threadId) === 0);
+    drainParkedDelegations(buses.commsBus, buses.approvalBus, runTarget);
+    await settle();
+    expect(ran).toHaveLength(1);
+    expect(ran[0]).toContain("do this");
+    expect(chips("waiting")).toHaveLength(1);
+    expect(onDisk()).toEqual([]);
+  });
+
+  it("does not start a handoff whose own source turn has not settled yet", async () => {
+    queue("not yet");
+    drainParkedDelegations(buses.commsBus, buses.approvalBus, runTarget);
+    await settle();
+    expect(ran).toEqual([]);
+    expect(_pendingCount(from.threadId)).toBe(1);
+  });
+
+  it("expires with a machine-readable reason after too many busy drains", async () => {
+    await park("never free");
+    for (let check = 2; check <= MAX_BUSY_CHECKS; check++) {
+      drainDelegations(buses.commsBus, buses.approvalBus, from.threadId, runTarget);
+      await waitFor(() => onDisk()[0]?.busyChecks === check);
+      await settle();
+    }
+    expect(_pendingCount(from.threadId)).toBe(1);
+    drainDelegations(buses.commsBus, buses.approvalBus, from.threadId, runTarget);
+    await waitFor(() => _pendingCount(from.threadId) === 0);
+    const expired = chips("target_busy_expired");
+    expect(expired).toHaveLength(1);
+    expect(expired[0]!.tool?.name).toBe("Delegation to @Helper expired — @Helper stayed busy (target_busy_expired)");
+    expect(expired[0]!.tool?.ok).toBe(false);
+    expect(ran).toEqual([]);
+    expect(chips("waiting")).toHaveLength(1);
+  });
+
+  it("does not run a handoff late once it has waited out its window, even after a restart", async () => {
+    await park("stale by now");
+    const raw = readQueue();
+    raw[from.threadId]![0]!.parkedAt = Date.now() - MAX_PARK_MS - 1;
+    writeFileSync(file(), JSON.stringify(raw));
+    _resetPending();
+    _loadPending();
+    store.patchBot(target.id, { busy: false });
+    drainParkedDelegations(buses.commsBus, buses.approvalBus, runTarget);
+    await waitFor(() => _pendingCount(from.threadId) === 0);
+    expect(chips("target_busy_expired")).toHaveLength(1);
+    expect(ran).toEqual([]);
+  });
+
+  it("a restart keeps a parked handoff parked, and it still runs exactly once", async () => {
+    await park("survive a restart");
+    _resetPending();
+    _loadPending();
+    expect(_pendingCount(from.threadId)).toBe(1);
+    store.patchBot(target.id, { busy: false });
+    // The boot drain and a turn.completed can race; the work runs once.
+    drainParkedDelegations(buses.commsBus, buses.approvalBus, runTarget);
+    drainDelegations(buses.commsBus, buses.approvalBus, from.threadId, runTarget);
+    await waitFor(() => ran.length === 1 && _pendingCount(from.threadId) === 0);
+    await settle();
+    expect(ran).toHaveLength(1);
+    expect(ran[0]).toContain("survive a restart");
+  });
+
+  it("retries a parked handoff whose target went idle while its thread was still draining", async () => {
+    const second = store.createBot();
+    store.patchBot(second.id, { name: "Second" });
+    store.patchBot(target.id, { busy: true });
+    queue("to the busy one");
+    queueDelegation(buses.commsBus, from, { toBotId: second.id, message: "to the free one", depth: 0 }, 1);
+    let release!: () => void;
+    const dispatched = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slowRun = async (_to: string, message: string) => {
+      ran.push(message);
+      if (message.includes("free one")) await dispatched;
+    };
+    drainDelegations(buses.commsBus, buses.approvalBus, from.threadId, slowRun);
+    await waitFor(() => ran.length === 1);
+    expect(onDisk().find((item) => item.message === "to the busy one")?.parkedAt).toBeDefined();
+
+    // The busy target settles while the thread is still draining: that
+    // turn.completed finds the drain lock taken.
+    store.patchBot(target.id, { busy: false });
+    drainParkedDelegations(buses.commsBus, buses.approvalBus, slowRun);
+    await settle();
+    expect(ran).toHaveLength(1);
+
+    // When the drain lets go, the parked handoff runs without another settle.
+    release();
+    await waitFor(() => ran.length === 2 && _pendingCount(from.threadId) === 0);
+    expect(ran[1]).toContain("to the busy one");
+  });
+
+  it("a stopped later turn drops only its own handoffs, not the parked ones", async () => {
+    await park("earlier turn");
+    queue("this turn");
+    discardDelegations(buses.commsBus, from.threadId);
+    expect(onDisk().map((item) => item.message)).toEqual(["earlier turn"]);
+    expect(_pendingCount(from.threadId)).toBe(1);
+    expect(chips("dropped")[0]?.tool?.name).toBe("1 queued delegation dropped — the turn did not finish");
   });
 });

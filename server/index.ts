@@ -66,7 +66,7 @@ import { EFFORT_LEVELS, isEffortLevel, type ModelSelection, type RequestOutcome,
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
 import { searchMessages } from "./message-db.ts";
-import { _loadPending, discardDelegations, drainDelegations, pendingThreads, queueDelegation, type QueueResult } from "./delegations.ts";
+import { _loadPending, discardDelegations, drainDelegations, drainParkedDelegations, MAX_PARK_MS, pendingThreads, queueDelegation, type QueueResult } from "./delegations.ts";
 import { drainSteeredMessages, queueSteeredMessage } from "./steer-queue.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
@@ -1168,6 +1168,11 @@ const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text,
 
 bus.subscribe((event: RuntimeEvent) => {
   if (event.type !== "turn.completed") return;
+  // Any settle may have freed the target of a parked handoff (one that found
+  // its target busy). Like the steer-queue drain below, this matches on "the
+  // target is idle now", not on the settling thread, and it runs whether or
+  // not this turn succeeded: a target that was stopped is free all the same.
+  drainParkedDelegations(commsBus, approvalBus, runDelegatedTurn);
   // A turn that failed or was interrupted drops its queue rather than
   // firing it later: the user who hit Stop does not expect the delegations
   // that turn queued to run anyway, minutes later, on an unrelated turn.
@@ -2595,10 +2600,18 @@ const server = createServer(async (req, res) => {
           MAX_COMMS_DEPTH,
           fromThreadId,
         );
+        const targetName = store.bot(toBotId)?.name ?? toBotId;
+        const parkedMinutes = Math.round(MAX_PARK_MS / 60_000);
+        if (result === "duplicate") {
+          return json(res, 200, {
+            queued: true,
+            message: `Already queued — this exact delegation to @${targetName} is waiting to run; do not send it again.`,
+          });
+        }
         if (result !== "ok") {
           // the agent reads this string — a bare enum ("too_deep") tells it
           // nothing about what to do instead
-          const said: Record<Exclude<QueueResult, "ok">, string> = {
+          const said: Record<Exclude<QueueResult, "ok" | "duplicate">, string> = {
             self: "a bot cannot delegate to itself",
             too_deep: "delegation chains are limited to one hop — do this one yourself",
             no_target: "no such bot",
@@ -2606,12 +2619,11 @@ const server = createServer(async (req, res) => {
           };
           return json(res, 200, { error: said[result] });
         }
-        const targetName = store.bot(toBotId)?.name ?? toBotId;
         return json(res, 200, {
           queued: true,
           message: from.approvePeerComms
             ? `Queued for review — @${targetName} will only pick it up if the user approves after your turn finishes.`
-            : `Delegation queued — @${targetName} will pick it up after your current turn finishes.`,
+            : `Delegation queued — @${targetName} will pick it up after your current turn finishes (if @${targetName} is busy then, it waits up to ${parkedMinutes} minutes for @${targetName} to be free). Carry on with other work meanwhile.`,
         });
       }
       if (method === "POST" && path === "/api/internal/connectors/mcp") {
